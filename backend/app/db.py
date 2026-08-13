@@ -1,12 +1,22 @@
 """SQLite 数据库层。"""
 import json
+import os
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 
+# SQLite 单进程写锁：保护 seq 计算 + INSERT 的原子性（见 add_transcript）。
+_seq_lock = threading.Lock()
 
-def get_db(db_path: str = "interview.db") -> sqlite3.Connection:
-    """获取数据库连接。"""
+
+def get_db(db_path: str = None) -> sqlite3.Connection:
+    """获取数据库连接。
+
+    数据库路径来源优先级：显式参数 > 环境变量 AI_DB_PATH > 缺省 "interview.db"。
+    """
+    if db_path is None:
+        db_path = os.environ.get("AI_DB_PATH", "interview.db")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -86,21 +96,28 @@ def end_session(conn: sqlite3.Connection, session_id: str) -> None:
 
 
 def add_transcript(conn: sqlite3.Connection, session_id: str, source: str, text: str) -> dict:
-    """添加转写记录。"""
-    seq = conn.execute(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcripts WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()[0]
-    cur = conn.execute(
-        "INSERT INTO transcripts (session_id, source, text, timestamp, seq) VALUES (?, ?, ?, ?, ?)",
-        (session_id, source, text, _now(), seq),
-    )
-    conn.commit()
+    """添加转写记录。
+
+    用模块级锁保护 seq 计算 + INSERT 的原子性，避免并发分片算出相同 seq
+    （见 final review：C1 改为并发 LLM 任务后，多个分片可能同时进入本函数）。
+    """
+    timestamp = _now()
+    with _seq_lock:
+        seq = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcripts WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO transcripts (session_id, source, text, timestamp, seq) VALUES (?, ?, ?, ?, ?)",
+            (session_id, source, text, timestamp, seq),
+        )
+        conn.commit()
     return {
         "id": cur.lastrowid,
         "session_id": session_id,
         "source": source,
         "text": text,
+        "timestamp": timestamp,
         "seq": seq,
     }
 
