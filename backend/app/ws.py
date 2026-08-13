@@ -173,4 +173,7 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 break
 
     except WebSocketDisconnect:
+        pass
+    finally:
+        # 无论正常退出（end_session）、异常（JSONDecodeError 等）还是断开，都清理连接
         manager.disconnect(session_id, ws)
