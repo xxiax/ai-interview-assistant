@@ -75,6 +75,31 @@ async def generate_answer(question: str, context: str = "") -> str:
     )
 
 
+async def generate_answer_with_search(question: str, context: str = "") -> str:
+    """搜索 + LLM 整理生成更准确的答案。"""
+    from . import search
+
+    results = await search.search_web(question)
+    if not results:
+        return await generate_answer(question, context)
+
+    search_text = "\n".join(f"{r['title']}: {r['snippet']}" for r in results)
+    system = (
+        "你是一名资深面试辅导专家。请根据面试官的问题和搜索到的资料，"
+        "给出简洁、有条理、有依据的回答要点。使用中文回答，控制在 300 字以内。"
+    )
+    user = f"面试官的问题：{question}\n\n搜索到的资料：\n{search_text}"
+    if context:
+        user += f"\n\n面试上下文（供参考）：{context}"
+    return await _chat(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.5,
+    )
+
+
 async def generate_review(transcripts: list[dict], answers: list[dict]) -> str:
     """根据完整转写和答案生成复盘报告。"""
     system = (
