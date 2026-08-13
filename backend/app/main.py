@@ -3,6 +3,7 @@ from fastapi import FastAPI, WebSocket
 
 from . import db
 from .routes_configs import router as configs_router
+from .routes_review import router as review_router
 from .routes_sessions import router as sessions_router
 from .ws import websocket_endpoint
 
@@ -26,6 +27,7 @@ finally:
 
 app.include_router(sessions_router)
 app.include_router(configs_router)
+app.include_router(review_router)
 
 
 @app.websocket("/ws/{session_id}")

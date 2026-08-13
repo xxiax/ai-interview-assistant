@@ -21,6 +21,11 @@ def _get_llm_config() -> dict:
     return config["data"]
 
 
+def ensure_llm_configured() -> None:
+    """校验 LLM 是否已配置，未配置则抛出 RuntimeError。"""
+    _get_llm_config()
+
+
 async def _chat(messages: list[dict], temperature: float = 0.7) -> str:
     """调用 OpenAI 兼容的 chat completions 接口。"""
     config = _get_llm_config()
