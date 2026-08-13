@@ -1,9 +1,10 @@
 """FastAPI 应用入口。"""
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 
 from . import db
 from .routes_configs import router as configs_router
 from .routes_sessions import router as sessions_router
+from .ws import websocket_endpoint
 
 app = FastAPI(title="AI 面试助手", version="0.1.0")
 
@@ -25,6 +26,11 @@ finally:
 
 app.include_router(sessions_router)
 app.include_router(configs_router)
+
+
+@app.websocket("/ws/{session_id}")
+async def ws_endpoint(ws: WebSocket, session_id: str):
+    await websocket_endpoint(ws, session_id)
 
 
 @app.get("/health")
