@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 
 from . import db
+from .routes_configs import router as configs_router
 from .routes_sessions import router as sessions_router
 
 app = FastAPI(title="AI 面试助手", version="0.1.0")
@@ -23,6 +24,7 @@ finally:
     conn.close()
 
 app.include_router(sessions_router)
+app.include_router(configs_router)
 
 
 @app.get("/health")
