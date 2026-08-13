@@ -18,13 +18,6 @@ async def startup():
     finally:
         conn.close()
 
-# 模块加载时初始化数据库，保证 TestClient 等不触发 startup 事件的场景下表已存在
-conn = db.get_db()
-try:
-    db.init_db(conn)
-finally:
-    conn.close()
-
 app.include_router(sessions_router)
 app.include_router(configs_router)
 app.include_router(review_router)
