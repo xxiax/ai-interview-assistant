@@ -1,7 +1,28 @@
 """FastAPI 应用入口。"""
 from fastapi import FastAPI
 
+from . import db
+from .routes_sessions import router as sessions_router
+
 app = FastAPI(title="AI 面试助手", version="0.1.0")
+
+# 启动时初始化数据库
+@app.on_event("startup")
+async def startup():
+    conn = db.get_db()
+    try:
+        db.init_db(conn)
+    finally:
+        conn.close()
+
+# 模块加载时初始化数据库，保证 TestClient 等不触发 startup 事件的场景下表已存在
+conn = db.get_db()
+try:
+    db.init_db(conn)
+finally:
+    conn.close()
+
+app.include_router(sessions_router)
 
 
 @app.get("/health")
