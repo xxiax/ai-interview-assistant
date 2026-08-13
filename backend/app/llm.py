@@ -32,9 +32,10 @@ async def _chat(messages: list[dict], temperature: float = 0.7) -> str:
     if not base_url or not api_key or not model:
         raise RuntimeError("LLM 配置不完整：需要 base_url、api_key、model")
 
-    headers = {auth_field: f"Bearer {api_key}"}
     if auth_field.lower() == "authorization":
-        headers[auth_field] = f"Bearer {api_key}"
+        headers = {auth_field: f"Bearer {api_key}"}
+    else:
+        headers = {auth_field: api_key}
 
     url = f"{base_url}/chat/completions"
     payload = {
