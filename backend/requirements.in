@@ -1,0 +1,17 @@
+# 直接依赖清单(版本与 requirements.lock 一致)。
+# 重新生成 lock:
+#   uv pip compile requirements.in --python-version 3.12 --universal \
+#       --generate-hashes --output-file requirements.lock
+# --universal 保证锁文件同时可解析 Windows 与 Linux:
+# uvloop 仅在非 Windows 平台安装,uvicorn[standard] 在 Windows 使用 asyncio 循环。
+fastapi==0.141.1
+starlette==1.6.0
+pydantic==2.13.4
+uvicorn[standard]==0.34.0
+# httpx2 是项目使用的 httpx 分支包;2.11.0 与本地验证过的版本一致
+httpx2==2.11.0
+python-dotenv==1.2.3
+websockets==14.1
+cryptography==50.0.0
+# SOCKS 代理支持:app/asr.py 通过 python-socks 建立 FunASR/Groq 出网隧道
+python-socks==3.0.0

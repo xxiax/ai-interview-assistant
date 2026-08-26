@@ -1,0 +1,146 @@
+name: ai-interview-backend
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    environment:
+      AI_AUTH_TOKEN: ${AI_AUTH_TOKEN:?AI_AUTH_TOKEN is required}
+      AI_CONFIG_ENCRYPTION_KEY: ${AI_CONFIG_ENCRYPTION_KEY:?AI_CONFIG_ENCRYPTION_KEY is required}
+      AI_ASR_ENGINE: ${AI_ASR_ENGINE:-funasr}
+      AI_FUNASR_URL: ${AI_FUNASR_URL:?AI_FUNASR_URL is required}
+      AI_FUNASR_STREAM: ${AI_FUNASR_STREAM:-true}
+      AI_FUNASR_TOKEN: ${AI_FUNASR_TOKEN:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      AI_DB_PATH: /data/interview.db
+      AI_ALLOWED_ORIGINS: ${AI_ALLOWED_ORIGINS:?AI_ALLOWED_ORIGINS is required}
+      AI_ALLOWED_HOSTS: ${AI_PUBLIC_HOST:?AI_PUBLIC_HOST is required}
+      AI_REQUIRE_HTTPS: "true"
+      AI_ALLOW_INSECURE_HTTP: "false"
+      AI_ALLOW_PRIVATE_LLM_HOSTS: "false"
+      AI_REST_RATE_LIMIT_PER_MINUTE: ${AI_REST_RATE_LIMIT_PER_MINUTE:-300}
+      AI_MAX_AUDIO_CHUNK_BYTES: ${AI_MAX_AUDIO_CHUNK_BYTES:-2097152}
+      AI_MAX_AUDIO_DURATION_MS: ${AI_MAX_AUDIO_DURATION_MS:-10000}
+      AI_AUDIO_DURATION_TOLERANCE_MS: ${AI_AUDIO_DURATION_TOLERANCE_MS:-750}
+      AI_AUDIO_QUEUE_SIZE: ${AI_AUDIO_QUEUE_SIZE:-8}
+      AI_ANSWER_QUEUE_SIZE: ${AI_ANSWER_QUEUE_SIZE:-8}
+      AI_AUDIO_REORDER_WAIT_SECONDS: ${AI_AUDIO_REORDER_WAIT_SECONDS:-5}
+      AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS: ${AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS:-1}
+      AI_LLM_SESSION_MAX_CONCURRENCY: ${AI_LLM_SESSION_MAX_CONCURRENCY:-3}
+      AI_LLM_MAX_CONCURRENCY: ${AI_LLM_MAX_CONCURRENCY:-4}
+      AI_SEARCH_MAX_CONCURRENCY: ${AI_SEARCH_MAX_CONCURRENCY:-2}
+      AI_ASR_MAX_CONCURRENCY: ${AI_ASR_MAX_CONCURRENCY:-2}
+      AI_LLM_TOKENS_PER_MINUTE: ${AI_LLM_TOKENS_PER_MINUTE:-60000}
+      AI_LLM_TOKENS_PER_HOUR: ${AI_LLM_TOKENS_PER_HOUR:-300000}
+      AI_LLM_TOKENS_PER_DAY: ${AI_LLM_TOKENS_PER_DAY:-1000000}
+      AI_SEARCH_REQUESTS_PER_MINUTE: ${AI_SEARCH_REQUESTS_PER_MINUTE:-30}
+      AI_SEARCH_REQUESTS_PER_HOUR: ${AI_SEARCH_REQUESTS_PER_HOUR:-300}
+      AI_SEARCH_REQUESTS_PER_DAY: ${AI_SEARCH_REQUESTS_PER_DAY:-2000}
+      AI_ASR_SECONDS_PER_MINUTE: ${AI_ASR_SECONDS_PER_MINUTE:-300}
+      AI_ASR_SECONDS_PER_HOUR: ${AI_ASR_SECONDS_PER_HOUR:-3600}
+      AI_ASR_SECONDS_PER_DAY: ${AI_ASR_SECONDS_PER_DAY:-14400}
+      AI_LLM_ANSWER_MAX_COMPLETION_TOKENS: ${AI_LLM_ANSWER_MAX_COMPLETION_TOKENS:-512}
+      AI_LLM_REVIEW_MAX_COMPLETION_TOKENS: ${AI_LLM_REVIEW_MAX_COMPLETION_TOKENS:-2048}
+      ASR_LANGUAGE: ${ASR_LANGUAGE:-zh}
+      # 出网代理（含 SOCKS）覆盖：容器内无法读取宿主机系统代理，需要显式注入
+      AI_OUTBOUND_PROXY: ${AI_OUTBOUND_PROXY:-}
+      # 镜像内置 ffmpeg/ffprobe；仅需在自定义路径时覆盖
+      AI_FFPROBE_PATH: ${AI_FFPROBE_PATH:-ffprobe}
+      # 交互式文档默认关闭；排查时可在 .env 里临时打开
+      AI_DOCS_ENABLED: ${AI_DOCS_ENABLED:-false}
+    volumes:
+      - app_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=10001,gid=10001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - scripts/healthcheck.py
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 4
+    networks:
+      - private
+      - edge
+
+  caddy:
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      AI_PUBLIC_HOST: ${AI_PUBLIC_HOST:?AI_PUBLIC_HOST is required}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - private
+      - edge
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+
+  backup:
+    profiles:
+      - tools
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - python
+      - scripts/backup_sqlite.py
+      - --source
+      - /data/interview.db
+      - --destination-dir
+      - /backups
+      - --keep
+      - ${AI_BACKUP_KEEP:-14}
+    environment:
+      AI_DB_PATH: /data/interview.db
+    volumes:
+      - app_data:/data:ro
+      - backups:/backups
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=10001,gid=10001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+
+volumes:
+  app_data:
+  backups:
+  caddy_data:
+  caddy_config:
+
+networks:
+  private:
+    internal: true
+  edge:

@@ -1,0 +1,1234 @@
+"""实时处理流水线：有序音频队列、FunASR 流、流式答案和答案队列。"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import os
+import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime
+from uuid import uuid4
+
+from . import asr, cost_control, db, llm
+from .protocol import event_message, server_message
+
+logger = logging.getLogger(__name__)
+Broadcast = Callable[[str, dict], Awaitable[None]]
+_AUDIO_WAKE = object()
+
+
+class _AudioSourceCancelled(RuntimeError):
+    pass
+
+
+# 片间文本归一化参数：分片独立转写(FunASR final 只覆盖本片)时，
+# 相邻片常出现与前文尾部的重叠(同一音节被两片各转一次)。
+_OVERLAP_MIN_CHARS = 4
+_LAST_TAIL_CHARS = 32
+_CJK_LEAD = re.compile(r"[一-鿿，。！？；：、）)》】]")
+_SENTENCE_END = re.compile(r"[。！？!?；;…]")
+
+
+def normalize_segment_text(prev_text_tail: str, new_text: str) -> str:
+    """把新分片转写归一化后返回应入库的文本。
+
+    纯函数、无副作用；调用方维护每个 (session, source) 的上一条尾部缓存。
+
+    - (a) 去重：new_text 的前缀与 prev 尾部有 ≥4 字符重叠时去掉重叠部分；
+      取最长重叠，避免重复的中文开头(如"嗯/就是"碎片)被双写。
+    - (b) 拼接语义见 join_transcript_text：中文句读延续不加空格、英文加空格。
+    - (c) 片级 final 以句中字符结尾属于正常情况，无需特殊处理；
+      下一片到来时按 (b) 自然拼接，句子边界因此恢复连续。
+    """
+    new_text = new_text.strip()
+    prev_tail = prev_text_tail.strip()
+    if not new_text:
+        return ""
+    if not prev_tail:
+        return new_text
+
+    overlap = 0
+    max_overlap = min(len(prev_tail), len(new_text))
+    for size in range(max_overlap, _OVERLAP_MIN_CHARS - 1, -1):
+        if prev_tail[-size:] == new_text[:size]:
+            overlap = size
+            break
+    if overlap:
+        new_text = new_text[overlap:].strip()
+        if not new_text:
+            return ""
+    return new_text
+
+
+def join_transcript_text(prev: str, new: str) -> str:
+    """按句读延续规则拼接两段转写文本。
+
+    - new 首字符是中文(或中文标点)且 prev 不以句末标点结尾：句未断，
+      直接拼接不补空格，恢复被 2.5 秒分片切开的中文句子。
+    - 其余情况(英文词、prev 已到句末)拼接时补一个空格。
+    """
+    prev = prev.strip()
+    new = new.strip()
+    if not prev:
+        return new
+    if not new:
+        return prev
+    if _CJK_LEAD.match(new[0]) and not _SENTENCE_END.search(prev[-1]):
+        return f"{prev}{new}"
+    return f"{prev} {new}"
+
+
+def _is_config_error(exc: BaseException) -> bool:
+    """判断 ASR 异常是否为不可重试的配置类错误。
+
+    首选结构化类型（asr.AsrConfigError / asr.AsrAuthError，由 transcribe
+    内部按 HTTP 状态码抛出）；字符串匹配仅兜底旧异常形状——此前靠
+    "401 in str(exc) and 'groq.com' in ..." 判定，FunASR 的 401 不含
+    groq.com 会被误分类为可重试的 processing_failed。
+    """
+    if isinstance(exc, (asr.AsrConfigError, asr.AsrAuthError)):
+        return True
+    reason = str(exc)
+    if "未配置" in reason or "GROQ_API_KEY" in reason:
+        return True
+    # 旧形状兜底：httpx HTTPStatusError 的消息含状态码与 URL
+    return ("401" in reason or "403" in reason) and "groq.com" in reason
+
+
+def _audio_config_error_message() -> str:
+    engine = os.environ.get("AI_ASR_ENGINE", "funasr").strip().lower()
+    if engine == "funasr":
+        return "备用 FunASR 不可用(Token 无效或无权限),请检查 FunASR 配置"
+    if engine == "groq":
+        return "备用 Groq 转写不可用(API Key 无效或无权限),请检查 Groq 配置"
+    return "多模态 AI 转写不可用(API Key 无效或无权限),请在「设置」页检查 LLM 配置和模型能力"
+
+
+def _audio_runtime_error_message() -> str:
+    engine = os.environ.get("AI_ASR_ENGINE", "funasr").strip().lower()
+    if engine == "funasr":
+        return "FunASR 连接失败，请检查网络或代理配置"
+    if engine == "groq":
+        return "Groq 转写请求失败，请检查网络或 Groq 配置"
+    return "多模态 AI 转写请求失败，请检查网络或 LLM 配置"
+
+
+def _db_call(func, *args, **kwargs):
+    conn = db.get_db()
+    try:
+        return func(conn, *args, **kwargs)
+    finally:
+        conn.close()
+
+
+async def run_db(func, *args, **kwargs):
+    """把同步 SQLite 操作移出事件循环。"""
+    return await asyncio.to_thread(_db_call, func, *args, **kwargs)
+
+
+@dataclass(frozen=True)
+class AudioWork:
+    session_id: str
+    chunk_id: str
+    source: str
+    codec: str
+    chunk_seq: int
+    captured_at: datetime
+    duration_ms: int
+    audio_bytes: bytes
+
+
+@dataclass(frozen=True)
+class AnswerWork:
+    session_id: str
+    question: str
+    use_search: bool
+    request_id: str = field(default_factory=lambda: str(uuid4()))
+
+
+class RealtimePipeline:
+    """按 session/source 顺序处理音频，并发生成每个切片的独立答案。"""
+
+    def __init__(self, broadcast: Broadcast) -> None:
+        self.broadcast = broadcast
+        self.audio_queue_size = int(os.environ.get("AI_AUDIO_QUEUE_SIZE", "8"))
+        self.answer_queue_size = int(os.environ.get("AI_ANSWER_QUEUE_SIZE", "8"))
+        self.answer_concurrency = int(
+            os.environ.get("AI_LLM_SESSION_MAX_CONCURRENCY", "3")
+        )
+        self._audio_queues: dict[tuple[str, str], asyncio.Queue[object]] = {}
+        self._audio_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._audio_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._audio_outstanding: dict[tuple[str, str], int] = {}
+        self._audio_next_seq: dict[tuple[str, str], int] = {}
+        self._audio_pending: dict[tuple[str, str], dict[int, AudioWork]] = {}
+        self._audio_current: dict[tuple[str, str], AudioWork] = {}
+        self._audio_processing_tasks: dict[
+            tuple[str, str], asyncio.Task[str]
+        ] = {}
+        self._audio_cancel_watermarks: dict[tuple[str, str], int] = {}
+        self._audio_cancel_reasons: dict[tuple[str, str], tuple[int, str]] = {}
+        # 每个 (会话,来源) 的"同一序号连续缺口超时"计数:≥2 判定洞被放弃并跳过
+        self._gap_timeouts: dict[tuple[str, str], dict[int, int]] = {}
+        # 每个 (会话,来源) 上一条已入库转写的尾部(≤32 字符)，供片间归一化
+        self._transcript_tails: dict[tuple[str, str], str] = {}
+        self._answer_queues: dict[str, asyncio.Queue[AnswerWork]] = {}
+        self._answer_tasks: dict[str, asyncio.Task] = {}
+        self._answer_generation_tasks: dict[str, set[asyncio.Task]] = {}
+        self._stopped_sessions: set[str] = set()
+        self._stop_reasons: dict[str, str] = {}
+        self._session_mutations: dict[str, int] = {}
+        self._funasr_streams: dict[tuple[str, str], asr.FunAsrStream] = {}
+        self._funasr_stream_chunks: dict[tuple[str, str], list[AudioWork]] = {}
+        self._funasr_last_work: dict[tuple[str, str], AudioWork] = {}
+
+    def prepare_for_current_loop(self) -> None:
+        """应用生命周期重启时清除属于已关闭事件循环的运行态。"""
+        current_loop = asyncio.get_running_loop()
+        tasks = [*self._audio_tasks.values(), *self._answer_tasks.values()]
+        stale = [task for task in tasks if task.get_loop() is not current_loop]
+        if any(not task.done() and not task.get_loop().is_closed() for task in stale):
+            raise RuntimeError("实时管线仍在另一个活动事件循环中运行")
+        if stale or not tasks:
+            self._audio_queues.clear()
+            self._audio_tasks.clear()
+            self._audio_locks.clear()
+            self._audio_outstanding.clear()
+            self._audio_next_seq.clear()
+            self._audio_pending.clear()
+            self._audio_current.clear()
+            self._audio_processing_tasks.clear()
+            self._audio_cancel_watermarks.clear()
+            self._audio_cancel_reasons.clear()
+            self._gap_timeouts.clear()
+            self._transcript_tails.clear()
+            self._answer_queues.clear()
+            self._answer_tasks.clear()
+            self._answer_generation_tasks.clear()
+            self._stopped_sessions.clear()
+            self._stop_reasons.clear()
+            self._session_mutations.clear()
+            self._funasr_streams.clear()
+            self._funasr_stream_chunks.clear()
+            self._funasr_last_work.clear()
+
+    async def _reject_stopped_session(self, session_id: str) -> None:
+        if session_id not in self._stopped_sessions:
+            return
+        session = await run_db(db.require_session, session_id)
+        raise db.SessionStateError(session["status"], "recording")
+
+    def _begin_session_mutation(self, session_id: str) -> None:
+        self._session_mutations[session_id] = (
+            self._session_mutations.get(session_id, 0) + 1
+        )
+
+    def _finish_session_mutation(self, session_id: str) -> None:
+        remaining = self._session_mutations.get(session_id, 0) - 1
+        if remaining > 0:
+            self._session_mutations[session_id] = remaining
+            return
+        self._session_mutations.pop(session_id, None)
+        if session_id not in self._stop_reasons:
+            self._stopped_sessions.discard(session_id)
+
+    def _release_stopped_session_if_idle(self, session_id: str) -> None:
+        if (
+            self._session_mutations.get(session_id, 0) == 0
+            and session_id not in self._stop_reasons
+        ):
+            self._stopped_sessions.discard(session_id)
+
+    def _audio_queue(self, key: tuple[str, str]) -> asyncio.Queue[object]:
+        queue = self._audio_queues.get(key)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=self.audio_queue_size)
+            self._audio_queues[key] = queue
+            self._audio_outstanding.setdefault(key, 0)
+        task = self._audio_tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._audio_worker(key, queue), name=f"audio:{key[0]}:{key[1]}"
+            )
+            self._audio_tasks[key] = task
+        return queue
+
+    def _audio_is_cancelled(self, key: tuple[str, str], chunk_seq: int) -> bool:
+        return chunk_seq <= self._audio_cancel_watermarks.get(key, -1)
+
+    def _finish_audio_item(
+        self, key: tuple[str, str], queue: asyncio.Queue[object]
+    ) -> None:
+        queue.task_done()
+        self._audio_outstanding[key] = max(
+            0, self._audio_outstanding.get(key, 0) - 1
+        )
+
+    @staticmethod
+    def _discard_audio_wakes(queue: asyncio.Queue[object]) -> None:
+        preserved = []
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            queue.task_done()
+            if item is not _AUDIO_WAKE:
+                preserved.append(item)
+        for item in preserved:
+            queue.put_nowait(item)
+
+    def _answer_queue(self, session_id: str) -> asyncio.Queue[AnswerWork]:
+        queue = self._answer_queues.get(session_id)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=self.answer_queue_size)
+            self._answer_queues[session_id] = queue
+        task = self._answer_tasks.get(session_id)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._answer_worker(session_id, queue), name=f"answer:{session_id}"
+            )
+            self._answer_tasks[session_id] = task
+        return queue
+
+    async def enqueue_audio(self, item: AudioWork) -> tuple[bool, dict]:
+        key = (item.session_id, item.source)
+        self._begin_session_mutation(item.session_id)
+        try:
+            await self._reject_stopped_session(item.session_id)
+            lock = self._audio_locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                cancelled = self._audio_is_cancelled(key, item.chunk_seq)
+                if (
+                    not cancelled
+                    and self._audio_outstanding.get(key, 0) >= self.audio_queue_size
+                ):
+                    return False, {
+                        "status": "backpressure",
+                        "chunk_id": item.chunk_id,
+                    }
+                accepted, record = await run_db(
+                    db.reserve_audio_chunk,
+                    chunk_id=item.chunk_id,
+                    session_id=item.session_id,
+                    source=item.source,
+                    codec=item.codec,
+                    chunk_seq=item.chunk_seq,
+                    captured_at=item.captured_at.isoformat(),
+                    duration_ms=item.duration_ms,
+                    content_sha256=hashlib.sha256(item.audio_bytes).hexdigest(),
+                )
+                if accepted:
+                    if item.session_id in self._stopped_sessions:
+                        await run_db(
+                            db.mark_audio_chunk_status,
+                            item.chunk_id,
+                            "cancelled",
+                            error_code="session_ended",
+                        )
+                        await self._reject_stopped_session(item.session_id)
+                    if cancelled:
+                        _, reason = self._audio_cancel_reasons[key]
+                        events = await run_db(
+                            db.cancel_audio_source_chunks,
+                            item.session_id,
+                            item.source,
+                            item.chunk_seq,
+                            reason,
+                        )
+                        matching = next(
+                            (
+                                event
+                                for event in reversed(events)
+                                if event["payload"]["chunk_id"] == item.chunk_id
+                            ),
+                            None,
+                        )
+                        record = {
+                            **record,
+                            "status": "cancelled",
+                            "error_code": reason,
+                            "transcript_id": None,
+                        }
+                        if matching:
+                            record["event_id"] = matching["event_id"]
+                    else:
+                        queue = self._audio_queue(key)
+                        self._discard_audio_wakes(queue)
+                        self._audio_outstanding[key] = (
+                            self._audio_outstanding.get(key, 0) + 1
+                        )
+                        queue.put_nowait(item)
+                return accepted, record
+        finally:
+            self._finish_session_mutation(item.session_id)
+
+    async def cancel_audio_source(
+        self,
+        session_id: str,
+        source: str,
+        through_chunk_seq: int,
+        reason: str,
+    ) -> list[dict]:
+        """线性化取消单一音频来源的水位内分片，并保留更高序号工作。"""
+        if source not in db.VALID_AUDIO_SOURCES:
+            raise ValueError("非法音频来源")
+        if (
+            type(through_chunk_seq) is not int
+            or not 0 <= through_chunk_seq <= db.CHUNK_SEQ_MAX
+        ):
+            raise ValueError("非法音频取消水位")
+        if reason not in db.VALID_AUDIO_CANCEL_REASONS:
+            raise ValueError("非法音频取消原因")
+
+        key = (session_id, source)
+        self._begin_session_mutation(session_id)
+        try:
+            await self._reject_stopped_session(session_id)
+            await run_db(db.ensure_recording, session_id)
+            lock = self._audio_locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                previous = self._audio_cancel_watermarks.get(key, -1)
+                watermark = max(previous, through_chunk_seq)
+                self._audio_cancel_watermarks[key] = watermark
+                if through_chunk_seq >= previous:
+                    self._audio_cancel_reasons[key] = (watermark, reason)
+
+                current = self._audio_current.get(key)
+                processing = self._audio_processing_tasks.get(key)
+                if (
+                    current is not None
+                    and current.chunk_seq <= watermark
+                    and processing is not None
+                    and not processing.done()
+                ):
+                    processing.cancel()
+
+                events = await run_db(
+                    db.cancel_audio_source_chunks,
+                    session_id,
+                    source,
+                    through_chunk_seq,
+                    reason,
+                )
+                self._audio_next_seq[key] = max(
+                    self._audio_next_seq.get(key, 0), watermark + 1
+                )
+
+                queue = self._audio_queues.get(key)
+                pending = self._audio_pending.get(key)
+                if queue is not None and pending is not None:
+                    for chunk_seq in list(pending):
+                        if chunk_seq <= watermark:
+                            pending.pop(chunk_seq)
+                            self._finish_audio_item(key, queue)
+
+                if queue is not None:
+                    preserved = []
+                    while True:
+                        try:
+                            queued = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        queue.task_done()
+                        if queued is _AUDIO_WAKE:
+                            continue
+                        if queued is None:
+                            preserved.append(queued)
+                            continue
+                        if queued.chunk_seq <= watermark:
+                            self._audio_outstanding[key] = max(
+                                0, self._audio_outstanding.get(key, 0) - 1
+                            )
+                        else:
+                            preserved.append(queued)
+                    for queued in preserved:
+                        queue.put_nowait(queued)
+                    task = self._audio_tasks.get(key)
+                    if task is not None and not task.done() and queue.empty():
+                        queue.put_nowait(_AUDIO_WAKE)
+
+            for event in events:
+                await self.broadcast(session_id, event_message(event))
+            return events
+        finally:
+            self._finish_session_mutation(session_id)
+
+    async def enqueue_answer(self, item: AnswerWork) -> bool:
+        self._begin_session_mutation(item.session_id)
+        try:
+            await self._reject_stopped_session(item.session_id)
+            await run_db(db.ensure_recording, item.session_id)
+            await self._reject_stopped_session(item.session_id)
+            # 第三重屏障（对齐 enqueue_audio 的 reserve 后复查）：上面两次检查都
+            # 让出过事件循环，end_session 的 stop_session 可能在任意一次 await 之后
+            # 执行并 pop 掉 _answer_queues/_answer_tasks；若直接调 _answer_queue 会
+            # 重建 queue+worker，worker 内 ensure_recording 抛错被吞后永久挂在
+            # queue.get()。先复查再建队列。
+            if item.session_id in self._stopped_sessions:
+                session = await run_db(db.require_session, item.session_id)
+                raise db.SessionStateError(session["status"], "recording")
+            queue = self._answer_queue(item.session_id)
+            if queue.full():
+                return False
+            queue.put_nowait(item)
+            return True
+        finally:
+            self._finish_session_mutation(item.session_id)
+
+    async def _broadcast_chunk_event(self, session_id: str, event: dict | None) -> None:
+        if event:
+            await self.broadcast(session_id, event_message(event))
+
+    async def _persist_single_final(
+        self, key: tuple[str, str], current: AudioWork, text: str
+    ) -> None:
+        text = normalize_segment_text(self._transcript_tails.get(key, ""), text)
+        if not text:
+            event = await run_db(
+                db.mark_audio_chunk_status, current.chunk_id, "done"
+            )
+            await self._broadcast_chunk_event(current.session_id, event)
+            return
+        transcript = await run_db(
+            db.add_transcript,
+            current.session_id,
+            current.source,
+            text,
+            chunk_id=current.chunk_id,
+            chunk_seq=current.chunk_seq,
+            captured_at=current.captured_at.isoformat(),
+        )
+        self._transcript_tails[key] = text[-_LAST_TAIL_CHARS:]
+        chunk_event = transcript.pop("chunk_event", None)
+        transcript_event_id = transcript.pop("event_id")
+        await self.broadcast(
+            current.session_id,
+            server_message(
+                "transcript", event_id=transcript_event_id, **transcript
+            ),
+        )
+        await self._broadcast_chunk_event(current.session_id, chunk_event)
+        if not await self.enqueue_answer(
+            AnswerWork(current.session_id, text, False)
+        ):
+            await self.broadcast(
+                current.session_id,
+                server_message(
+                    "error",
+                    code="answer_backpressure",
+                    message="答案生成队列已满，请稍后重试",
+                ),
+            )
+
+    async def _persist_stream_final(
+        self, key: tuple[str, str], final_text: str
+    ) -> None:
+        chunks = self._funasr_stream_chunks.get(key, [])
+        if not chunks:
+            return
+        session_id, _source = key
+        final_text = normalize_segment_text(
+            self._transcript_tails.get(key, ""), final_text
+        )
+        # 前面的音频分片已经被同一条 FunASR 流消费，但只能把最终文本
+        # 绑定到最后一片；其余分片标记 done，避免客户端持续重传。
+        for item in chunks[:-1]:
+            event = await run_db(db.mark_audio_chunk_status, item.chunk_id, "done")
+            await self._broadcast_chunk_event(session_id, event)
+        last = chunks[-1]
+        if not final_text:
+            event = await run_db(db.mark_audio_chunk_status, last.chunk_id, "done")
+            await self._broadcast_chunk_event(session_id, event)
+            return
+        await self._persist_single_final(key, last, final_text)
+
+    async def _release_stream_prefix(self, key: tuple[str, str]) -> None:
+        """长连接已接收新片后释放之前的 queued 分片，避免客户端泵被占满。"""
+        chunks = self._funasr_stream_chunks.get(key, [])
+        if not chunks:
+            return
+        self._funasr_stream_chunks[key] = []
+        for item in chunks:
+            event = await run_db(db.mark_audio_chunk_status, item.chunk_id, "done")
+            await self._broadcast_chunk_event(key[0], event)
+
+    async def _process_stream_events(
+        self, key: tuple[str, str], events: list[asr.FunAsrEvent]
+    ) -> None:
+        final_text: str | None = None
+        for event in events:
+            if event.type == "partial":
+                await self.broadcast(
+                    key[0],
+                    server_message(
+                        "transcript_partial",
+                        session_id=key[0],
+                        source=key[1],
+                        text=event.text,
+                    ),
+                )
+            elif event.type == "final":
+                final_text = event.text
+        if final_text is not None:
+            # final 即使是空串也要让客户端清掉上一条临时转写。
+            await self.broadcast(
+                key[0],
+                server_message(
+                    "transcript_partial",
+                    session_id=key[0],
+                    source=key[1],
+                    text="",
+                ),
+            )
+            await self._persist_stream_final(key, final_text)
+            self._funasr_stream_chunks[key] = []
+
+    async def _fail_stream_chunks(
+        self, key: tuple[str, str], error_code: str = "processing_failed"
+    ) -> None:
+        for item in self._funasr_stream_chunks.get(key, []):
+            event = await run_db(
+                db.mark_audio_chunk_status,
+                item.chunk_id,
+                "failed",
+                error_code=error_code,
+            )
+            await self._broadcast_chunk_event(key[0], event)
+
+    async def _finish_funasr_stream(self, key: tuple[str, str]) -> None:
+        stream = self._funasr_streams.get(key)
+        if stream is None:
+            return
+        try:
+            events = await stream.finish()
+            # 某些部署在 stop 后只回最后一次 partial；在明确结束语音段时，
+            # 将它作为本段最终文本，避免最后一句丢失。
+            if not any(event.type == "final" for event in events):
+                partials = [event for event in events if event.type == "partial"]
+                if partials:
+                    events.append(asr.FunAsrEvent("final", text=partials[-1].text))
+            await self._process_stream_events(key, events)
+        except Exception:
+            await self._fail_stream_chunks(key)
+            raise
+        finally:
+            stream = self._funasr_streams.pop(key, None)
+            self._funasr_stream_chunks.pop(key, None)
+            self._funasr_last_work.pop(key, None)
+            if stream is not None:
+                await stream.close()
+
+    async def _process_audio_work(
+        self, key: tuple[str, str], current: AudioWork
+    ) -> None:
+        if asr.use_funasr_stream(current.codec):
+            stream = self._funasr_streams.get(key)
+            if stream is None:
+                stream = asr.FunAsrStream()
+                await stream.connect()
+                self._funasr_streams[key] = stream
+                self._funasr_stream_chunks[key] = []
+            try:
+                events = await stream.push_wav(current.audio_bytes, current.duration_ms)
+            except Exception:
+                await self._fail_stream_chunks(key)
+                self._funasr_streams.pop(key, None)
+                self._funasr_stream_chunks.pop(key, None)
+                self._funasr_last_work.pop(key, None)
+                await stream.close()
+                raise
+            await self._release_stream_prefix(key)
+            self._funasr_stream_chunks.setdefault(key, []).append(current)
+            self._funasr_last_work[key] = current
+            await self._process_stream_events(key, events)
+            return
+
+        text = await asr.transcribe_audio(
+            current.audio_bytes,
+            current.codec,
+            current.source,
+            current.duration_ms,
+        )
+        await self._persist_single_final(key, current, text)
+
+    async def _audio_worker(
+        self, key: tuple[str, str], queue: asyncio.Queue[object]
+    ) -> None:
+        pending: dict[int, AudioWork] = {}
+        self._audio_pending[key] = pending
+        expected_seq = self._audio_next_seq.get(key)
+        if expected_seq is None:
+            expected_seq = await run_db(db.get_next_audio_chunk_seq, key[0], key[1])
+            self._audio_next_seq[key] = expected_seq
+        expected_seq = max(
+            expected_seq, self._audio_cancel_watermarks.get(key, -1) + 1
+        )
+        resume_expected_seq: int | None = None
+        current: AudioWork | None = None
+        try:
+            while True:
+                expected_seq = max(
+                    expected_seq, self._audio_cancel_watermarks.get(key, -1) + 1
+                )
+                if expected_seq not in pending:
+                    try:
+                        if pending:
+                            wait_seconds = float(
+                                os.environ.get("AI_AUDIO_REORDER_WAIT_SECONDS", "5")
+                            )
+                            received = await asyncio.wait_for(
+                                queue.get(), timeout=max(0.1, wait_seconds)
+                            )
+                        else:
+                            received = await queue.get()
+                    except asyncio.TimeoutError:
+                        # 同一洞的连续超时计数:首次报缺口并回洞头等补传(客户端可能重发);
+                        # 连续第二次仍缺 → 判定洞被放弃,静默跳过(防止错误永动机刷屏)
+                        gap_counts = self._gap_timeouts.get(key, {})
+                        count = gap_counts.get(expected_seq, 0) + 1
+                        gap_counts[expected_seq] = count
+                        self._gap_timeouts[key] = gap_counts
+                        abandoned = count >= 2
+                        lock = self._audio_locks.setdefault(key, asyncio.Lock())
+                        async with lock:
+                            candidates = list(pending.values())
+                            pending.clear()
+                            held_back = []
+                            for item in candidates:
+                                queue.task_done()
+                                if abandoned and not self._audio_is_cancelled(
+                                    key, item.chunk_seq
+                                ):
+                                    # queue.get 已增加 unfinished 计数；重放前先
+                                    # task_done 再 put，使 unfinished/outstanding 净值不变。
+                                    held_back.append(item)
+                                    queue.put_nowait(item)
+                                else:
+                                    self._audio_outstanding[key] = max(
+                                        0,
+                                        self._audio_outstanding.get(key, 0) - 1,
+                                    )
+                            if held_back:
+                                expected_seq = max(
+                                    min(item.chunk_seq for item in held_back),
+                                    self._audio_cancel_watermarks.get(key, -1) + 1,
+                                )
+                                self._audio_next_seq[key] = expected_seq
+
+                        if not abandoned:
+                            for item in candidates:
+                                if self._audio_is_cancelled(key, item.chunk_seq):
+                                    continue
+                                event = await run_db(
+                                    db.mark_audio_chunk_status,
+                                    item.chunk_id,
+                                    "failed",
+                                    error_code="missing_predecessor",
+                                )
+                                if not event:
+                                    continue
+                                await self.broadcast(
+                                    item.session_id, event_message(event)
+                                )
+                                await self.broadcast(
+                                    item.session_id,
+                                    server_message(
+                                        "error",
+                                        code="audio_sequence_gap",
+                                        message="音频序号存在缺口，等待补传缺失分片",
+                                        chunk_id=item.chunk_id,
+                                        chunk_seq=item.chunk_seq,
+                                        expected_chunk_seq=expected_seq,
+                                    ),
+                                )
+                        continue
+                    if received is _AUDIO_WAKE:
+                        queue.task_done()
+                        continue
+                    if self._audio_is_cancelled(key, received.chunk_seq):
+                        self._finish_audio_item(key, queue)
+                        continue
+                    if received.chunk_seq < expected_seq:
+                        # 迟到的重传(seq 已被越过):前序早已终态化,
+                        # 就地处理这一片再恢复原序列,不进 pending 死等
+                        pending[received.chunk_seq] = received
+                        resume_expected_seq = expected_seq
+                        expected_seq = received.chunk_seq
+                        continue
+                    pending[received.chunk_seq] = received
+                    continue
+
+                current = pending.pop(expected_seq)
+                self._audio_current[key] = current
+                advance_sequence = False
+                try:
+                    if self._audio_is_cancelled(key, current.chunk_seq):
+                        raise _AudioSourceCancelled
+                    await run_db(db.ensure_recording, current.session_id)
+                    if self._audio_is_cancelled(key, current.chunk_seq):
+                        raise _AudioSourceCancelled
+                    processing = asyncio.create_task(
+                        self._process_audio_work(key, current),
+                        name=(
+                            f"asr:{current.session_id}:{current.source}:"
+                            f"{current.chunk_seq}"
+                        ),
+                    )
+                    self._audio_processing_tasks[key] = processing
+                    try:
+                        await processing
+                    finally:
+                        if self._audio_processing_tasks.get(key) is processing:
+                            self._audio_processing_tasks.pop(key, None)
+                    if self._audio_is_cancelled(key, current.chunk_seq):
+                        raise _AudioSourceCancelled
+                    advance_sequence = True
+                except _AudioSourceCancelled:
+                    advance_sequence = True
+                except db.AudioSourceNotAllowedError:
+                    events = await run_db(
+                        db.cancel_audio_source_chunks,
+                        current.session_id,
+                        current.source,
+                        current.chunk_seq,
+                        "source_disabled",
+                    )
+                    for event in events:
+                        await self.broadcast(
+                            current.session_id, event_message(event)
+                        )
+                    advance_sequence = True
+                except db.SessionStateError:
+                    if current:
+                        event = await run_db(
+                            db.mark_audio_chunk_status,
+                            current.chunk_id,
+                            "cancelled",
+                            error_code="session_not_recording",
+                        )
+                        if event:
+                            await self.broadcast(
+                                current.session_id, event_message(event)
+                            )
+                except (db.UsageLimitExceeded, cost_control.PaidCallBusyError) as exc:
+                    event = await run_db(
+                        db.mark_audio_chunk_status,
+                        current.chunk_id,
+                        "failed",
+                        error_code="usage_limited",
+                    )
+                    if event:
+                        await self.broadcast(current.session_id, event_message(event))
+                    retry_after = getattr(exc, "retry_after_seconds", 1)
+                    await self.broadcast(
+                        current.session_id,
+                        server_message(
+                            "error",
+                            code="paid_usage_limited",
+                            message="付费服务预算或并发已达上限，请稍后重试",
+                            chunk_id=current.chunk_id,
+                            retry_after_seconds=retry_after,
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    if self._audio_is_cancelled(key, current.chunk_seq):
+                        advance_sequence = True
+                    else:
+                        reason = self._stop_reasons.get(
+                            current.session_id, "service_shutdown"
+                        )
+                        status = (
+                            "failed" if reason == "service_shutdown" else "cancelled"
+                        )
+                        await run_db(
+                            db.mark_audio_chunk_status,
+                            current.chunk_id,
+                            status,
+                            error_code=reason,
+                        )
+                        raise
+                except Exception as exc:
+                    logger.exception(
+                        "音频分片处理失败: session=%s chunk=%s",
+                        current.session_id,
+                        current.chunk_id,
+                    )
+                    # 配置类错误(未配置/鉴权失败):原因直达客户端,不可重试且推进序号,
+                    # 否则每个静音分片都会重复失败并触发序号缺口风暴。
+                    # 优先按结构化异常分类;字符串匹配仅兜底旧第三方异常
+                    # (如旧版 httpx 错误消息),FunASR/Groq 均已抛结构化类型。
+                    is_config_error = _is_config_error(exc)
+                    error_code = "config_missing" if is_config_error else "processing_failed"
+                    event = await run_db(
+                        db.mark_audio_chunk_status,
+                        current.chunk_id,
+                        "failed",
+                        error_code=error_code,
+                    )
+                    if event:
+                        await self.broadcast(current.session_id, event_message(event))
+                    await self.broadcast(
+                        current.session_id,
+                        server_message(
+                            "error",
+                            code="audio_processing_failed",
+                            message=(
+                                _audio_config_error_message()
+                                if is_config_error
+                                else _audio_runtime_error_message()
+                            ),
+                            chunk_id=current.chunk_id,
+                        ),
+                    )
+                    if is_config_error:
+                        advance_sequence = True
+                    elif error_code == "processing_failed":
+                        # 转写服务当下失败(如网络不通):也推进序列,否则后续分片
+                        # 全部卡成 missing_predecessor 连环错;重试由客户端 outbox/对账兜底
+                        advance_sequence = True
+                finally:
+                    self._finish_audio_item(key, queue)
+                    if self._audio_current.get(key) is current:
+                        self._audio_current.pop(key, None)
+                    current = None
+                if advance_sequence:
+                    expected_seq += 1
+                    if resume_expected_seq is not None:
+                        expected_seq = max(expected_seq, resume_expected_seq)
+                        resume_expected_seq = None
+                    # 重启恢复时，当前重试分片之后可能已经存在 done/cancelled
+                    # （或不可重试 failed）的连续终态。只做 +1 会把这些已消费
+                    # 序号再次当成缺口，导致下一片被误标 missing_predecessor。
+                    expected_seq = await run_db(
+                        db.get_next_audio_chunk_seq,
+                        key[0],
+                        key[1],
+                        expected_seq,
+                    )
+                    expected_seq = max(
+                        expected_seq,
+                        self._audio_cancel_watermarks.get(key, -1) + 1,
+                    )
+                    self._audio_next_seq[key] = expected_seq
+                    # 序号正常前进:清掉该序号的缺口计数(洞已补上或已越过)
+                    counts = self._gap_timeouts.get(key)
+                    if counts:
+                        counts.pop(expected_seq - 1, None)
+                        counts.pop(expected_seq, None)
+        finally:
+            for item in pending.values():
+                self._finish_audio_item(key, queue)
+            pending.clear()
+            while True:
+                try:
+                    queued = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                queue.task_done()
+                if queued is not None and queued is not _AUDIO_WAKE:
+                    self._audio_outstanding[key] = max(
+                        0, self._audio_outstanding.get(key, 0) - 1
+                    )
+            self._audio_queues.pop(key, None)
+            self._audio_tasks.pop(key, None)
+            self._audio_pending.pop(key, None)
+            self._audio_current.pop(key, None)
+            self._audio_processing_tasks.pop(key, None)
+            if self._audio_outstanding.get(key, 0) <= 0:
+                self._audio_outstanding.pop(key, None)
+
+    async def _answer_worker(
+        self, session_id: str, queue: asyncio.Queue[AnswerWork]
+    ) -> None:
+        active = self._answer_generation_tasks.setdefault(session_id, set())
+        try:
+            while True:
+                completed = {task for task in active if task.done()}
+                if completed:
+                    await asyncio.gather(*completed, return_exceptions=True)
+                    active.difference_update(completed)
+                if len(active) >= self.answer_concurrency:
+                    completed, _ = await asyncio.wait(
+                        active, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    await asyncio.gather(*completed, return_exceptions=True)
+                    active.difference_update(completed)
+                    continue
+                item = await queue.get()
+                generation = asyncio.create_task(
+                    self._run_answer_item(session_id, item, queue),
+                    name=f"answer-generation:{session_id}:{item.request_id}",
+                )
+                active.add(generation)
+        finally:
+            active = self._answer_generation_tasks.pop(session_id, set())
+            for generation in active:
+                if not generation.done():
+                    generation.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            while True:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                queue.task_done()
+            self._answer_queues.pop(session_id, None)
+            self._answer_tasks.pop(session_id, None)
+
+    async def _run_answer_item(
+        self,
+        session_id: str,
+        item: AnswerWork,
+        queue: asyncio.Queue[AnswerWork],
+    ) -> None:
+        try:
+            await self._generate_answer(session_id, item)
+        finally:
+            queue.task_done()
+
+    async def _generate_answer(self, session_id: str, item: AnswerWork) -> None:
+        try:
+            await run_db(db.ensure_recording, session_id)
+            context = await run_db(db.get_recent_transcript_context, session_id)
+            answer_text = ""
+            thinking_text = ""
+            source = "llm"
+            if item.use_search:
+                stream = llm.stream_answer_with_search_info(item.question, context)
+            else:
+                stream = self._plain_answer_stream(item.question, context)
+            async for part, used_search in stream:
+                source = "search+llm" if used_search else "llm"
+                if part.thinking:
+                    thinking_text += part.thinking
+                    await self.broadcast(
+                        session_id,
+                        server_message(
+                            "answer_stream",
+                            session_id=session_id,
+                            request_id=item.request_id,
+                            question=item.question,
+                            channel="thinking",
+                            delta=part.thinking,
+                            text=thinking_text,
+                            thinking=thinking_text,
+                            answer=answer_text,
+                            source=source,
+                            done=False,
+                        ),
+                    )
+                if part.text:
+                    answer_text += part.text
+                    await self.broadcast(
+                        session_id,
+                        server_message(
+                            "answer_stream",
+                            session_id=session_id,
+                            request_id=item.request_id,
+                            question=item.question,
+                            channel="answer",
+                            delta=part.text,
+                            text=answer_text,
+                            thinking=thinking_text,
+                            answer=answer_text,
+                            source=source,
+                            done=False,
+                        ),
+                    )
+            if not answer_text.strip():
+                raise RuntimeError("LLM 返回了空答案")
+            await self.broadcast(
+                session_id,
+                server_message(
+                    "answer_stream",
+                    session_id=session_id,
+                    request_id=item.request_id,
+                    question=item.question,
+                    channel="answer",
+                    delta="",
+                    text=answer_text,
+                    thinking=thinking_text,
+                    answer=answer_text,
+                    source=source,
+                    done=True,
+                ),
+            )
+            answer = await run_db(
+                db.add_answer,
+                session_id,
+                item.question,
+                answer_text,
+                source,
+                item.request_id,
+            )
+            await self.broadcast(
+                session_id,
+                server_message(
+                    "answer",
+                    event_id=answer["event_id"],
+                    **{
+                        key: value
+                        for key, value in answer.items()
+                        if key != "event_id"
+                    },
+                    thinking=thinking_text,
+                ),
+            )
+        except db.SessionStateError:
+            pass
+        except (db.UsageLimitExceeded, cost_control.PaidCallBusyError) as exc:
+            await self.broadcast(
+                session_id,
+                server_message(
+                    "error",
+                    code="paid_usage_limited",
+                    message="付费服务预算或并发已达上限，请稍后重试",
+                    retry_after_seconds=getattr(exc, "retry_after_seconds", 1),
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("答案生成失败: session=%s", session_id)
+            await self.broadcast(
+                session_id,
+                server_message(
+                    "error",
+                    code="answer_generation_failed",
+                    message="答案生成失败，请稍后重试",
+                ),
+            )
+
+    @staticmethod
+    async def _plain_answer_stream(question: str, context: str):
+        async for part in llm.stream_answer(question, context):
+            yield part, False
+
+    async def flush_session(self, session_id: str) -> None:
+        """结束会话前结束 FunASR 语音段，确保最后的 partial 不丢失。"""
+        processing = [
+            task
+            for key, task in self._audio_processing_tasks.items()
+            if key[0] == session_id and not task.done()
+        ]
+        if processing:
+            await asyncio.gather(*processing, return_exceptions=True)
+        for key in [key for key in self._funasr_streams if key[0] == session_id]:
+            try:
+                await self._finish_funasr_stream(key)
+            except Exception:
+                logger.exception("结束会话时刷新 FunASR 失败: session=%s", session_id)
+        queue = self._answer_queues.get(session_id)
+        if queue is not None:
+            try:
+                await asyncio.wait_for(
+                    queue.join(),
+                    timeout=float(
+                        os.environ.get("AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS", "10")
+                    ),
+                )
+            except (asyncio.TimeoutError, ValueError):
+                logger.warning("结束会话时等待最终答案超时: session=%s", session_id)
+
+    async def stop_session(self, session_id: str) -> None:
+        """结束会话时取消在途任务并清空队列，保证 ended 后不再写入。"""
+        self._stopped_sessions.add(session_id)
+        self._stop_reasons[session_id] = "session_ended"
+        tasks = []
+        for key, task in list(self._audio_tasks.items()):
+            if key[0] == session_id:
+                task.cancel()
+                tasks.append(task)
+        answer_task = self._answer_tasks.get(session_id)
+        if answer_task:
+            answer_task.cancel()
+            tasks.append(answer_task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for key in [key for key in self._funasr_streams if key[0] == session_id]:
+            stream = self._funasr_streams.pop(key, None)
+            self._funasr_stream_chunks.pop(key, None)
+            self._funasr_last_work.pop(key, None)
+            if stream is not None:
+                await stream.close()
+        await run_db(db.cancel_pending_audio_chunks, session_id, "session_ended")
+        self._stop_reasons.pop(session_id, None)
+        self._release_stopped_session_if_idle(session_id)
+        self._answer_queues.pop(session_id, None)
+        self._answer_tasks.pop(session_id, None)
+        audio_keys = {
+            key
+            for mapping in (
+                self._audio_queues,
+                self._audio_tasks,
+                self._audio_locks,
+                self._audio_outstanding,
+                self._audio_next_seq,
+                self._audio_pending,
+                self._audio_current,
+                self._audio_processing_tasks,
+                self._audio_cancel_watermarks,
+                self._audio_cancel_reasons,
+                self._gap_timeouts,
+                self._transcript_tails,
+            )
+            for key in mapping
+            if key[0] == session_id
+        }
+        for key in audio_keys:
+            self._audio_queues.pop(key, None)
+            self._audio_tasks.pop(key, None)
+            self._audio_locks.pop(key, None)
+            self._audio_outstanding.pop(key, None)
+            self._audio_next_seq.pop(key, None)
+            self._audio_pending.pop(key, None)
+            self._audio_current.pop(key, None)
+            self._audio_processing_tasks.pop(key, None)
+            self._audio_cancel_watermarks.pop(key, None)
+            self._audio_cancel_reasons.pop(key, None)
+            self._gap_timeouts.pop(key, None)
+            self._transcript_tails.pop(key, None)
+
+    async def shutdown(self) -> None:
+        session_ids = {
+            *[key[0] for key in self._audio_tasks],
+            *self._answer_tasks.keys(),
+        }
+        current_loop = asyncio.get_running_loop()
+        tasks = [*self._audio_tasks.values(), *self._answer_tasks.values()]
+        current_tasks = [task for task in tasks if task.get_loop() is current_loop]
+        for session_id in session_ids:
+            self._stop_reasons[session_id] = "service_shutdown"
+        for task in current_tasks:
+            task.cancel()
+        if current_tasks:
+            await asyncio.gather(*current_tasks, return_exceptions=True)
+        for session_id in session_ids:
+            await run_db(db.cancel_pending_audio_chunks, session_id, "service_shutdown")
+        for stream in list(self._funasr_streams.values()):
+            await stream.close()
+        self._funasr_streams.clear()
+        self._funasr_stream_chunks.clear()
+        self._funasr_last_work.clear()
+        self._audio_queues.clear()
+        self._audio_tasks.clear()
+        self._audio_locks.clear()
+        self._audio_outstanding.clear()
+        self._audio_next_seq.clear()
+        self._audio_pending.clear()
+        self._audio_current.clear()
+        self._audio_processing_tasks.clear()
+        self._audio_cancel_watermarks.clear()
+        self._audio_cancel_reasons.clear()
+        self._transcript_tails.clear()
+        self._answer_queues.clear()
+        self._answer_tasks.clear()
+        self._answer_generation_tasks.clear()
+        self._stopped_sessions.clear()
+        self._stop_reasons.clear()
+        self._session_mutations.clear()

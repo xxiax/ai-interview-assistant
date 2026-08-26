@@ -1,0 +1,18 @@
+{$AI_PUBLIC_HOST} {
+    encode zstd gzip
+
+    request_body {
+        max_size 4MB
+    }
+
+    reverse_proxy api:8000 {
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 135s
+        }
+    }
+
+    header {
+        -Server
+    }
+}

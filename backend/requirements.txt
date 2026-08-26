@@ -1,5 +1,4 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-httpx==0.28.1
-python-dotenv==1.0.1
-websockets==14.1
+# Local install entry (Windows dev machines). Containers use requirements.lock via Dockerfile.
+# The lock is generated with `uv pip compile --universal`: it carries both Windows and Linux
+# hashes, and uvloop is installed only on non-Windows platforms (see requirements.in notes).
+-r requirements.lock

@@ -28,6 +28,7 @@ out/
 .env
 .env.*
 !.env.example
+!.env.*.example
 *.pem
 *.key
 
@@ -40,8 +41,22 @@ Thumbs.db
 .vscode/
 *.swp
 
+# Local AI review/worktree artifacts
+.gstack/
+.superpowers/sdd-desktop/
+
 # Logs
 *.log
+.coverage
+htmlcov/
+.pytest_cache/
 
 # SQLite 数据库文件
 *.db
+
+# 调试用转储文件（curl 排查产物，勿提交）
+/chunks*.json
+/evs.json
+/backend/chunks*.json
+/backend/s[0-9].json
+/backend/sid.txt

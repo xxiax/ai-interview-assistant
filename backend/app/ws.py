@@ -1,218 +1,482 @@
-"""WebSocket 实时转写与答案生成。"""
-import base64
+"""认证且可恢复的 WebSocket 实时协议。"""
+
+from __future__ import annotations
+
 import asyncio
+import base64
+import binascii
 import logging
+import os
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from . import db, asr, llm
+from . import db
+from .protocol import (
+    AudioChunkMessage,
+    CancelAudioSourceMessage,
+    EndSessionMessage,
+    PingMessage,
+    RegenerateAnswerMessage,
+    ResumeMessage,
+    SetRadioModeMessage,
+    StartSessionMessage,
+    event_message,
+    parse_auth_message,
+    parse_client_message,
+    server_message,
+)
+from .realtime import AnswerWork, AudioWork, RealtimePipeline, run_db
+from .security import rate_limiter, token_fingerprint, verify_token
 
 logger = logging.getLogger(__name__)
+AUTH_TIMEOUT_SECONDS = 5
+SEND_TIMEOUT_SECONDS = 3
+EventLoader = Callable[[str, int, int], Awaitable[list[dict]]]
 
 
 class ConnectionManager:
-    """管理会话的 WebSocket 连接。"""
+    """管理单 worker 内同一会话的所有连接。"""
 
-    def __init__(self):
-        self.connections: dict[str, list[WebSocket]] = {}
+    def __init__(self, event_loader: EventLoader | None = None) -> None:
+        self.connections: dict[str, set[WebSocket]] = {}
+        self.send_locks: dict[WebSocket, asyncio.Lock] = {}
+        self.event_watermarks: dict[WebSocket, int] = {}
+        self._session_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+        self._event_loader = event_loader
 
-    async def connect(self, session_id: str, ws: WebSocket):
-        await ws.accept()
-        if session_id not in self.connections:
-            self.connections[session_id] = []
-        self.connections[session_id].append(ws)
-
-    def disconnect(self, session_id: str, ws: WebSocket):
-        if session_id in self.connections:
-            try:
-                self.connections[session_id].remove(ws)
-            except ValueError:
-                # 并发下可能已被移除，忽略
-                pass
-            if not self.connections[session_id]:
-                del self.connections[session_id]
-
-    async def broadcast(self, session_id: str, message: dict):
-        """向会话的所有连接广播消息。"""
-        # 迭代活列表的副本，避免广播与 disconnect 并发时 list.remove 触发 RuntimeError
-        for ws in list(self.connections.get(session_id, [])):
-            try:
-                await ws.send_json(message)
-            except Exception:
-                pass
-
-
-manager = ConnectionManager()
-
-
-async def _handle_audio_chunk(session_id: str, source: str, audio_b64: str):
-    """处理音频分片：转写 + 生成答案。
-
-    作为后台任务运行，不阻塞消息循环。广播顺序保持：先 transcript，LLM 完成后广播 answer
-    （transcript 和 answer 是两条独立消息）。
-    """
-    try:
-        if not audio_b64:
-            return
-        audio_bytes = base64.b64decode(audio_b64)
+    @asynccontextmanager
+    async def session_lock(self, session_id: str):
+        entry = self._session_locks.get(session_id)
+        lock, users = entry if entry is not None else (asyncio.Lock(), 0)
+        self._session_locks[session_id] = (lock, users + 1)
         try:
-            text = await asr.transcribe_audio(audio_bytes, source)
-        except Exception as e:
-            await manager.broadcast(session_id, {"type": "error", "message": f"转写失败: {e}"})
-            return
-        if not text.strip():
-            return
-
-        conn = db.get_db()
-        try:
-            transcript = db.add_transcript(conn, session_id, source, text.strip())
+            async with lock:
+                yield
         finally:
-            conn.close()
-        await manager.broadcast(session_id, {
-            "type": "transcript",
-            "session_id": session_id,
-            "source": source,
-            "text": text.strip(),
-            "seq": transcript["seq"],
-        })
+            current = self._session_locks.get(session_id)
+            if current is not None and current[0] is lock:
+                remaining = current[1] - 1
+                if remaining == 0:
+                    self._session_locks.pop(session_id, None)
+                else:
+                    self._session_locks[session_id] = (lock, remaining)
 
-        # 若文本像问题，生成答案
-        if _looks_like_question(text):
-            try:
-                answer = await llm.generate_answer(text.strip())
-            except Exception as e:
-                await manager.broadcast(session_id, {"type": "error", "message": f"答案生成失败: {e}"})
+    def connect(self, session_id: str, ws: WebSocket, last_event_id: int = 0) -> None:
+        self.connections.setdefault(session_id, set()).add(ws)
+        self.send_locks.setdefault(ws, asyncio.Lock())
+        self.event_watermarks[ws] = max(0, last_event_id)
+
+    def disconnect(self, session_id: str, ws: WebSocket) -> None:
+        self.send_locks.pop(ws, None)
+        self.event_watermarks.pop(ws, None)
+        sockets = self.connections.get(session_id)
+        if not sockets:
+            return
+        sockets.discard(ws)
+        if not sockets:
+            self.connections.pop(session_id, None)
+
+    async def send(self, ws: WebSocket, message: dict) -> bool:
+        try:
+            lock = self.send_locks.setdefault(ws, asyncio.Lock())
+            async with lock:
+                event_id = message.get("event_id")
+                if type(event_id) is int and event_id <= self.event_watermarks.get(
+                    ws, 0
+                ):
+                    return True
+                await asyncio.wait_for(
+                    ws.send_json(message), timeout=SEND_TIMEOUT_SECONDS
+                )
+                if type(event_id) is int:
+                    self.event_watermarks[ws] = event_id
+            return True
+        except (WebSocketDisconnect, RuntimeError, OSError, asyncio.TimeoutError):
+            return False
+
+    async def replay(
+        self,
+        ws: WebSocket,
+        session_id: str,
+        through_event_id: int,
+    ) -> bool:
+        if self._event_loader is None:
+            raise RuntimeError("未配置事件重放加载器")
+        latest_sent = self.event_watermarks.get(ws, 0)
+        while latest_sent < through_event_id:
+            events = await self._event_loader(session_id, latest_sent, 200)
+            events = [
+                event for event in events if event["event_id"] <= through_event_id
+            ]
+            if not events:
+                return True
+            for event in events:
+                if not await self.send(ws, event_message(event)):
+                    return False
+                latest_sent = event["event_id"]
+        return True
+
+    async def _send_in_event_order(
+        self, ws: WebSocket, session_id: str, message: dict
+    ) -> bool:
+        event_id = message.get("event_id")
+        if type(event_id) is not int or self._event_loader is None:
+            return await self.send(ws, message)
+        if event_id <= self.event_watermarks.get(ws, 0):
+            return True
+        return await self.replay(ws, session_id, event_id)
+
+    async def broadcast(self, session_id: str, message: dict) -> None:
+        async with self.session_lock(session_id):
+            sockets = list(self.connections.get(session_id, set()))
+            if not sockets:
                 return
-            conn = db.get_db()
-            try:
-                db.add_answer(conn, session_id, text.strip(), answer, "llm")
-            finally:
-                conn.close()
-            await manager.broadcast(session_id, {
-                "type": "answer",
-                "session_id": session_id,
-                "question": text.strip(),
-                "answer": answer,
-            })
-    except Exception as e:
-        # 兜底：避免 asyncio.create_task 中的异常变成 "Task exception was never retrieved"
-        await manager.broadcast(session_id, {"type": "error", "message": f"处理音频分片失败: {e}"})
+            results = await asyncio.gather(
+                *(self._send_in_event_order(ws, session_id, message) for ws in sockets)
+            )
+            for ws, sent in zip(sockets, results):
+                if not sent:
+                    self.disconnect(session_id, ws)
+
+    async def close_session(self, session_id: str, code: int = 1000) -> None:
+        async with self.session_lock(session_id):
+            sockets = list(self.connections.get(session_id, set()))
+            self.connections.pop(session_id, None)
+            await asyncio.gather(
+                *(ws.close(code=code) for ws in sockets), return_exceptions=True
+            )
+            for ws in sockets:
+                self.send_locks.pop(ws, None)
+                self.event_watermarks.pop(ws, None)
+
+    async def shutdown(self) -> None:
+        sockets = [
+            ws
+            for session_sockets in self.connections.values()
+            for ws in session_sockets
+        ]
+        self.connections.clear()
+        await asyncio.gather(
+            *(ws.close(code=1001) for ws in sockets), return_exceptions=True
+        )
+        self.send_locks.clear()
+        self.event_watermarks.clear()
+        self._session_locks.clear()
 
 
-async def _regenerate_answer(session_id: str, question: str):
-    """后台任务：重新生成答案（避免内联 await 阻塞消息循环）。"""
+async def _load_events(session_id: str, after_event_id: int, limit: int) -> list[dict]:
+    return await run_db(db.get_events, session_id, after_event_id, limit)
+
+
+manager = ConnectionManager(event_loader=_load_events)
+pipeline = RealtimePipeline(manager.broadcast)
+
+
+async def _send_error(ws: WebSocket, code: str, message: str, **details) -> None:
+    await manager.send(
+        ws, server_message("error", code=code, message=message, **details)
+    )
+
+
+def _decode_audio(data: str) -> bytes:
+    max_bytes = int(os.environ.get("AI_MAX_AUDIO_CHUNK_BYTES", str(2 * 1024 * 1024)))
+    if len(data) > ((max_bytes + 2) // 3) * 4 + 4:
+        raise ValueError("音频分片过大")
     try:
-        answer = await llm.generate_answer(question)
-    except Exception as e:
-        await manager.broadcast(session_id, {"type": "error", "message": f"答案生成失败: {e}"})
-        return
-    conn = db.get_db()
+        audio_bytes = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("音频数据不是有效 Base64") from exc
+    if not audio_bytes or len(audio_bytes) > max_bytes:
+        raise ValueError("音频分片大小非法")
+    return audio_bytes
+
+
+def _source_allowed(session: dict, source: str) -> bool:
+    return session["radio_mode"] == "both" or session["radio_mode"] == source
+
+
+def _origin_allowed(ws: WebSocket) -> bool:
+    allowed = {
+        item.strip()
+        for item in os.environ.get("AI_ALLOWED_ORIGINS", "").split(",")
+        if item.strip()
+    }
+    origin = ws.headers.get("origin")
+    if not origin:
+        return True
+    return origin in allowed
+
+
+async def websocket_endpoint(ws: WebSocket, session_id: str) -> None:
+    """WebSocket v1：先认证，再同步事件，然后处理严格消息模型。"""
+    await ws.accept()
+    authenticated = False
     try:
-        db.add_answer(conn, session_id, question, answer, "llm")
-    finally:
-        conn.close()
-    await manager.broadcast(session_id, {
-        "type": "answer",
-        "session_id": session_id,
-        "question": question,
-        "answer": answer,
-    })
+        if not _origin_allowed(ws):
+            await _send_error(ws, "origin_not_allowed", "WebSocket Origin 不在允许列表")
+            await ws.close(code=4403)
+            return
+        client_host = ws.client.host if ws.client else "unknown"
+        if not rate_limiter.allow(f"ws-auth:{client_host}", 30, 60):
+            await _send_error(ws, "rate_limited", "认证请求过于频繁")
+            await ws.close(code=4429)
+            return
+        try:
+            raw_auth = await asyncio.wait_for(
+                ws.receive_json(), timeout=AUTH_TIMEOUT_SECONDS
+            )
+            auth = parse_auth_message(raw_auth)
+        except (asyncio.TimeoutError, ValueError):
+            await _send_error(
+                ws, "authentication_required", "请先发送有效的 authenticate 消息"
+            )
+            await ws.close(code=4401)
+            return
 
+        if not verify_token(auth.token):
+            await _send_error(ws, "authentication_failed", "认证失败")
+            await ws.close(code=4401)
+            return
+        authenticated = True
 
-def _looks_like_question(text: str) -> bool:
-    """判断文本是否像面试问题。"""
-    question_markers = ["?", "？", "吗", "呢", "如何", "怎么", "为什么", "什么", "哪些", "请", "介绍", "说说", "谈谈"]
-    return any(m in text for m in question_markers)
+        try:
+            session = await run_db(db.require_session, session_id)
+        except db.SessionNotFoundError:
+            await _send_error(ws, "session_not_found", "会话不存在")
+            await ws.close(code=4404)
+            return
 
+        async with manager.session_lock(session_id):
+            session, latest_event_id = await run_db(db.get_session_snapshot, session_id)
+            manager.connect(
+                session_id, ws, last_event_id=min(auth.last_event_id, latest_event_id)
+            )
+            if not await manager.replay(ws, session_id, latest_event_id):
+                raise WebSocketDisconnect(code=1006)
+            if not await manager.send(
+                ws,
+                server_message(
+                    "sync_complete",
+                    session_id=session_id,
+                    latest_event_id=latest_event_id,
+                    status=session["status"],
+                    radio_mode=session["radio_mode"],
+                ),
+            ):
+                raise WebSocketDisconnect(code=1006)
 
-async def websocket_endpoint(ws: WebSocket, session_id: str):
-    """WebSocket 端点：处理音频分片和会话控制。"""
-    conn = db.get_db()
-    try:
-        session = db.get_session(conn, session_id)
-    finally:
-        conn.close()
-    if not session:
-        await ws.close(code=4004, reason="会话不存在")
-        return
-
-    await manager.connect(session_id, ws)
-    # 广播当前会话状态
-    await manager.broadcast(session_id, {
-        "type": "session_state",
-        "session_id": session_id,
-        "status": session["status"],
-        "radio_mode": session["radio_mode"],
-    })
-
-    # 登记所有后台任务（音频分片处理、答案再生成），退出时统一 await 收尾，
-    # 保证消息循环不被 LLM 调用（可能数秒到 30s）阻塞。
-    pending_tasks: set[asyncio.Task] = set()
-
-    def _spawn(coro) -> asyncio.Task:
-        task = asyncio.create_task(coro)
-        pending_tasks.add(task)
-        task.add_done_callback(pending_tasks.discard)
-        return task
-
-    try:
+        connection_key = f"ws:{session_id}:{id(ws)}"
         while True:
             try:
-                data = await ws.receive_json()
-                msg_type = data.get("type")
-
-                if msg_type == "audio_chunk":
-                    source = data.get("source", "pc")
-                    audio_b64 = data.get("data", "")
-                    _spawn(_handle_audio_chunk(session_id, source, audio_b64))
-
-                elif msg_type == "set_radio_mode":
-                    mode = data.get("mode", "pc")
-                    conn = db.get_db()
-                    try:
-                        conn.execute("UPDATE sessions SET radio_mode = ? WHERE id = ?", (mode, session_id))
-                        conn.commit()
-                    finally:
-                        conn.close()
-                    await manager.broadcast(session_id, {
-                        "type": "session_state",
-                        "session_id": session_id,
-                        "status": "recording",
-                        "radio_mode": mode,
-                    })
-
-                elif msg_type == "regenerate_answer":
-                    question = data.get("question", "")
-                    if question:
-                        _spawn(_regenerate_answer(session_id, question))
-
-                elif msg_type == "end_session":
-                    conn = db.get_db()
-                    try:
-                        db.end_session(conn, session_id)
-                    finally:
-                        conn.close()
-                    await manager.broadcast(session_id, {
-                        "type": "session_state",
-                        "session_id": session_id,
-                        "status": "ended",
-                        "radio_mode": session["radio_mode"],
-                    })
-                    break
-
-            except WebSocketDisconnect:
+                raw_message = await ws.receive_json()
+            except ValueError:
+                await _send_error(ws, "invalid_message", "消息必须是有效 JSON")
+                continue
+            except RuntimeError as exc:
+                if "WebSocket is not connected" in str(exc):
+                    raise WebSocketDisconnect(code=1006) from exc
                 raise
-            except Exception as e:
-                # 消息处理异常（如 conn.execute 抛 OperationalError）不导致连接泄漏：
-                # 记录后退出，外层 finally 仍会清理连接与后台任务。
-                logger.warning("WebSocket 处理消息异常，断开连接: %s", e)
-                break
+            if not rate_limiter.allow(connection_key, 600, 60):
+                await _send_error(ws, "rate_limited", "消息过于频繁")
+                continue
+            try:
+                message = parse_client_message(raw_message)
+            except ValueError as exc:
+                await _send_error(ws, "invalid_message", str(exc))
+                continue
+
+            try:
+                if isinstance(message, StartSessionMessage):
+                    _, event = await run_db(
+                        db.start_session, session_id, message.radio_mode
+                    )
+                    await manager.broadcast(session_id, event_message(event))
+
+                elif isinstance(message, SetRadioModeMessage):
+                    _, event = await run_db(db.set_radio_mode, session_id, message.mode)
+                    if message.mode == "mobile":
+                        max_pc_seq = await run_db(
+                            db.get_max_audio_chunk_seq, session_id, "pc"
+                        )
+                        if max_pc_seq >= 0:
+                            await pipeline.cancel_audio_source(
+                                session_id,
+                                "pc",
+                                max_pc_seq,
+                                "source_disabled",
+                            )
+                    await manager.broadcast(session_id, event_message(event))
+
+                elif isinstance(message, CancelAudioSourceMessage):
+                    await pipeline.cancel_audio_source(
+                        session_id,
+                        message.source,
+                        message.through_chunk_seq,
+                        message.reason,
+                    )
+
+                elif isinstance(message, AudioChunkMessage):
+                    session = await run_db(db.ensure_recording, session_id)
+                    if not _source_allowed(session, message.source):
+                        await _send_error(
+                            ws,
+                            "source_not_allowed",
+                            "当前收音模式不允许该音频来源",
+                            chunk_id=str(message.chunk_id),
+                        )
+                        continue
+                    try:
+                        audio_bytes = _decode_audio(message.data)
+                    except ValueError as exc:
+                        await _send_error(
+                            ws,
+                            "invalid_audio",
+                            str(exc),
+                            chunk_id=str(message.chunk_id),
+                        )
+                        continue
+                    accepted, record = await pipeline.enqueue_audio(
+                        AudioWork(
+                            session_id=session_id,
+                            chunk_id=str(message.chunk_id),
+                            source=message.source,
+                            codec=message.codec,
+                            chunk_seq=message.chunk_seq,
+                            captured_at=message.captured_at,
+                            duration_ms=message.duration_ms,
+                            audio_bytes=audio_bytes,
+                        )
+                    )
+                    if accepted:
+                        await manager.broadcast(
+                            session_id,
+                            server_message(
+                                "chunk_ack",
+                                event_id=record.get("event_id"),
+                                session_id=session_id,
+                                chunk_id=str(message.chunk_id),
+                                chunk_seq=message.chunk_seq,
+                                status=record.get("status", "queued"),
+                                error_code=record.get("error_code"),
+                            ),
+                        )
+                    elif record.get("status") == "backpressure":
+                        await _send_error(
+                            ws,
+                            "audio_backpressure",
+                            "音频处理队列已满，请稍后重试",
+                            chunk_id=str(message.chunk_id),
+                        )
+                    else:
+                        await manager.send(
+                            ws,
+                            server_message(
+                                "chunk_ack",
+                                chunk_id=str(message.chunk_id),
+                                chunk_seq=message.chunk_seq,
+                                status=record.get("status", "duplicate"),
+                                duplicate=True,
+                            ),
+                        )
+
+                elif isinstance(message, RegenerateAnswerMessage):
+                    await run_db(db.ensure_recording, session_id)
+                    regenerate_key = f"regenerate:{token_fingerprint(auth.token)}"
+                    if not rate_limiter.allow(regenerate_key, 10, 60):
+                        await _send_error(ws, "rate_limited", "重新生成请求过于频繁")
+                        continue
+                    if not await pipeline.enqueue_answer(
+                        AnswerWork(session_id, message.question, message.use_search)
+                    ):
+                        await _send_error(
+                            ws, "answer_backpressure", "答案生成队列已满，请稍后重试"
+                        )
+
+                elif isinstance(message, ResumeMessage):
+                    async with manager.session_lock(session_id):
+                        session, latest_event_id = await run_db(
+                            db.get_session_snapshot, session_id
+                        )
+                        self_cursor = min(message.after_event_id, latest_event_id)
+                        manager.event_watermarks[ws] = max(
+                            manager.event_watermarks.get(ws, 0), self_cursor
+                        )
+                        if not await manager.replay(ws, session_id, latest_event_id):
+                            raise WebSocketDisconnect(code=1006)
+                        if not await manager.send(
+                            ws,
+                            server_message(
+                                "sync_complete",
+                                session_id=session_id,
+                                latest_event_id=latest_event_id,
+                                status=session["status"],
+                                radio_mode=session["radio_mode"],
+                            ),
+                        ):
+                            raise WebSocketDisconnect(code=1006)
+
+                elif isinstance(message, PingMessage):
+                    await manager.send(ws, server_message("pong"))
+
+                elif isinstance(message, EndSessionMessage):
+                    await pipeline.flush_session(session_id)
+                    _, event = await run_db(db.end_session, session_id)
+                    await pipeline.stop_session(session_id)
+                    if event:
+                        await manager.broadcast(session_id, event_message(event))
+                    await manager.close_session(session_id)
+                    return
+
+            except db.SessionNotFoundError:
+                await _send_error(ws, "session_not_found", "会话不存在")
+            except db.SessionStateError as exc:
+                details = {
+                    "current_status": exc.current_status,
+                    "expected": exc.expected,
+                }
+                if isinstance(message, AudioChunkMessage):
+                    details["chunk_id"] = str(message.chunk_id)
+                await _send_error(
+                    ws,
+                    "invalid_session_state",
+                    str(exc),
+                    **details,
+                )
+            except db.AudioSourceNotAllowedError as exc:
+                details = {}
+                if isinstance(message, AudioChunkMessage):
+                    details["chunk_id"] = str(message.chunk_id)
+                await _send_error(
+                    ws,
+                    "source_not_allowed",
+                    str(exc),
+                    **details,
+                )
+            except ValueError as exc:
+                details = {}
+                if isinstance(message, AudioChunkMessage):
+                    details["chunk_id"] = str(message.chunk_id)
+                await _send_error(ws, "invalid_audio_chunk", str(exc), **details)
+            except Exception:
+                logger.exception("WebSocket 消息处理失败: session=%s", session_id)
+                await _send_error(ws, "internal_error", "消息处理失败")
 
     except WebSocketDisconnect:
         pass
     finally:
-        # 等待所有后台任务完成（LLM 调用等）再断开，避免任务悬挂/异常未取
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
-        # 无论正常退出（end_session）、异常还是断开，都清理连接
-        manager.disconnect(session_id, ws)
+        if authenticated:
+            manager.disconnect(session_id, ws)
+        else:
+            manager.send_locks.pop(ws, None)
+        rate_limiter.clear_prefix(f"ws:{session_id}:{id(ws)}")
+
+
+async def shutdown_realtime() -> None:
+    await pipeline.shutdown()
+    await manager.shutdown()
+
+
+def prepare_realtime() -> None:
+    pipeline.prepare_for_current_loop()
