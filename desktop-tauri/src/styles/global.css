@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  background: #0b0f1a;
+  color: #f1f5f9;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* 输入类元素允许选择 */
+input,
+textarea {
+  user-select: text;
+}
+
+/* 滚动条:细、深色 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3550;
+  border-radius: 4px;
+  border: 2px solid #0b0f1a;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4a6e;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 键盘可达性:统一焦点环 */
+:focus-visible {
+  outline: 2px solid #4f7cff;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Agent composer 依靠光标表达输入焦点，不改变边框或绘制额外焦点环。 */
+.agent-prompt-input:focus,
+.agent-prompt-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* 数字等宽(时间戳/计数) */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 减少动态效果偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

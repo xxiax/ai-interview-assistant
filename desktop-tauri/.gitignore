@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# 编辑器
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# 日志
+*.log

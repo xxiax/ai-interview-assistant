@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "默认权限：事件监听、命令调用与窗口能力；实时音频由 Rust WASAPI loopback 采集",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:window:default",
+    "core:webview:default",
+    "core:app:default",
+    "opener:default"
+  ]
+}
