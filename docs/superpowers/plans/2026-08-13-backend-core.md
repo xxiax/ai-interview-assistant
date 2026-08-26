@@ -1,1517 +1,180 @@
-# 后端核心（MVP）实现计划
+# 后端核心实施计划：归档状态
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> 原计划日期：2026-08-13
+> 最近按代码复核：2026-08-26
+> 状态：核心后端已实现。本文件不再是可执行接口规范。
 
-**Goal:** 实现 AI 辅助面试工具的后端核心：FastAPI 服务 + WebSocket 实时转写/答案生成 + 会话管理 + LLM/搜索配置管理。
+原始计划完成后，后端经历了安全、协议、可靠性、成本控制和 ASR 路由修订。旧计划中的部分示例曾包含无鉴权请求、明文 API Key、简化音频消息和不完整的恢复语义，已经不符合当前代码，因此不应复制到客户端或新服务中。当前工作树还包含尚未完成生产收敛的 FunASR 与代理改动；本归档只记录现状，不代表它们已经通过部署审查。
 
-**Architecture:** FastAPI 提供 REST API 和 WebSocket 端点。音频分片通过 WebSocket 上传，后端调用 Groq Whisper 转写，转写文本触发 LLM 生成答案，结果通过 WebSocket 广播给所有连接的客户端。SQLite 存储会话、转写、答案和配置。
+当前开发入口：
 
-**Tech Stack:** Python 3.10, FastAPI, uvicorn, websockets, httpx, SQLite (sqlite3 标准库), Groq API, OpenAI 兼容 LLM API
+1. [后端权威 README](../../../backend/README.md)
+2. [当前架构快照](../specs/2026-08-13-ai-interview-assistant-design.md)
+3. `backend/app/` 实现
+4. `backend/tests/` 行为证据
 
-## Global Constraints
+如果文档冲突，以代码和测试为准。
 
-- Python 3.10+（本机 3.10.6）
-- 所有 API key 通过环境变量或配置页管理，**绝不硬编码**
-- LLM 使用 OpenAI 兼容格式（base_url + api_key + model）
-- ASR 使用 Groq Whisper API（whisper-large-v3）
-- 数据库使用 SQLite（标准库 sqlite3，无需 ORM）
-- 所有异步操作使用 `async/await`
-- 代码注释使用中文
-- 每个任务结束必须提交 git
+## 1. 原计划目标
 
----
+后端核心要提供：
 
-### Task 1: 项目脚手架与依赖
+- 会话管理。
+- 电脑/移动来源的实时音频入口。
+- Groq Whisper 转写。
+- LLM 答案生成。
+- 可选搜索增强。
+- 会后复盘。
+- LLM/Search 配置管理。
+- SQLite 持久化。
 
-**Files:**
-- Create: `backend/requirements.txt`
-- Create: `backend/app/__init__.py`
-- Create: `backend/app/main.py`
-- Create: `backend/.env.example`
+这些是 2026-08-13 的原始目标。当前实现默认使用 `AI_ASR_ENGINE=funasr` 的 WAV 路径，多模态 LLM 和 Groq 作为可选引擎保留，并支持 LLM/Search/ASR/Network 四类配置；这些扩展不是原计划当时的承诺。
 
-**Interfaces:**
-- Consumes: 无
-- Produces: `app.main:app`（FastAPI 实例，后续任务挂载路由）
+## 2. 完成情况
 
-- [ ] **Step 1: 创建 requirements.txt**
+| 工作项 | 状态 | 当前实现 |
+|---|---|---|
+| FastAPI 应用与生命周期 | 完成 | `app/main.py` |
+| SQLite schema 与迁移 | 完成 | `app/db.py` |
+| 会话状态机 | 完成 | `idle -> recording -> ended` |
+| REST 会话 API | 完成并扩展 | 创建、读取、开始、结束、历史/对账，以及 idle/ended 会话删除 |
+| WebSocket | 完成并升级 | 首包认证、`v:1`、事件重放、严格模型 |
+| 音频处理 | 完成并升级 | UUID 幂等、摘要冲突、排序、背压、对账、重试、`cancel_audio_source` 水位取消和当前任务中止 |
+| ASR | 完成但仍需生产收敛 | 默认 FunASR WAV 路径、可选多模态 LLM、Groq 非 WAV 路径和全路径 `ffprobe` 校验 |
+| 问题识别 | 已移除 | 实时链路不再判断问题，FunASR partial 只显示，final 直接驱动 AI |
+| LLM 答案 | 完成并加固 | OpenAI-compatible、输入隔离、输出/成本上限 |
+| 搜索 | 完成 | Google，可选且故障降级；Bing 新配置已退役；只是搜索增强，不是向量 RAG |
+| 复盘 | 完成并升级 | ended 限制、输入上限、幂等、single-flight |
+| 配置管理 | 完成并扩展 | LLM/Search/ASR/Network 四类配置，Fernet 密钥存储、脱敏读取、激活和删除；Network 秘密模型仍需收敛 |
+| 认证与限流 | 完成 | REST Bearer、WS Token、Origin/Host 和速率限制 |
+| 成本控制 | 完成 | 并发门 + SQLite 持久化预算 |
+| 备份恢复 | 完成代码与测试 | `backend/scripts/` |
+| 自动化测试 | 当前通过 | 2026-08-26 Python 3.10.6：后端 `218 passed`；`ruff` 通过，本轮未重新生成覆盖率，目标 Python 3.12 需重新复现当前测试集 |
+| 容器生产实测 | 暂缓 | 资产存在，Docker daemon 不可用时未实测 |
 
-```txt
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-httpx==0.28.1
-python-dotenv==1.0.1
-websockets==14.1
-```
+## 3. 原计划之后形成的关键约束
 
-- [ ] **Step 2: 创建 app/__init__.py**
+### 认证
 
-```python
-"""AI 面试助手后端服务。"""
-```
+- 所有业务 REST API 都需要 `Authorization: Bearer <token>`。
+- WebSocket 不能在 URL 中携带业务 Token；连接后的第一条消息必须是 `authenticate`。
+- Token 至少 32 字符。
 
-- [ ] **Step 3: 创建 app/main.py**
+### 音频协议
 
-```python
-"""FastAPI 应用入口。"""
-from fastapi import FastAPI
+当前 `audio_chunk` 必须包含：
 
-app = FastAPI(title="AI 面试助手", version="0.1.0")
+- `v: 1`
+- UUID `chunk_id`
+- `source`
+- `codec`
+- 每来源连续 `chunk_seq`
+- 带时区 `captured_at`
+- `duration_ms`
+- Base64 `data`
 
+只发送 `source + data` 的旧客户端不会工作。
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-```
+当前 Tauri 客户端只采集电脑播放声，由 WASAPI loopback 送入后端并标记为 `source=pc`；当前不启用麦克风，也不做说话人分离。
 
-- [ ] **Step 4: 创建 .env.example**
+当前 LivePage 会把后端/Tauri 命令产生的标准 `Error` 或原始字符串统一归一化后显示；字符串错误不再因为读取不存在的 `.message` 而变成空 toast。
 
-```env
-# Groq Whisper API
-GROQ_API_KEY=
+当前协议还包含：
 
-# LLM 中转站配置
-LLM_BASE_URL=
-LLM_API_KEY=
-LLM_MODEL=
-```
+~~~json
+{"v":1,"type":"cancel_audio_source","source":"pc","through_chunk_seq":17,"reason":"capture_stopped"}
+~~~
 
-- [ ] **Step 5: 创建虚拟环境并安装依赖**
+该消息以包含式水位取消单一来源的 queued、带可重试错误的 failed 和当前 ASR 任务，并持久化 cancelled ACK；原因只允许 `capture_stopped`、`source_disabled`。同水位重复请求幂等，水位内迟到旧片直接取消，更高序号可用于下一轮采集。
 
-```bash
-cd backend
-python -m venv .venv
-source .venv/Scripts/activate  # Windows Git Bash
-pip install -r requirements.txt
-```
+后端取消水位本身仍是进程内状态。已经落库 cancelled 的分片可跨重启恢复，但尚未 reserve 的空洞取消范围不会跨后端重启；这属于需要部署故障测试覆盖的边界。
 
-- [ ] **Step 6: 运行测试验证服务启动**
+### 事件恢复
 
-```bash
-cd backend
-uvicorn app.main:app --port 8000
-# 另开终端
-curl http://localhost:8000/health
-# 期望: {"status":"ok"}
-```
+- `session_state`、`chunk_ack`、`transcript`、`answer` 持久化。
+- 客户端必须保存 `event_id` 并处理重放。
+- 音频还必须用 `chunk_id/chunk_seq` 单独对账。
+- 服务重启/关闭中断的分片可以用同一身份重试，不是永久失败终态。
+- Tauri 客户端停止、切到 `mobile` 或退出实时页时先关闭 capture gate，再发送取消水位；页面重进、重连或应用重启不自动恢复旧采集。
+- `processing_failed` 在协议层可重试，但当前 Tauri 对同一分片累计 3 次后停止自动重试，且 `queued` ACK 不清空失败计数；首个 ASR 故障会熔断采集并取消积压。
 
-- [ ] **Step 7: 提交**
+### 配置秘密
 
-```bash
-git add backend/
-git commit -m "feat: backend scaffold with FastAPI and health check"
-```
-
----
-
-### Task 2: 数据库层（SQLite）
-
-**Files:**
-- Create: `backend/app/db.py`
-- Test: `backend/tests/test_db.py`
-
-**Interfaces:**
-- Consumes: 无
-- Produces:
-  - `get_db()` → `sqlite3.Connection`（每请求一个连接）
-  - `init_db()` → None（建表）
-  - `create_session(title: str) -> dict`
-  - `get_session(session_id: str) -> dict | None`
-  - `end_session(session_id: str) -> None`
-  - `add_transcript(session_id, source, text) -> dict`
-  - `get_transcripts(session_id) -> list[dict]`
-  - `add_answer(session_id, question, answer, source) -> dict`
-  - `get_answers(session_id) -> list[dict]`
-  - `save_config(type, name, data, is_active) -> dict`
-  - `get_configs(type) -> list[dict]`
-  - `get_active_config(type) -> dict | None`
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_db.py
-import os
-import sys
-import tempfile
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import pytest
-from app import db
-
-
-@pytest.fixture()
-def conn(tmp_path):
-    db_path = tmp_path / "test.db"
-    conn = db.get_db(str(db_path))
-    db.init_db(conn)
-    yield conn
-    conn.close()
-
-
-def test_create_and_get_session(conn):
-    session = db.create_session(conn, "测试面试")
-    assert session["title"] == "测试面试"
-    assert session["status"] == "idle"
-    got = db.get_session(conn, session["id"])
-    assert got["id"] == session["id"]
-
-
-def test_add_and_get_transcripts(conn):
-    session = db.create_session(conn, "测试")
-    db.add_transcript(conn, session["id"], "pc", "你好")
-    db.add_transcript(conn, session["id"], "mobile", "面试官好")
-    transcripts = db.get_transcripts(conn, session["id"])
-    assert len(transcripts) == 2
-    assert transcripts[0]["source"] == "pc"
-    assert transcripts[0]["text"] == "你好"
-
-
-def test_add_and_get_answers(conn):
-    session = db.create_session(conn, "测试")
-    db.add_answer(conn, session["id"], "什么是 FastAPI?", "FastAPI 是一个 Web 框架", "llm")
-    answers = db.get_answers(conn, session["id"])
-    assert len(answers) == 1
-    assert answers[0]["question"] == "什么是 FastAPI?"
-
-
-def test_save_and_get_configs(conn):
-    db.save_config(conn, "llm", "我的中转", {"base_url": "http://x", "api_key": "k"}, True)
-    configs = db.get_configs(conn, "llm")
-    assert len(configs) == 1
-    assert configs[0]["name"] == "我的中转"
-    active = db.get_active_config(conn, "llm")
-    assert active["name"] == "我的中转"
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_db.py -v`
-Expected: FAIL（`ModuleNotFoundError: No module named 'app.db'`）
-
-- [ ] **Step 3: 实现 db.py**
-
-```python
-"""SQLite 数据库层。"""
-import json
-import sqlite3
-import uuid
-from datetime import datetime, timezone
-
-
-def get_db(db_path: str = "interview.db") -> sqlite3.Connection:
-    """获取数据库连接。"""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def init_db(conn: sqlite3.Connection) -> None:
-    """初始化数据库表。"""
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'idle',
-        radio_mode TEXT NOT NULL DEFAULT 'pc',
-        created_at TEXT NOT NULL,
-        ended_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS transcripts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        source TEXT NOT NULL,
-        text TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        seq INTEGER NOT NULL,
-        FOREIGN KEY (session_id) REFERENCES sessions(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS answers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        question TEXT NOT NULL,
-        answer TEXT NOT NULL,
-        source TEXT NOT NULL DEFAULT 'llm',
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (session_id) REFERENCES sessions(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS configs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL,
-        name TEXT NOT NULL,
-        data TEXT NOT NULL,
-        is_active INTEGER NOT NULL DEFAULT 0
-    );
-    """)
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def create_session(conn: sqlite3.Connection, title: str) -> dict:
-    """创建会话。"""
-    session_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO sessions (id, title, status, radio_mode, created_at) VALUES (?, ?, 'idle', 'pc', ?)",
-        (session_id, title, _now()),
-    )
-    conn.commit()
-    return get_session(conn, session_id)
-
-
-def get_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
-    """获取会话。"""
-    row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def end_session(conn: sqlite3.Connection, session_id: str) -> None:
-    """结束会话。"""
-    conn.execute(
-        "UPDATE sessions SET status = 'ended', ended_at = ? WHERE id = ?",
-        (_now(), session_id),
-    )
-    conn.commit()
-
-
-def add_transcript(conn: sqlite3.Connection, session_id: str, source: str, text: str) -> dict:
-    """添加转写记录。"""
-    seq = conn.execute(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcripts WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()[0]
-    cur = conn.execute(
-        "INSERT INTO transcripts (session_id, source, text, timestamp, seq) VALUES (?, ?, ?, ?, ?)",
-        (session_id, source, text, _now(), seq),
-    )
-    conn.commit()
-    return {
-        "id": cur.lastrowid,
-        "session_id": session_id,
-        "source": source,
-        "text": text,
-        "seq": seq,
-    }
-
-
-def get_transcripts(conn: sqlite3.Connection, session_id: str) -> list[dict]:
-    """获取会话的所有转写。"""
-    rows = conn.execute(
-        "SELECT * FROM transcripts WHERE session_id = ? ORDER BY seq",
-        (session_id,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def add_answer(conn: sqlite3.Connection, session_id: str, question: str, answer: str, source: str = "llm") -> dict:
-    """添加答案记录。"""
-    cur = conn.execute(
-        "INSERT INTO answers (session_id, question, answer, source, created_at) VALUES (?, ?, ?, ?, ?)",
-        (session_id, question, answer, source, _now()),
-    )
-    conn.commit()
-    return {
-        "id": cur.lastrowid,
-        "session_id": session_id,
-        "question": question,
-        "answer": answer,
-        "source": source,
-    }
-
-
-def get_answers(conn: sqlite3.Connection, session_id: str) -> list[dict]:
-    """获取会话的所有答案。"""
-    rows = conn.execute(
-        "SELECT * FROM answers WHERE session_id = ? ORDER BY id",
-        (session_id,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def save_config(conn: sqlite3.Connection, type: str, name: str, data: dict, is_active: bool) -> dict:
-    """保存配置。若 is_active 为 True，先清除同类型其他配置的 active 标记。"""
-    if is_active:
-        conn.execute("UPDATE configs SET is_active = 0 WHERE type = ?", (type,))
-    cur = conn.execute(
-        "INSERT INTO configs (type, name, data, is_active) VALUES (?, ?, ?, ?)",
-        (type, name, json.dumps(data, ensure_ascii=False), 1 if is_active else 0),
-    )
-    conn.commit()
-    return {"id": cur.lastrowid, "type": type, "name": name, "data": data, "is_active": is_active}
-
-
-def get_configs(conn: sqlite3.Connection, type: str) -> list[dict]:
-    """获取某类型的所有配置。"""
-    rows = conn.execute(
-        "SELECT * FROM configs WHERE type = ? ORDER BY id",
-        (type,),
-    ).fetchall()
-    return [{"id": r["id"], "type": r["type"], "name": r["name"], "data": json.loads(r["data"]), "is_active": bool(r["is_active"])} for r in rows]
-
-
-def get_active_config(conn: sqlite3.Connection, type: str) -> dict | None:
-    """获取某类型的当前启用配置。"""
-    row = conn.execute(
-        "SELECT * FROM configs WHERE type = ? AND is_active = 1",
-        (type,),
-    ).fetchone()
-    if not row:
-        return None
-    return {"id": row["id"], "type": row["type"], "name": row["name"], "data": json.loads(row["data"]), "is_active": True}
-```
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_db.py -v`
-Expected: PASS（4 个测试全过）
-
-- [ ] **Step 5: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: SQLite database layer with sessions, transcripts, answers, configs"
-```
-
----
-
-### Task 3: LLM 客户端（OpenAI 兼容）
-
-**Files:**
-- Create: `backend/app/llm.py`
-- Test: `backend/tests/test_llm.py`
-
-**Interfaces:**
-- Consumes: `db.get_active_config(conn, "llm")` → `{"data": {"base_url", "api_key", "model", "auth_field"}}`
-- Produces:
-  - `generate_answer(question: str, context: str = "") -> str`（异步，调用 LLM 生成回答要点）
-  - `generate_review(transcripts: list[dict], answers: list[dict]) -> str`（异步，生成复盘报告）
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_llm.py
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import pytest
-from app import llm
-
-
-@pytest.mark.asyncio
-async def test_generate_answer_without_config():
-    """无配置时应抛出明确错误。"""
-    with pytest.raises(RuntimeError, match="未配置 LLM"):
-        await llm.generate_answer("什么是 FastAPI?")
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_llm.py -v`
-Expected: FAIL（`ModuleNotFoundError: No module named 'app.llm'`）
-
-- [ ] **Step 3: 实现 llm.py**
-
-```python
-"""LLM 客户端（OpenAI 兼容格式）。"""
-import httpx
-
-from . import db
-
-
-def _get_llm_config() -> dict:
-    """获取当前启用的 LLM 配置，未配置则抛错。"""
-    conn = db.get_db()
-    try:
-        config = db.get_active_config(conn, "llm")
-    finally:
-        conn.close()
-    if not config:
-        raise RuntimeError("未配置 LLM，请在设置页配置")
-    return config["data"]
-
-
-async def _chat(messages: list[dict], temperature: float = 0.7) -> str:
-    """调用 OpenAI 兼容的 chat completions 接口。"""
-    config = _get_llm_config()
-    base_url = config.get("base_url", "").rstrip("/")
-    api_key = config.get("api_key", "")
-    model = config.get("model", "")
-    auth_field = config.get("auth_field", "Authorization")
-
-    if not base_url or not api_key or not model:
-        raise RuntimeError("LLM 配置不完整：需要 base_url、api_key、model")
-
-    headers = {auth_field: f"Bearer {api_key}"}
-    if auth_field.lower() == "authorization":
-        headers[auth_field] = f"Bearer {api_key}"
-
-    url = f"{base_url}/chat/completions"
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
-
-async def generate_answer(question: str, context: str = "") -> str:
-    """根据面试问题生成回答要点。"""
-    system = (
-        "你是一名资深面试辅导专家。请根据面试官的问题，给出简洁、有条理的回答要点。"
-        "回答要点应包含：核心答案、关键点、可能的追问方向。"
-        "使用中文回答，控制在 200 字以内。"
-    )
-    user = f"面试官的问题：{question}"
-    if context:
-        user += f"\n\n面试上下文（供参考）：{context}"
-    return await _chat(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.5,
-    )
-
-
-async def generate_review(transcripts: list[dict], answers: list[dict]) -> str:
-    """根据完整转写和答案生成复盘报告。"""
-    system = (
-        "你是一名资深面试辅导专家。请根据面试的完整转写和 AI 生成的答案，"
-        "生成一份复盘报告，包含：1. 面试问题清单 2. 每个问题的回答评估 3. 改进建议。"
-        "使用中文回答。"
-    )
-    transcript_text = "\n".join(f"[{t['source']}] {t['text']}" for t in transcripts)
-    answer_text = "\n".join(f"Q: {a['question']}\nA: {a['answer']}" for a in answers)
-    user = f"面试转写：\n{transcript_text}\n\nAI 答案：\n{answer_text}"
-    return await _chat(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.4,
-    )
-```
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_llm.py -v`
-Expected: PASS
-
-- [ ] **Step 5: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: LLM client with OpenAI-compatible chat completions"
-```
-
----
-
-### Task 4: ASR 客户端（Groq Whisper）
-
-**Files:**
-- Create: `backend/app/asr.py`
-- Test: `backend/tests/test_asr.py`
-
-**Interfaces:**
-- Consumes: 环境变量 `GROQ_API_KEY`
-- Produces:
-  - `transcribe_audio(audio_bytes: bytes, source: str) -> str`（异步，调用 Groq Whisper 转写音频分片）
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_asr.py
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import pytest
-from app import asr
-
-
-def test_missing_api_key():
-    """未设置 GROQ_API_KEY 时应抛出明确错误。"""
-    os.environ.pop("GROQ_API_KEY", None)
-    with pytest.raises(RuntimeError, match="GROQ_API_KEY"):
-        asr._get_api_key()
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_asr.py -v`
-Expected: FAIL（`ModuleNotFoundError: No module named 'app.asr'`）
-
-- [ ] **Step 3: 实现 asr.py**
-
-```python
-"""ASR 客户端（Groq Whisper API）。"""
-import os
-
-import httpx
-
-GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_MODEL = "whisper-large-v3"
-
-
-def _get_api_key() -> str:
-    """获取 Groq API key。"""
-    key = os.environ.get("GROQ_API_KEY", "")
-    if not key:
-        raise RuntimeError("未设置 GROQ_API_KEY 环境变量")
-    return key
-
-
-async def transcribe_audio(audio_bytes: bytes, source: str = "pc") -> str:
-    """调用 Groq Whisper 转写音频分片。"""
-    api_key = _get_api_key()
-    files = {"file": ("chunk.webm", audio_bytes, "audio/webm")}
-    data = {"model": GROQ_MODEL, "language": "zh"}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {api_key}"},
-            files=files,
-            data=data,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        return result.get("text", "")
-```
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_asr.py -v`
-Expected: PASS
-
-- [ ] **Step 5: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: ASR client with Groq Whisper API"
-```
-
----
-
-### Task 5: 会话管理 API
-
-**Files:**
-- Create: `backend/app/routes_sessions.py`
-- Modify: `backend/app/main.py`
-- Test: `backend/tests/test_sessions_api.py`
-
-**Interfaces:**
-- Consumes: `db.create_session`, `db.get_session`, `db.end_session`, `db.get_transcripts`, `db.get_answers`
-- Produces:
-  - `POST /api/sessions` → 创建会话
-  - `GET /api/sessions` → 获取会话列表
-  - `GET /api/sessions/{id}` → 获取会话详情
-  - `POST /api/sessions/{id}/end` → 结束会话
-  - `GET /api/sessions/{id}/transcripts` → 获取转写列表
-  - `GET /api/sessions/{id}/answers` → 获取答案列表
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_sessions_api.py
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import pytest
-from fastapi.testclient import TestClient
-
-from app.main import app
-
-client = TestClient(app)
-
-
-def test_create_session():
-    resp = client.post("/api/sessions", json={"title": "测试面试"})
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["title"] == "测试面试"
-    assert data["status"] == "idle"
-    return data["id"]
-
-
-def test_get_session():
-    session_id = test_create_session()
-    resp = client.get(f"/api/sessions/{session_id}")
-    assert resp.status_code == 200
-    assert resp.json()["id"] == session_id
-
-
-def test_end_session():
-    session_id = test_create_session()
-    resp = client.post(f"/api/sessions/{session_id}/end")
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "ended"
-
-
-def test_get_transcripts_empty():
-    session_id = test_create_session()
-    resp = client.get(f"/api/sessions/{session_id}/transcripts")
-    assert resp.status_code == 200
-    assert resp.json() == []
-
-
-def test_list_sessions():
-    test_create_session()
-    test_create_session()
-    resp = client.get("/api/sessions")
-    assert resp.status_code == 200
-    assert len(resp.json()) >= 2
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_sessions_api.py -v`
-Expected: FAIL（404，路由未注册）
-
-- [ ] **Step 3: 实现 routes_sessions.py**
-
-```python
-"""会话管理 API 路由。"""
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-
-from . import db
-
-router = APIRouter(prefix="/api/sessions", tags=["sessions"])
-
-
-class CreateSessionRequest(BaseModel):
-    title: str
-
-
-@router.post("")
-async def create_session(req: CreateSessionRequest):
-    conn = db.get_db()
-    try:
-        session = db.create_session(conn, req.title)
-    finally:
-        conn.close()
-    return session
-
-
-@router.get("")
-async def list_sessions():
-    conn = db.get_db()
-    try:
-        rows = conn.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-@router.get("/{session_id}")
-async def get_session(session_id: str):
-    conn = db.get_db()
-    try:
-        session = db.get_session(conn, session_id)
-    finally:
-        conn.close()
-    if not session:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    return session
-
-
-@router.post("/{session_id}/end")
-async def end_session(session_id: str):
-    conn = db.get_db()
-    try:
-        session = db.get_session(conn, session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="会话不存在")
-        db.end_session(conn, session_id)
-        return db.get_session(conn, session_id)
-    finally:
-        conn.close()
-
-
-@router.get("/{session_id}/transcripts")
-async def get_transcripts(session_id: str):
-    conn = db.get_db()
-    try:
-        return db.get_transcripts(conn, session_id)
-    finally:
-        conn.close()
-
-
-@router.get("/{session_id}/answers")
-async def get_answers(session_id: str):
-    conn = db.get_db()
-    try:
-        return db.get_answers(conn, session_id)
-    finally:
-        conn.close()
-```
-
-- [ ] **Step 4: 在 main.py 挂载路由**
-
-```python
-"""FastAPI 应用入口。"""
-from fastapi import FastAPI
-
-from . import db
-from .routes_sessions import router as sessions_router
-
-app = FastAPI(title="AI 面试助手", version="0.1.0")
-
-# 启动时初始化数据库
-@app.on_event("startup")
-async def startup():
-    conn = db.get_db()
-    try:
-        db.init_db(conn)
-    finally:
-        conn.close()
-
-app.include_router(sessions_router)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-```
-
-- [ ] **Step 5: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_sessions_api.py -v`
-Expected: PASS（4 个测试全过）
-
-- [ ] **Step 6: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: session management REST API"
-```
-
----
-
-### Task 6: 配置管理 API
-
-**Files:**
-- Create: `backend/app/routes_configs.py`
-- Modify: `backend/app/main.py`
-- Test: `backend/tests/test_configs_api.py`
-
-**Interfaces:**
-- Consumes: `db.save_config`, `db.get_configs`, `db.get_active_config`
-- Produces:
-  - `GET /api/configs/{type}` → 获取某类型配置列表
-  - `POST /api/configs/{type}` → 保存配置
-  - `POST /api/configs/{type}/activate/{config_id}` → 启用某配置
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_configs_api.py
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from fastapi.testclient import TestClient
-
-from app.main import app
-
-client = TestClient(app)
-
-
-def test_save_and_get_llm_config():
-    resp = client.post("/api/configs/llm", json={
-        "name": "我的中转",
-        "data": {"base_url": "http://x", "api_key": "k", "model": "gpt-4o"},
-        "is_active": True,
-    })
-    assert resp.status_code == 200
-    config_id = resp.json()["id"]
-
-    resp = client.get("/api/configs/llm")
-    assert resp.status_code == 200
-    configs = resp.json()
-    assert len(configs) == 1
-    assert configs[0]["name"] == "我的中转"
-    assert configs[0]["is_active"] is True
-
-
-def test_activate_switches_active():
-    client.post("/api/configs/llm", json={
-        "name": "配置A", "data": {"base_url": "a"}, "is_active": True,
-    })
-    resp = client.post("/api/configs/llm", json={
-        "name": "配置B", "data": {"base_url": "b"}, "is_active": True,
-    })
-    config_b_id = resp.json()["id"]
-
-    configs = client.get("/api/configs/llm").json()
-    active = [c for c in configs if c["is_active"]]
-    assert len(active) == 1
-    assert active[0]["id"] == config_b_id
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_configs_api.py -v`
-Expected: FAIL（404，路由未注册）
-
-- [ ] **Step 3: 实现 routes_configs.py**
-
-```python
-"""配置管理 API 路由。"""
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-
-from . import db
-
-router = APIRouter(prefix="/api/configs", tags=["configs"])
-
-
-class SaveConfigRequest(BaseModel):
-    name: str
-    data: dict
-    is_active: bool = False
-
-
-@router.get("/{config_type}")
-async def get_configs(config_type: str):
-    conn = db.get_db()
-    try:
-        return db.get_configs(conn, config_type)
-    finally:
-        conn.close()
-
-
-@router.post("/{config_type}")
-async def save_config(config_type: str, req: SaveConfigRequest):
-    conn = db.get_db()
-    try:
-        return db.save_config(conn, config_type, req.name, req.data, req.is_active)
-    finally:
-        conn.close()
-
-
-@router.post("/{config_type}/activate/{config_id}")
-async def activate_config(config_type: str, config_id: int):
-    conn = db.get_db()
-    try:
-        configs = db.get_configs(conn, config_type)
-        target = next((c for c in configs if c["id"] == config_id), None)
-        if not target:
-            raise HTTPException(status_code=404, detail="配置不存在")
-        # 清除所有 active，再启用目标
-        for c in configs:
-            if c["is_active"]:
-                conn.execute("UPDATE configs SET is_active = 0 WHERE id = ?", (c["id"],))
-        conn.execute("UPDATE configs SET is_active = 1 WHERE id = ?", (config_id,))
-        conn.commit()
-        return db.get_active_config(conn, config_type)
-    finally:
-        conn.close()
-```
-
-- [ ] **Step 4: 在 main.py 挂载路由**
-
-```python
-from .routes_configs import router as configs_router
-
-app.include_router(configs_router)
-```
-
-- [ ] **Step 5: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_configs_api.py -v`
-Expected: PASS（2 个测试全过）
-
-- [ ] **Step 6: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: config management REST API for LLM and search"
-```
-
----
-
-### Task 7: WebSocket 实时转写与答案生成
-
-**Files:**
-- Create: `backend/app/ws.py`
-- Modify: `backend/app/main.py`
-- Test: `backend/tests/test_ws.py`
-
-**Interfaces:**
-- Consumes: `db.add_transcript`, `db.add_answer`, `asr.transcribe_audio`, `llm.generate_answer`
-- Produces:
-  - `WS /ws/{session_id}` → 实时音频转写 + 答案生成
-  - 客户端消息类型：`audio_chunk`（base64 音频）、`set_radio_mode`、`regenerate_answer`、`end_session`
-  - 服务端消息类型：`transcript`、`answer`、`session_state`、`error`
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_ws.py
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import pytest
-from fastapi.testclient import TestClient
-
-from app.main import app
-
-client = TestClient(app)
-
-
-def test_ws_connect_and_receive():
-    session_id = client.post("/api/sessions", json={"title": "测试"}).json()["id"]
-    with client.websocket_connect(f"/ws/{session_id}") as ws:
-        # 发送一个音频分片（空音频，ASR 会返回空文本，但连接应正常）
-        ws.send_json({"type": "audio_chunk", "source": "pc", "data": ""})
-        # 发送收音模式切换
-        ws.send_json({"type": "set_radio_mode", "mode": "both"})
-        # 应收到 session_state 广播
-        msg = ws.receive_json()
-        assert msg["type"] == "session_state"
-        assert msg["radio_mode"] == "both"
-
-
-def test_ws_unknown_session():
-    with pytest.raises(Exception):
-        with client.websocket_connect("/ws/nonexistent") as ws:
-            ws.receive_json()
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_ws.py -v`
-Expected: FAIL（404，WebSocket 路由未注册）
-
-- [ ] **Step 3: 实现 ws.py**
-
-```python
-"""WebSocket 实时转写与答案生成。"""
-import base64
-import asyncio
-
-from fastapi import WebSocket, WebSocketDisconnect
-
-from . import db, asr, llm
-
-
-class ConnectionManager:
-    """管理会话的 WebSocket 连接。"""
-
-    def __init__(self):
-        self.connections: dict[str, list[WebSocket]] = {}
-
-    async def connect(self, session_id: str, ws: WebSocket):
-        await ws.accept()
-        if session_id not in self.connections:
-            self.connections[session_id] = []
-        self.connections[session_id].append(ws)
-
-    def disconnect(self, session_id: str, ws: WebSocket):
-        if session_id in self.connections:
-            self.connections[session_id].remove(ws)
-            if not self.connections[session_id]:
-                del self.connections[session_id]
-
-    async def broadcast(self, session_id: str, message: dict):
-        """向会话的所有连接广播消息。"""
-        for ws in self.connections.get(session_id, []):
-            try:
-                await ws.send_json(message)
-            except Exception:
-                pass
-
-
-manager = ConnectionManager()
-
-
-async def _handle_audio_chunk(session_id: str, source: str, audio_b64: str):
-    """处理音频分片：转写 + 生成答案。"""
-    if not audio_b64:
-        return
-    audio_bytes = base64.b64decode(audio_b64)
-    try:
-        text = await asr.transcribe_audio(audio_bytes, source)
-    except Exception as e:
-        await manager.broadcast(session_id, {"type": "error", "message": f"转写失败: {e}"})
-        return
-    if not text.strip():
-        return
-
-    conn = db.get_db()
-    try:
-        transcript = db.add_transcript(conn, session_id, source, text.strip())
-    finally:
-        conn.close()
-    await manager.broadcast(session_id, {
-        "type": "transcript",
-        "session_id": session_id,
-        "source": source,
-        "text": text.strip(),
-        "seq": transcript["seq"],
-    })
-
-    # 若文本像问题，生成答案
-    if _looks_like_question(text):
-        try:
-            answer = await llm.generate_answer(text.strip())
-        except Exception as e:
-            await manager.broadcast(session_id, {"type": "error", "message": f"答案生成失败: {e}"})
-            return
-        conn = db.get_db()
-        try:
-            db.add_answer(conn, session_id, text.strip(), answer, "llm")
-        finally:
-            conn.close()
-        await manager.broadcast(session_id, {
-            "type": "answer",
-            "session_id": session_id,
-            "question": text.strip(),
-            "answer": answer,
-        })
-
-
-def _looks_like_question(text: str) -> bool:
-    """判断文本是否像面试问题。"""
-    question_markers = ["?", "？", "吗", "呢", "如何", "怎么", "为什么", "什么", "哪些", "请", "介绍", "说说", "谈谈"]
-    return any(m in text for m in question_markers)
-
-
-async def websocket_endpoint(ws: WebSocket, session_id: str):
-    """WebSocket 端点：处理音频分片和会话控制。"""
-    conn = db.get_db()
-    try:
-        session = db.get_session(conn, session_id)
-    finally:
-        conn.close()
-    if not session:
-        await ws.close(code=4004, reason="会话不存在")
-        return
-
-    await manager.connect(session_id, ws)
-    # 广播当前会话状态
-    await manager.broadcast(session_id, {
-        "type": "session_state",
-        "session_id": session_id,
-        "status": session["status"],
-        "radio_mode": session["radio_mode"],
-    })
-
-    try:
-        while True:
-            data = await ws.receive_json()
-            msg_type = data.get("type")
-
-            if msg_type == "audio_chunk":
-                source = data.get("source", "pc")
-                audio_b64 = data.get("data", "")
-                asyncio.create_task(_handle_audio_chunk(session_id, source, audio_b64))
-
-            elif msg_type == "set_radio_mode":
-                mode = data.get("mode", "pc")
-                conn = db.get_db()
-                try:
-                    conn.execute("UPDATE sessions SET radio_mode = ? WHERE id = ?", (mode, session_id))
-                    conn.commit()
-                finally:
-                    conn.close()
-                await manager.broadcast(session_id, {
-                    "type": "session_state",
-                    "session_id": session_id,
-                    "status": "recording",
-                    "radio_mode": mode,
-                })
-
-            elif msg_type == "regenerate_answer":
-                question = data.get("question", "")
-                if question:
-                    try:
-                        answer = await llm.generate_answer(question)
-                    except Exception as e:
-                        await manager.broadcast(session_id, {"type": "error", "message": f"答案生成失败: {e}"})
-                        continue
-                    conn = db.get_db()
-                    try:
-                        db.add_answer(conn, session_id, question, answer, "llm")
-                    finally:
-                        conn.close()
-                    await manager.broadcast(session_id, {
-                        "type": "answer",
-                        "session_id": session_id,
-                        "question": question,
-                        "answer": answer,
-                    })
-
-            elif msg_type == "end_session":
-                conn = db.get_db()
-                try:
-                    db.end_session(conn, session_id)
-                finally:
-                    conn.close()
-                await manager.broadcast(session_id, {
-                    "type": "session_state",
-                    "session_id": session_id,
-                    "status": "ended",
-                    "radio_mode": session["radio_mode"],
-                })
-                break
-
-    except WebSocketDisconnect:
-        manager.disconnect(session_id, ws)
-```
-
-- [ ] **Step 4: 在 main.py 挂载 WebSocket 路由**
-
-```python
-from fastapi import WebSocket
-from .ws import websocket_endpoint
-
-@app.websocket("/ws/{session_id}")
-async def ws_endpoint(ws: WebSocket, session_id: str):
-    await websocket_endpoint(ws, session_id)
-```
-
-- [ ] **Step 5: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_ws.py -v`
-Expected: PASS（2 个测试全过）
-
-- [ ] **Step 6: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: WebSocket realtime transcription and answer generation"
-```
-
----
-
-### Task 8: 复盘 API
-
-**Files:**
-- Create: `backend/app/routes_review.py`
-- Modify: `backend/app/main.py`
-- Test: `backend/tests/test_review_api.py`
-
-**Interfaces:**
-- Consumes: `db.get_transcripts`, `db.get_answers`, `llm.generate_review`
-- Produces:
-  - `POST /api/sessions/{id}/review` → 生成复盘报告
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_review_api.py
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from fastapi.testclient import TestClient
-
-from app.main import app
-
-client = TestClient(app)
-
-
-def test_review_without_llm_config():
-    """未配置 LLM 时应返回明确错误。"""
-    session_id = client.post("/api/sessions", json={"title": "测试"}).json()["id"]
-    resp = client.post(f"/api/sessions/{session_id}/review")
-    assert resp.status_code == 500
-    assert "LLM" in resp.json()["detail"]
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_review_api.py -v`
-Expected: FAIL（404，路由未注册）
-
-- [ ] **Step 3: 实现 routes_review.py**
-
-```python
-"""复盘报告 API 路由。"""
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
-
-from . import db, llm
-
-router = APIRouter(prefix="/api/sessions", tags=["review"])
-
-
-@router.post("/{session_id}/review")
-async def generate_review(session_id: str):
-    conn = db.get_db()
-    try:
-        session = db.get_session(conn, session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="会话不存在")
-        transcripts = db.get_transcripts(conn, session_id)
-        answers = db.get_answers(conn, session_id)
-    finally:
-        conn.close()
-
-    if not transcripts:
-        return JSONResponse(status_code=400, content={"detail": "会话没有转写记录"})
-
-    try:
-        review = await llm.generate_review(transcripts, answers)
-    except RuntimeError as e:
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"复盘生成失败: {e}"})
-
-    return {"session_id": session_id, "review": review}
-```
-
-- [ ] **Step 4: 在 main.py 挂载路由**
-
-```python
-from .routes_review import router as review_router
-
-app.include_router(review_router)
-```
-
-- [ ] **Step 5: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_review_api.py -v`
-Expected: PASS
-
-- [ ] **Step 6: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: review report generation API"
-```
-
----
-
-### Task 9: 搜索集成（可选增强）
-
-**Files:**
-- Create: `backend/app/search.py`
-- Modify: `backend/app/llm.py`
-- Test: `backend/tests/test_search.py`
-
-**Interfaces:**
-- Consumes: `db.get_active_config(conn, "search")` → `{"data": {"engine", "api_key", ...}}`
-- Produces:
-  - `search_web(query: str) -> list[dict]`（异步，返回搜索结果列表）
-  - `generate_answer_with_search(question: str) -> str`（异步，搜索 + LLM 整理）
-
-- [ ] **Step 1: 写失败测试**
-
-```python
-# backend/tests/test_search.py
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import pytest
-from app import search
-
-
-def test_no_search_config():
-    """未配置搜索时应返回空结果。"""
-    assert search.search_web("测试") == []
-```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `cd backend && python -m pytest tests/test_search.py -v`
-Expected: FAIL（`ModuleNotFoundError: No module named 'app.search'`）
-
-- [ ] **Step 3: 实现 search.py**
-
-```python
-"""搜索客户端（可选增强）。"""
-import httpx
-
-from . import db
-
-
-async def search_web(query: str) -> list[dict]:
-    """搜索网络，返回结果列表。未配置搜索 API 时返回空列表。"""
-    conn = db.get_db()
-    try:
-        config = db.get_active_config(conn, "search")
-    finally:
-        conn.close()
-    if not config:
-        return []
-
-    data = config["data"]
-    engine = data.get("engine", "")
-    api_key = data.get("api_key", "")
-
-    if not engine or not api_key:
-        return []
-
-    if engine == "google":
-        return await _search_google(query, data)
-    elif engine == "bing":
-        return await _search_bing(query, data)
-    return []
-
-
-async def _search_google(query: str, data: dict) -> list[dict]:
-    """Google Custom Search JSON API。"""
-    cx = data.get("cx", "")
-    api_key = data.get("api_key", "")
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": api_key, "cx": cx, "q": query, "num": 5}
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, params=params)
-        if resp.status_code != 200:
-            return []
-        items = resp.json().get("items", [])
-        return [{"title": i.get("title", ""), "link": i.get("link", ""), "snippet": i.get("snippet", "")} for i in items]
-
-
-async def _search_bing(query: str, data: dict) -> list[dict]:
-    """Bing Web Search API。"""
-    api_key = data.get("api_key", "")
-    url = "https://api.bing.microsoft.com/v7.0/search"
-    params = {"q": query, "count": 5}
-    headers = {"Ocp-Apim-Subscription-Key": api_key}
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, params=params, headers=headers)
-        if resp.status_code != 200:
-            return []
-        items = resp.json().get("webPages", {}).get("value", [])
-        return [{"title": i.get("name", ""), "link": i.get("url", ""), "snippet": i.get("snippet", "")} for i in items]
-```
-
-- [ ] **Step 4: 在 llm.py 添加 generate_answer_with_search**
-
-```python
-async def generate_answer_with_search(question: str, context: str = "") -> str:
-    """搜索 + LLM 整理生成更准确的答案。"""
-    from . import search
-
-    results = await search.search_web(question)
-    if not results:
-        return await generate_answer(question, context)
-
-    search_text = "\n".join(f"{r['title']}: {r['snippet']}" for r in results)
-    system = (
-        "你是一名资深面试辅导专家。请根据面试官的问题和搜索到的资料，"
-        "给出简洁、有条理、有依据的回答要点。使用中文回答，控制在 300 字以内。"
-    )
-    user = f"面试官的问题：{question}\n\n搜索到的资料：\n{search_text}"
-    if context:
-        user += f"\n\n面试上下文（供参考）：{context}"
-    return await _chat(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.5,
-    )
-```
-
-- [ ] **Step 5: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_search.py -v`
-Expected: PASS
-
-- [ ] **Step 6: 提交**
-
-```bash
-git add backend/
-git commit -m "feat: optional web search integration with LLM answer enhancement"
-```
-
----
-
-### Task 10: 端到端验证
-
-**Files:**
-- Modify: `backend/app/main.py`
-- Create: `backend/README.md`
-
-**Interfaces:**
-- Consumes: 所有已实现模块
-- Produces: 可运行的完整后端服务
-
-- [ ] **Step 1: 运行全部测试**
-
-```bash
-cd backend
-python -m pytest tests/ -v
-```
-
-Expected: 全部 PASS
-
-- [ ] **Step 2: 启动服务并手动验证**
-
-```bash
-cd backend
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-- 访问 `http://localhost:8000/health` → `{"status":"ok"}`
-- 访问 `http://localhost:8000/docs` → Swagger UI 正常显示
-- 创建会话、配置 LLM、连接 WebSocket 均正常
-
-- [ ] **Step 3: 编写 backend/README.md**
-
-```markdown
-# 后端服务
-
-AI 面试助手后端，基于 FastAPI。
-
-## 启动
-
-```bash
-cd backend
-python -m venv .venv
-source .venv/Scripts/activate  # Windows
-pip install -r requirements.txt
-cp .env.example .env  # 填入 GROQ_API_KEY
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-## API
-
-- `GET /health` — 健康检查
-- `POST /api/sessions` — 创建会话
-- `GET /api/sessions/{id}` — 会话详情
-- `POST /api/sessions/{id}/end` — 结束会话
-- `GET /api/sessions/{id}/transcripts` — 转写列表
-- `GET /api/sessions/{id}/answers` — 答案列表
-- `POST /api/sessions/{id}/review` — 生成复盘
-- `GET /api/configs/{type}` — 配置列表
-- `POST /api/configs/{type}` — 保存配置
-- `WS /ws/{session_id}` — 实时转写与答案
-
-## 环境变量
-
-- `GROQ_API_KEY` — Groq Whisper API key
-```
-
-- [ ] **Step 4: 提交**
-
-```bash
-git add backend/
-git commit -m "docs: backend README and end-to-end verification"
-```
+- API Key 从普通配置 JSON 中拆出，使用 Fernet 加密。
+- 读取配置不会返回 API Key。
+- LLM Base URL 经过 HTTPS、DNS 和私网 SSRF 校验；当前代码不维护额外的主机白名单。
+- 当前配置类型已经扩展为 `llm`、`search`、`asr`、`network`，并支持删除接口。
+- Network 配置的请求模型仍要求 `api_key`，但运行时代理代码只消费 `proxy_url`；不要把代理凭据嵌入公开 URL 数据，这部分不是已完成的生产秘密设计。
+
+### 当前 ASR 路由
+
+- 默认 `AI_ASR_ENGINE=funasr` 且 `AI_FUNASR_STREAM=true`；WAV 按 `session + source` 复用 FunASR WebSocket，每片独立 `start -> PCM -> stop -> final`。每个 final 创建独立 LLM SSE 请求，会话内默认并发 3 条并以 `request_id` 隔离输出；连接复用不等于整题识别，当前也没有 `speech_end` 或问题线程累积器。只有显式设置 `AI_ASR_ENGINE=llm` 时才使用激活 LLM 配置的主 `model` 做多模态转写。
+- 激活的 ASR 配置选择 Whisper 模型或配置名称包含 `groq` 时，WAV 改走 Groq；旧 Groq/Paraformer 组合会使用 `whisper-large-v3`。受支持的非 WAV 编码当前也走 Groq。
+- 所有路径先经过 `ffprobe` 容器、编码、音轨和时长校验。
+- ASR 代理优先级为 `AI_OUTBOUND_PROXY`、active Network 配置、Windows 当前用户系统代理；兼容系统代理单地址和 `http=...;https=...` 写法。
+- FunASR 地址由 `AI_FUNASR_URL` 配置；`AI_FUNASR_TOKEN` 必须通过 Secret Manager 注入，源码不再保留凭据回退值。
+
+### 搜索增强，不是向量 RAG
+
+- Google 搜索最多返回 5 条经过形状和长度限制的结果供 LLM 参考；Bing 新配置已退役。
+- 当前没有文档摄取、Embedding、向量数据库、召回器或引用生成管线。
+- 自动回答默认不搜索；重新生成和复盘只有显式启用时才搜索，普通搜索失败降级为纯 LLM。
+
+### 成本
+
+- LLM/Search/ASR 都有限并发。
+- 用量预算持久化，不能通过重启进程清零。
+- 复盘相同内容幂等，避免重复付费。
+
+## 4. 当前测试验收
+
+在 `backend/`：
+
+~~~powershell
+python -m pytest -q
+~~~
+
+2026-08-26 对当前工作树在 Python 3.10.6 的结果为：
+
+~~~text
+218 passed
+~~~
+
+旧文档中出现过的 `80 passed`、`94 passed`、`113 passed`、`212 passed` 和对应覆盖率均属于更早代码快照，不应继续作为当前验收数字。本轮没有重新生成覆盖率报告；`ruff` 已验证，目标 Python 3.12 仍需重新运行当前 218 项测试。
+
+测试覆盖的验收面包括：
+
+- 启动安全配置和匿名健康端点。
+- REST/WS 认证与协议拒绝。
+- 状态机和 ended 写屏障。
+- 分片幂等、乱序、缺口、背压、取消水位、当前任务取消、迟到旧片和恢复。
+- 事件重放和连接水位。
+- 媒体伪造检测、FunASR 假 WebSocket 协议、Groq/Paraformer 旧配置兼容、Windows 系统代理解析和 Groq 回退。
+- LLM/Search 输入输出边界与降级。
+- 四类配置的秘密处理、激活/删除、SSRF、预算和备份恢复。
+
+该测试结果不替代真实 FunASR、Groq、LLM、Google Search、HTTP/SOCKS 代理、客户端或容器端到端测试。
+
+## 5. 后端仍可继续改进的事项
+
+这些不是原计划遗漏的“未完成核心功能”，而是后续成熟化工作：
+
+- 定期轮换由 `AI_FUNASR_TOKEN` 注入的 FunASR 凭据，禁止在文档或日志中复制原值。
+- 在真实镜像中复核 `python-socks` 等代理运行时依赖已按生产锁文件和哈希安装。
+- 重新设计 Network 配置的秘密字段、代理 URL 凭据规则和配置失败后是否允许静默直连。
+- 对真实 FunASR/Groq/LLM/Google Search/代理做受控集成测试。
+- 在引入 `speech_end` 后区分短静音片段边界与长静音问题终止，并在保持片级低延迟回答的同时增加累计问题线程。
+- 在真实客户端验证停止、切 mobile、退出页面和服务端取消并发，确认自动化覆盖的队列/outstanding 计数修复在长时间运行中不泄漏。
+- 增加结构化日志、指标、追踪和告警。
+- 建立显式数据库迁移版本。
+- 在多用户需求出现时重新设计身份、权限和数据所有权。
+- 在多实例需求出现时迁移共享数据库、消息总线和分布式限流。
+- 在目标 Python 3.12 重新运行当前测试、覆盖率与静态检查。
+- 主要客户端完成后，恢复容器构建、TLS、备份恢复和故障演练；在真实验证前保持“部署资产存在、上线未实证”的状态。
+
+## 6. 使用本归档的规则
+
+- 可以用它了解后端最初的建设目标。
+- 不要从旧 Git 版本复制其中历史代码示例。
+- 不要据此推断当前请求字段、响应字段或错误语义。
+- 新实现计划必须从 [backend/README.md](../../../backend/README.md) 和当前测试重新生成。
