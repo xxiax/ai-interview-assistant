@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "默认权限：事件监听、命令调用与窗口能力；实时音频由 Rust WASAPI loopback 采集",
-  "windows": ["main"],
+  "description": "默认权限：事件监听、命令调用与窗口能力；实时音频由 Rust WASAPI loopback 采集。overlay 窗口共用同一套能力，但只拿到 window 的 getter（无 allow-set-*），所有窗口动作走 overlay_* Rust 命令",
+  "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
     "core:event:default",

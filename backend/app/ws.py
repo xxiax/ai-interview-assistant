@@ -21,6 +21,8 @@ from .protocol import (
     RegenerateAnswerMessage,
     ResumeMessage,
     SetRadioModeMessage,
+    SolveScreenshotMessage,
+    SpeechEndMessage,
     StartSessionMessage,
     event_message,
     parse_auth_message,
@@ -193,6 +195,26 @@ def _decode_audio(data: str) -> bytes:
     return audio_bytes
 
 
+def _decode_screenshot(data: str) -> bytes:
+    """解码笔试截图，并按容器魔数确认它真是 PNG/JPEG。
+
+    上限默认 6 MiB：1080p PNG 截图通常 1-3 MiB，留两倍余量。校验魔数是因为
+    mime 字段来自客户端，不能让一个声明 image/png 的任意二进制流进 LLM。
+    """
+    max_bytes = int(os.environ.get("AI_MAX_SCREENSHOT_BYTES", str(6 * 1024 * 1024)))
+    if len(data) > ((max_bytes + 2) // 3) * 4 + 4:
+        raise ValueError("截图过大")
+    try:
+        image_bytes = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("截图不是有效 Base64") from exc
+    if not image_bytes or len(image_bytes) > max_bytes:
+        raise ValueError("截图大小非法")
+    if not image_bytes.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")):
+        raise ValueError("截图必须是 PNG 或 JPEG")
+    return image_bytes
+
+
 def _source_allowed(session: dict, source: str) -> bool:
     return session["radio_mode"] == "both" or session["radio_mode"] == source
 
@@ -317,6 +339,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: str) -> None:
                         message.reason,
                     )
 
+                elif isinstance(message, SpeechEndMessage):
+                    session = await run_db(db.ensure_recording, session_id)
+                    if not _source_allowed(session, message.source):
+                        await _send_error(
+                            ws,
+                            "source_not_allowed",
+                            "当前收音模式不允许该音频来源",
+                        )
+                        continue
+                    await pipeline.mark_speech_end(
+                        session_id,
+                        message.source,
+                        message.through_chunk_seq,
+                    )
+
                 elif isinstance(message, AudioChunkMessage):
                     session = await run_db(db.ensure_recording, session_id)
                     if not _source_allowed(session, message.source):
@@ -387,11 +424,51 @@ async def websocket_endpoint(ws: WebSocket, session_id: str) -> None:
                     if not rate_limiter.allow(regenerate_key, 10, 60):
                         await _send_error(ws, "rate_limited", "重新生成请求过于频繁")
                         continue
-                    if not await pipeline.enqueue_answer(
-                        AnswerWork(session_id, message.question, message.use_search)
-                    ):
+                    if message.thread_id is not None:
+                        # 带线程 id：重问某张问题卡。revision+1、答案流回
+                        # 同一张卡，完成后按线程规则落库。
+                        accepted = await pipeline.regenerate_thread_answer(
+                            session_id,
+                            message.thread_id,
+                            message.question,
+                            message.use_search,
+                        )
+                    else:
+                        # 不带:手动提问式重新生成,独立成卡立即入库。
+                        accepted = await pipeline.enqueue_answer(
+                            AnswerWork(session_id, message.question, message.use_search)
+                        )
+                    if not accepted:
                         await _send_error(
                             ws, "answer_backpressure", "答案生成队列已满，请稍后重试"
+                        )
+
+                elif isinstance(message, SolveScreenshotMessage):
+                    await run_db(db.ensure_recording, session_id)
+                    # 和 regenerate 共用一条限流键：两者都是用户手点触发的
+                    # 付费调用，合起来 10 次/分钟才是真实的花钱速率上限。
+                    solve_key = f"regenerate:{token_fingerprint(auth.token)}"
+                    if not rate_limiter.allow(solve_key, 10, 60):
+                        await _send_error(ws, "rate_limited", "解题请求过于频繁")
+                        continue
+                    try:
+                        image_bytes = _decode_screenshot(message.image)
+                    except ValueError as exc:
+                        await _send_error(ws, "invalid_screenshot", str(exc))
+                        continue
+                    if not await pipeline.enqueue_answer(
+                        AnswerWork(
+                            session_id=session_id,
+                            # 截图题没有转写出来的问题文本，用备注或固定标题
+                            # 占位；answers.question 非空是 db 层的硬约束。
+                            question=(message.note.strip() or "截图题目"),
+                            use_search=False,
+                            image_bytes=image_bytes,
+                            image_mime=message.mime,
+                        )
+                    ):
+                        await _send_error(
+                            ws, "answer_backpressure", "解题队列已满，请稍后重试"
                         )
 
                 elif isinstance(message, ResumeMessage):

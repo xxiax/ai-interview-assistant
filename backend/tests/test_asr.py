@@ -155,7 +155,7 @@ async def test_asr_concurrency_limit_includes_media_probe(monkeypatch):
     monkeypatch.setenv("AI_ASR_MAX_CONCURRENCY", "2")
     monkeypatch.setenv("AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS", "5")
     monkeypatch.setattr(asr, "inspect_audio", slow_probe)
-    monkeypatch.setattr(asr.cost_control, "reserve_asr_seconds", fake_reserve)
+    monkeypatch.setattr(asr.cost_control, "reserve_asr_millis", fake_reserve)
     monkeypatch.setattr(
         asr.httpx, "AsyncClient", lambda **kwargs: FakeClient({}, **kwargs)
     )
@@ -271,22 +271,27 @@ async def test_funasr_sends_start_pcm_stop_and_reads_final(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_funasr_stream_reuses_connection_and_exposes_partial_then_final(monkeypatch):
-    """同一 WebSocket 复用多轮 start/PCM/stop，每片都立即拿 final。"""
+async def test_funasr_stream_keeps_one_utterance_open_across_chunks(monkeypatch):
+    """一个语音段只发一次 start、一次 stop；段内每片只推 PCM 并拿累计 partial。"""
     import json as _json
 
     monkeypatch.setenv("AI_ASR_ENGINE", "funasr")
     monkeypatch.setenv("AI_FUNASR_STREAM", "true")
     monkeypatch.setenv("AI_FUNASR_URL", "ws://127.0.0.1:10096/ws")
+    monkeypatch.setenv("AI_FUNASR_PARTIAL_IDLE_SECONDS", "0.05")
+    monkeypatch.setenv("AI_FUNASR_PARTIAL_MAX_WAIT_SECONDS", "0.5")
     monkeypatch.setattr(asr, "_active_proxy", lambda: None)
     monkeypatch.setattr(asr, "inspect_audio", lambda *_args: 1000)
     monkeypatch.setattr(asr, "_resolve_funasr_host", lambda *_args: _async_none())
-    monkeypatch.setattr(asr.cost_control, "reserve_asr_seconds", _async_noop)
+    monkeypatch.setattr(asr.cost_control, "reserve_asr_millis", _async_noop)
 
     sent = []
     incoming = asyncio.Queue()
 
     class StreamWS:
+        def __init__(self):
+            self.pushes = 0
+
         async def __aenter__(self):
             return self
 
@@ -295,15 +300,18 @@ async def test_funasr_stream_reuses_connection_and_exposes_partial_then_final(mo
 
         async def send(self, raw):
             if isinstance(raw, bytes):
+                self.pushes += 1
                 sent.append(("binary", len(raw)))
-                await incoming.put({"type": "partial", "text": f"临时{len(sent)}"})
+                # partial 是累计全文：第二片包含第一片的文本
+                text = "".join(f"第{index}段" for index in range(1, self.pushes + 1))
+                await incoming.put({"type": "partial", "text": text})
             else:
                 message = _json.loads(raw)
                 sent.append(("text", message))
                 if message["type"] == "start":
                     await incoming.put({"type": "started"})
                 if message["type"] == "stop":
-                    await incoming.put({"type": "final", "text": "最终问题？"})
+                    await incoming.put({"type": "final", "text": "第1段第2段"})
 
         async def recv(self):
             return _json.dumps(await incoming.get())
@@ -325,16 +333,77 @@ async def test_funasr_stream_reuses_connection_and_exposes_partial_then_final(mo
     await stream.close()
 
     assert len(connects) == 1
-    assert [item[1]["type"] for item in sent if item[0] == "text"] == [
-        "start",
-        "stop",
-        "start",
-        "stop",
-    ]
+    # 关键：整段只有一次 start、一次 stop，不再是每片 start/stop
+    assert [item[1]["type"] for item in sent if item[0] == "text"] == ["start", "stop"]
     assert [item[0] for item in sent if item[0] == "binary"] == ["binary", "binary"]
-    assert [event.type for event in first] == ["partial", "final"]
-    assert [event.type for event in second] == ["partial", "final"]
-    assert finished == []
+    assert [event.type for event in first] == ["partial"]
+    assert [event.type for event in second] == ["partial"]
+    # partial 累计：第二片文本包含第一片
+    assert first[-1].text == "第1段"
+    assert second[-1].text == "第1段第2段"
+    assert [event.type for event in finished] == ["final"]
+    assert finished[-1].text == "第1段第2段"
+
+
+@pytest.mark.asyncio
+async def test_funasr_stream_starts_new_utterance_after_finish(monkeypatch):
+    """finish 之后下一片重新发 start，同一连接承载多个语音段。"""
+    import json as _json
+
+    monkeypatch.setenv("AI_ASR_ENGINE", "funasr")
+    monkeypatch.setenv("AI_FUNASR_STREAM", "true")
+    monkeypatch.setenv("AI_FUNASR_URL", "ws://127.0.0.1:10096/ws")
+    monkeypatch.setenv("AI_FUNASR_PARTIAL_IDLE_SECONDS", "0.05")
+    monkeypatch.setenv("AI_FUNASR_PARTIAL_MAX_WAIT_SECONDS", "0.5")
+    monkeypatch.setattr(asr, "_active_proxy", lambda: None)
+    monkeypatch.setattr(asr, "inspect_audio", lambda *_args: 1000)
+    monkeypatch.setattr(asr, "_resolve_funasr_host", lambda *_args: _async_none())
+    monkeypatch.setattr(asr.cost_control, "reserve_asr_millis", _async_noop)
+
+    sent = []
+    incoming = asyncio.Queue()
+
+    class StreamWS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def send(self, raw):
+            if isinstance(raw, bytes):
+                sent.append("binary")
+                await incoming.put({"type": "partial", "text": "问题"})
+            else:
+                message = _json.loads(raw)
+                sent.append(message["type"])
+                if message["type"] == "stop":
+                    await incoming.put({"type": "final", "text": "问题？"})
+
+        async def recv(self):
+            return _json.dumps(await incoming.get())
+
+        async def close(self):
+            return None
+
+    connects = []
+
+    def connect(url, **_kwargs):
+        connects.append(url)
+        return StreamWS()
+
+    monkeypatch.setattr(asr, "_websockets_connect", connect)
+    stream = asr.FunAsrStream()
+    await stream.push_wav(_wav_bytes(), 1000)
+    await stream.finish()
+    await stream.push_wav(_wav_bytes(), 1000)
+    await stream.finish()
+    # finish 后没有活动 utterance，重复 finish 是空操作
+    assert await stream.finish() == []
+    await stream.close()
+
+    assert len(connects) == 1
+    assert sent == ["start", "binary", "stop", "start", "binary", "stop"]
 
 
 def test_funasr_stream_is_enabled_by_default_for_wav(monkeypatch):
@@ -348,12 +417,116 @@ def test_funasr_stream_is_enabled_by_default_for_wav(monkeypatch):
     assert asr.use_funasr_stream("wav_pcm_s16le") is False
 
 
+def test_partial_idle_window_stays_below_the_default_chunk(monkeypatch):
+    """IDLE 是每片必付的等待，必须小于客户端默认分片时长(400 ms)。
+
+    大于分片时长的话，音频 worker 的消费速度就低于采集线程的生产速度，
+    队列填满后客户端背压回踩，首字延迟反而比大分片更差。
+    """
+    monkeypatch.delenv("AI_FUNASR_PARTIAL_IDLE_SECONDS", raising=False)
+    monkeypatch.delenv("AI_FUNASR_PARTIAL_MAX_WAIT_SECONDS", raising=False)
+
+    assert asr._funasr_partial_idle_seconds() < 0.4
+    assert asr._funasr_partial_max_wait_seconds() >= asr._funasr_partial_idle_seconds()
+
+
+@pytest.mark.asyncio
+async def test_drain_returns_queued_partial_without_waiting():
+    """队列里已有 partial 时必须立刻返回，不能再白等一个空闲窗口。"""
+    stream = asr.FunAsrStream()
+    await stream._put_event(asr.FunAsrEvent("partial", text="第1段"))
+    await stream._put_event(asr.FunAsrEvent("partial", text="第1段第2段"))
+
+    started = time.monotonic()
+    events = await stream._drain_until_idle(5.0, 15.0)
+    elapsed = time.monotonic() - started
+
+    assert [event.text for event in events] == ["第1段", "第1段第2段"]
+    assert elapsed < 0.1, f"队列已有事件却等了 {elapsed:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_at_most_one_idle_window_when_queue_is_empty():
+    """空队列时最多付一个 idle 窗口，不是每条事件后都再等一次。"""
+    stream = asr.FunAsrStream()
+
+    started = time.monotonic()
+    assert await stream._drain_until_idle(0.05, 5.0) == []
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5, f"空队列等了 {elapsed:.3f}s，超过一个 idle 窗口"
+
+
+@pytest.mark.asyncio
+async def test_drain_does_not_wait_again_after_taking_one_event():
+    """拿到一条就返回：不能为"可能更新的下一条"再守一个窗口。
+
+    partial 是累计全文，最新一条就够；下一条会在下个分片推流时被扫走。
+    """
+    stream = asr.FunAsrStream()
+
+    async def put_later():
+        await asyncio.sleep(0.01)
+        await stream._put_event(asr.FunAsrEvent("partial", text="第1段"))
+
+    task = asyncio.create_task(put_later())
+    started = time.monotonic()
+    events = await stream._drain_until_idle(1.0, 5.0)
+    elapsed = time.monotonic() - started
+    await task
+
+    assert [event.text for event in events] == ["第1段"]
+    assert elapsed < 0.5, f"取到事件后又等了一轮，共 {elapsed:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_drain_raises_on_error_event():
+    stream = asr.FunAsrStream()
+    await stream._put_event(asr.FunAsrEvent("error", message="鉴权失败"))
+    with pytest.raises(RuntimeError, match="鉴权失败"):
+        await stream._drain_until_idle(0.05, 0.5)
+
+
+@pytest.mark.asyncio
+async def test_short_chunks_reserve_exact_milliseconds(monkeypatch):
+    """400 ms 分片必须记 400，不能向上取整成一整秒。
+
+    向上取整的话，一分钟连续说话会记成 150 秒，
+    AI_ASR_SECONDS_PER_MINUTE 在真正说满一分钟前就先爆了。
+    """
+    reserved: list[int] = []
+
+    async def fake_reserve(_credential, millis):
+        reserved.append(millis)
+
+    monkeypatch.setenv("AI_FUNASR_TOKEN", "funasr-token")
+    monkeypatch.setattr(asr, "inspect_audio", lambda *_args: 400)
+    monkeypatch.setattr(asr.cost_control, "reserve_asr_millis", fake_reserve)
+
+    stream = asr.FunAsrStream()
+
+    class NoopWS:
+        async def send(self, _raw):
+            return None
+
+    stream._ws = NoopWS()
+    monkeypatch.setattr(stream, "connect", _async_noop)
+    monkeypatch.setattr(stream, "_drain_until_idle", _async_empty_list)
+
+    await stream.push_wav(_wav_bytes(), 400)
+    assert reserved == [400]
+
+
 async def _async_none(*_args):
     return None
 
 
 async def _async_noop(*_args, **_kwargs):
     return None
+
+
+async def _async_empty_list(*_args, **_kwargs):
+    return []
 
 
 @pytest.mark.asyncio

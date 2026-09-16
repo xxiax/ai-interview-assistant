@@ -15,6 +15,10 @@ export interface LiveState {
   partialTranscript: PartialTranscript | null
   answers: Answer[]
   streamingAnswers: Record<string, StreamingAnswer>
+  /** 本机采集门（captureState 事件）：悬浮窗开的采集主窗口也要如实显示。 */
+  captureOn: boolean
+  /** 已发出、还没等到 answer_stream 首帧的手动提问（渲染成"正在思考"卡）。 */
+  pendingQuestions: { id: number; question: string }[]
   lastEventId: number
   synced: boolean
   outbox: OutboxStats | null
@@ -30,6 +34,8 @@ export interface LiveState {
   apply: (event: EngineEvent) => void
   /** App 层全局订阅入口(带 toast 副作用) */
   applyGlobal: (event: EngineEvent) => void
+  /** 手动提问发送成功后挂"正在思考"卡;answer_stream 首帧到达即摘除。 */
+  addPendingQuestion: (question: string) => void
   /** 合并 REST 历史(并集去重,禁止 replace):LivePage 挂载回填用 */
   mergeHistory: (sessionId: string, transcripts: Transcript[], answers: Answer[]) => void
   reset: (sessionId: string | null) => void
@@ -39,6 +45,7 @@ export interface LiveState {
 let toastSeq = 0
 let audioFaultSeq = 0
 let systemAudioFaultSeq = 0
+let pendingSeq = 0
 
 const SESSION_STATUSES: readonly SessionStatus[] = ['idle', 'recording', 'ended']
 
@@ -58,7 +65,11 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
         sessionStatus:
           // 脆弱契约:note 文案由 Rust ws_client 直接透传服务端中文文案,前端
           // 以字符串匹配识别「会话已结束」。改动协议时两侧需同步(暂无法改 Rust)。
-          event.phase === 'closed' && event.note === '会话已结束' ? 'ended' : state.sessionStatus
+          event.phase === 'closed' && event.note === '会话已结束' ? 'ended' : state.sessionStatus,
+        // 引擎断开:采集门必然随之关闭;在途的"正在思考"卡也不会再有帧来
+        // 接棒,一并收掉,别留永久转圈的卡。
+        captureOn: event.phase === 'closed' ? false : state.captureOn,
+        pendingQuestions: event.phase === 'closed' ? [] : state.pendingQuestions
       }
     }
     case 'syncComplete':
@@ -72,6 +83,10 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
       }
     case 'sessionEnded':
       return { sessionStatus: 'ended' }
+    case 'captureState':
+      // 本机采集门翻转。主窗口的开始/停止按钮不能只看本地 state——悬浮窗
+      // Ctrl+Alt+Z 开的采集也走这条路,按钮状态必须跟着事件走。
+      return { captureOn: event.active }
     case 'serverMessage': {
       const type = (event as { type?: unknown }).type
       // 快速切换会话时,旧会话的迟到事件不得落入新会话的列表
@@ -99,9 +114,10 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
         const a = event as unknown as Answer
         if (a.session_id !== state.sessionId) return state
         if (state.answers.some((x) => x.id === a.id)) return state
-        const streamingAnswers = { ...state.streamingAnswers }
-        if (typeof a.request_id === 'string') delete streamingAnswers[a.request_id]
-        return { answers: [...state.answers, a], streamingAnswers }
+        // 落库答案**不清除**实时分段:用户要求每一版答案都保留到会话结束,
+        // 页面按 thread_id 把它们聚合成一张卡(见 shared/answer-threads.ts),
+        // 最终答案只是这张卡上的"已入库"标记。
+        return { answers: [...state.answers, a] }
       }
       if (type === 'answer_stream') {
         const sessionId = event.session_id
@@ -112,6 +128,14 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
           typeof event.request_id === 'string' && event.request_id
             ? event.request_id
             : `legacy:${String(question)}`
+        const threadId =
+          typeof event.thread_id === 'string' && event.thread_id
+            ? event.thread_id
+            : undefined
+        const revision =
+          typeof event.revision === 'number' && Number.isInteger(event.revision)
+            ? event.revision
+            : 1
         if (
           typeof sessionId !== 'string' ||
           sessionId !== state.sessionId ||
@@ -121,28 +145,53 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
         ) {
           return state
         }
-        const previous = state.streamingAnswers[requestId]
+        // 思考过程功能已下线:thinking 通道的增量直接丢弃,不进 store、不渲染。
+        if (channel === 'thinking') return state
+        // 一次 LLM 请求 = 一段答案。后端对同一问题的每一版累计 partial 都并发
+        // 发一次请求(request_id 唯一、revision 递增),所以这里必须按 request_id
+        // 存；页面再按 thread_id 聚合成一张卡并择优展示一个版本。
+        const streamKey = requestId
+        const previous = state.streamingAnswers[streamKey]
+        const started = event.started === true
+        const failed = event.failed === true
+        // 兼容旧后端的 superseded 终止帧。当前后端各 revision 互不取消；
+        // 若收到旧帧仍冻结该段并保留半截答案。
+        if (event.superseded === true) {
+          if (!previous) return state
+          return {
+            streamingAnswers: {
+              ...state.streamingAnswers,
+              [streamKey]: { ...previous, done: true, failed: false, superseded: true }
+            }
+          }
+        }
+        // 同一 request 内失败时保留已经流出来的可用内容。
+        const preservePrevious = Boolean(previous && failed)
         const answer: StreamingAnswer = {
           request_id: requestId,
+          thread_id: threadId,
+          revision,
           session_id: sessionId,
           question,
           answer:
             typeof event.answer === 'string'
-              ? event.answer
-              : channel === 'answer'
-                ? text
-                : previous?.answer ?? '',
-          thinking:
-            typeof event.thinking === 'string'
-              ? event.thinking
-              : channel === 'thinking'
-                ? text
-                : previous?.thinking ?? '',
+              ? event.answer || (preservePrevious ? previous?.answer ?? '' : '')
+              : text,
           source: event.source === 'search+llm' ? 'search+llm' : ('llm' as AnswerSource),
-          done: event.done === true
+          done: event.done === true,
+          started,
+          failed
         }
+        // catch-up swap：新 revision 的帧不删旧 revision 的段——旧段正流着
+        // 被删会让眼前答案凭空消失。全部保留，渲染层挑「未被取代里答案
+        // 最长」的一段展示：新版追平长度即自然接管，旧版收尾前始终兜底。
+        //
+        // 手动提问的 pending 卡在这里交棒：后端在生成一开始就发 started
+        // 空帧（answer=""），同文本的 pending 即刻摘除，"正在思考"无缝变
+        // 成流式卡（流式卡本身对空答案也显示"正在生成…"）。
         return {
-          streamingAnswers: { ...state.streamingAnswers, [requestId]: answer }
+          streamingAnswers: { ...state.streamingAnswers, [streamKey]: answer },
+          pendingQuestions: state.pendingQuestions.filter((p) => p.question !== question)
         }
       }
       return state
@@ -153,7 +202,7 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
       return { seqWatermark: event.nextChunkSeq, seqWatermarkReady: true }
     case 'serverError':
       if (event.code === 'answer_generation_failed') {
-        return { streamingAnswers: {} }
+        return state
       }
       if (event.code === 'audio_processing_failed') {
         return { audioFault: { id: ++audioFaultSeq, message: event.message } }
@@ -224,6 +273,8 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   partialTranscript: null,
   answers: [],
   streamingAnswers: {},
+  captureOn: false,
+  pendingQuestions: [],
   lastEventId: 0,
   synced: false,
   outbox: null,
@@ -272,6 +323,10 @@ export const useLiveStore = create<LiveState>((set, get) => ({
       const patch = mergeHistory(state, sessionId, transcripts, answers)
       return patch ?? {}
     }),
+  addPendingQuestion: (question) =>
+    set((s) => ({
+      pendingQuestions: [...s.pendingQuestions, { id: ++pendingSeq, question }]
+    })),
   reset: (sessionId) =>
     set({
       sessionId,
@@ -282,6 +337,8 @@ export const useLiveStore = create<LiveState>((set, get) => ({
       partialTranscript: null,
       answers: [],
       streamingAnswers: {},
+      captureOn: false,
+      pendingQuestions: [],
       lastEventId: 0,
       synced: false,
       outbox: null,

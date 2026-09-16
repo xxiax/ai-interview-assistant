@@ -35,6 +35,22 @@ def test_state_machine_and_ended_write_barrier(conn):
         db.add_answer(conn, session["id"], "问题", "答案")
 
 
+def test_init_db_resets_stale_recording_to_idle(conn):
+    # 后端被杀后库里的 recording 是僵尸状态：重放 init_db（等价于进程重启）
+    # 必须把它收回 idle，否则客户端 sync_complete 会照旧报告"录制中"。
+    stale = _recording_session(conn)
+    ended_session = db.create_session(conn, "正常结束")
+    db.start_session(conn, ended_session["id"], "pc")
+    db.end_session(conn, ended_session["id"])
+    idle_session = db.create_session(conn, "从未开始")
+
+    db.init_db(conn)
+
+    assert db.get_session(conn, stale["id"])["status"] == "idle"
+    assert db.get_session(conn, ended_session["id"])["status"] == "ended"
+    assert db.get_session(conn, idle_session["id"])["status"] == "idle"
+
+
 def test_concurrent_transcripts_receive_unique_monotonic_seq(conn):
     session = _recording_session(conn)
 
@@ -55,7 +71,7 @@ def test_concurrent_transcripts_receive_unique_monotonic_seq(conn):
     )
 
 
-def test_answer_event_persists_request_id_for_websocket_replay(conn):
+def test_answer_event_persists_stream_metadata_for_websocket_replay(conn):
     session = _recording_session(conn)
     answer = db.add_answer(
         conn,
@@ -63,12 +79,18 @@ def test_answer_event_persists_request_id_for_websocket_replay(conn):
         "并发问题",
         "并发答案",
         request_id="request-123",
+        thread_id="thread-123",
+        revision=3,
     )
     events = db.get_events(conn, session["id"])
     event = next(item for item in events if item["event_id"] == answer["event_id"])
 
     assert answer["request_id"] == "request-123"
+    assert answer["thread_id"] == "thread-123"
+    assert answer["revision"] == 3
     assert event["payload"]["request_id"] == "request-123"
+    assert event["payload"]["thread_id"] == "thread-123"
+    assert event["payload"]["revision"] == 3
 
 
 def test_repeated_init_preserves_existing_transcript_sequence(conn):
@@ -163,6 +185,10 @@ def test_interrupted_audio_chunk_is_retryable_without_advancing_sequence(
     db.reserve_audio_chunk(conn, **metadata)
     if error_code == "service_restart":
         db.init_db(conn)
+        # 新契约：重启把僵尸 recording 收回 idle（见
+        # test_init_db_resets_stale_recording_to_idle）。客户端要继续推同一场的
+        # 分片，得先重新 start——这正是真实重连后的流程。
+        db.start_session(conn, session["id"], session["radio_mode"])
     else:
         db.mark_audio_chunk_status(
             conn,

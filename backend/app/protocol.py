@@ -65,11 +65,38 @@ class CancelAudioSourceMessage(StrictModel):
     reason: Literal["capture_stopped", "source_disabled"]
 
 
+class SpeechEndMessage(StrictModel):
+    v: Literal[1] = PROTOCOL_VERSION
+    type: Literal["speech_end"]
+    source: AudioSource
+    through_chunk_seq: Annotated[
+        int, Field(strict=True, ge=0, le=CHUNK_SEQ_MAX)
+    ]
+
+
 class RegenerateAnswerMessage(StrictModel):
+    """重新生成。带 thread_id 时 revision+1 并流回同一卡；不带时独立入库。"""
+
     v: Literal[1] = PROTOCOL_VERSION
     type: Literal["regenerate_answer"]
     question: Annotated[str, Field(min_length=1, max_length=2000)]
     use_search: bool = False
+    thread_id: str | None = None
+
+
+class SolveScreenshotMessage(StrictModel):
+    """笔试辅助：客户端截图 + 可选备注，请求多模态解题。
+
+    只允许 PNG/JPEG：这两种 OpenAI-compatible 多模态接口普遍支持，
+    且客户端截图路径本来就只产出 PNG。Base64 长度上限在 ws 侧按
+    AI_MAX_SCREENSHOT_BYTES 校验，这里只做形状约束。
+    """
+
+    v: Literal[1] = PROTOCOL_VERSION
+    type: Literal["solve_screenshot"]
+    image: Annotated[str, Field(min_length=1)]
+    mime: Literal["image/png", "image/jpeg"] = "image/png"
+    note: Annotated[str, Field(max_length=500)] = ""
 
 
 class EndSessionMessage(StrictModel):
@@ -93,7 +120,9 @@ CLIENT_MESSAGE_MODELS = {
     "set_radio_mode": SetRadioModeMessage,
     "audio_chunk": AudioChunkMessage,
     "cancel_audio_source": CancelAudioSourceMessage,
+    "speech_end": SpeechEndMessage,
     "regenerate_answer": RegenerateAnswerMessage,
+    "solve_screenshot": SolveScreenshotMessage,
     "end_session": EndSessionMessage,
     "resume": ResumeMessage,
     "ping": PingMessage,

@@ -23,12 +23,17 @@ _LIMITS = {
         (3600, "AI_SEARCH_REQUESTS_PER_HOUR", 300),
         (86_400, "AI_SEARCH_REQUESTS_PER_DAY", 2_000),
     ),
-    "asr_seconds": (
+    # ASR 用量按毫秒入桶，环境变量仍按秒配置，换算见 _UNIT_SCALE。
+    # 分片可以短到 100 ms，按秒向上取整会把一分钟连续说话记成 150 秒，
+    # AI_ASR_SECONDS_PER_MINUTE 在真正说满一分钟之前就先爆了。
+    "asr_millis": (
         (60, "AI_ASR_SECONDS_PER_MINUTE", 300),
         (3600, "AI_ASR_SECONDS_PER_HOUR", 3_600),
         (86_400, "AI_ASR_SECONDS_PER_DAY", 14_400),
     ),
 }
+# 环境变量单位到入桶单位的换算系数。只有需要亚秒精度的服务才在这里出现。
+_UNIT_SCALE = {"asr_millis": 1_000}
 _CONCURRENCY_ENV = {
     "llm": ("AI_LLM_MAX_CONCURRENCY", 4),
     "search": ("AI_SEARCH_MAX_CONCURRENCY", 2),
@@ -68,8 +73,9 @@ def _principals(service: str, provider_credential: str) -> list[str]:
 def _reserve_sync(service: str, provider_credential: str, amount: int) -> None:
     conn = db.get_db()
     try:
+        scale = _UNIT_SCALE.get(service, 1)
         limits = [
-            (window, _positive_int(env_name, default))
+            (window, _positive_int(env_name, default) * scale)
             for window, env_name, default in _LIMITS[service]
         ]
         db.reserve_usage(
@@ -91,9 +97,15 @@ async def reserve_search_request(provider_credential: str) -> None:
     await asyncio.to_thread(_reserve_sync, "search_requests", provider_credential, 1)
 
 
-async def reserve_asr_seconds(provider_credential: str, seconds: int) -> None:
+async def reserve_asr_millis(provider_credential: str, millis: int) -> None:
+    """按毫秒预留 ASR 预算。
+
+    上限按秒配置、按毫秒入桶，所以 400 ms 的分片就记 400，不再被向上取整成
+    一整秒。`max(1, ...)` 只是挡住 0 和负数（`reserve_usage` 要求 amount > 0），
+    不再放大真实用量。
+    """
     await asyncio.to_thread(
-        _reserve_sync, "asr_seconds", provider_credential, max(1, seconds)
+        _reserve_sync, "asr_millis", provider_credential, max(1, millis)
     )
 
 

@@ -1,11 +1,15 @@
 //! Windows 系统播放音频采集。
 //!
 //! 独立线程通过默认 Render endpoint 的 WASAPI loopback 获取系统混音，要求
-//! 音频引擎在 shared mode 下自动转换为 16 kHz / mono / PCM s16le。完整的
-//! 2.5 秒非静音窗口会直接进入现有 Rust outbox；停止时不冲刷不足 2.5 秒的尾片。
+//! 音频引擎在 shared mode 下自动转换为 16 kHz / mono / PCM s16le。凑满一个分片
+//! 的非静音音频直接进入现有 Rust outbox；停止时不冲刷未满的尾片。
+//!
+//! 分片时长由 `AI_AUDIO_CHUNK_MS` 配置，默认 400 ms。面试场景要的是"先开口"，
+//! 分片越短，第一版累计 partial 越早到达 ASR，第一版答案也就越早出来；代价是
+//! 上传次数按比例变多。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -16,16 +20,55 @@ use crate::engine::{now_ms, EngineCommand, EngineEvent, EngineEventEmitter, NewC
 const SAMPLE_RATE: u32 = 16_000;
 const CHANNELS: u16 = 1;
 const BITS_PER_SAMPLE: u16 = 16;
-const CHUNK_DURATION_MS: i64 = 2_500;
-const CHUNK_FRAMES: usize = SAMPLE_RATE as usize * CHUNK_DURATION_MS as usize / 1_000;
+/// 分片时长默认值。400 ms 是"首字够快"和"上传次数不失控"的折中：
+/// 一句 3 秒的提问会拆成约 7 片，第一版累计 partial 在说话开始后半秒内就能到 ASR。
+const DEFAULT_CHUNK_MS: i64 = 400;
+/// 下限跟后端 `audio_chunk.duration_ms` 的 `ge=100` 对齐，再低会被协议拒收。
+const MIN_CHUNK_MS: i64 = 100;
+/// 上限保留原来的 2.5 秒，方便在弱网机器上退回旧行为。
+const MAX_CHUNK_MS: i64 = 2_500;
 /// 与前端 worklet 一致：以 20 ms 窗口计算 RMS。
 const RMS_WINDOW_FRAMES: usize = SAMPLE_RATE as usize * 20 / 1_000;
 /// 0.002 * i16 满量程约等于 66；高于当前观测的约 -62 dBFS 噪声底。
 const RMS_THRESHOLD_I16: i64 = 66;
-/// 一个 2.5 秒分片至少包含 3 个过阈值窗口才视为有声。
+/// 一个分片至少包含 3 个过阈值窗口才视为有声。
 const MIN_VOICED_WINDOWS: usize = 3;
+/// 连续 1.6 秒静音结束一个语音片段；问题线程由后端继续保留宽限期。
+const SPEECH_END_SILENT_WINDOWS: usize = 80;
+/// 语音尾部只保留 100 ms 静音，避免把完整 1.6 秒静音交给 ASR。
+const TRAILING_SILENCE_WINDOWS: usize = 5;
+const MIN_CHUNK_FRAMES: usize = SAMPLE_RATE as usize / 10;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+static CHUNK_FRAMES: OnceLock<usize> = OnceLock::new();
+
+/// 一个分片的采样帧数，由 `AI_AUDIO_CHUNK_MS` 决定，进程内只解析一次。
+fn chunk_frames() -> usize {
+    *CHUNK_FRAMES.get_or_init(|| {
+        let requested = std::env::var("AI_AUDIO_CHUNK_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_CHUNK_MS);
+        frames_for_chunk_ms(requested)
+    })
+}
+
+/// 把请求的分片时长换算成采样帧数。
+///
+/// 必须向下取整到 `RMS_WINDOW_FRAMES` 的整数倍：分片是按 20 ms 窗口逐个累积的，
+/// 触发条件是 `pending_samples.len() >= chunk_frames()`，取整能保证边界精确落在
+/// 窗口上，不会因为配置成 350 ms 之类的值而让分片一直凑不满。
+fn frames_for_chunk_ms(requested_ms: i64) -> usize {
+    let clamped = requested_ms.clamp(MIN_CHUNK_MS, MAX_CHUNK_MS);
+    let frames = SAMPLE_RATE as usize * clamped as usize / 1_000;
+    (frames / RMS_WINDOW_FRAMES).max(1) * RMS_WINDOW_FRAMES
+}
+
+/// 分片的实际时长（毫秒）。取整之后可能比配置值略小，以这个为准。
+fn chunk_duration_ms() -> i64 {
+    (chunk_frames() * 1_000 / SAMPLE_RATE as usize) as i64
+}
 
 struct Worker {
     stop: Arc<AtomicBool>,
@@ -190,53 +233,130 @@ impl Drop for SystemAudioState {
     }
 }
 
-#[derive(Default)]
-struct ChunkAssembler {
-    samples: Vec<i16>,
+enum SegmentOutput {
+    Chunk(Vec<i16>),
+    SpeechEnd,
 }
 
-impl ChunkAssembler {
-    fn push(&mut self, mut input: &[i16]) -> Vec<Vec<i16>> {
-        let mut completed = Vec::new();
+#[derive(Default)]
+struct SpeechChunker {
+    window: Vec<i16>,
+    pending_samples: Vec<i16>,
+    pending_voiced: Vec<bool>,
+    speech_active: bool,
+    phrase_voiced_windows: usize,
+    silent_windows: usize,
+}
+
+impl SpeechChunker {
+    fn push(&mut self, mut input: &[i16]) -> Vec<SegmentOutput> {
+        let mut outputs = Vec::new();
         while !input.is_empty() {
-            let remaining = CHUNK_FRAMES - self.samples.len();
+            let remaining = RMS_WINDOW_FRAMES - self.window.len();
             let take = remaining.min(input.len());
-            self.samples.extend_from_slice(&input[..take]);
+            self.window.extend_from_slice(&input[..take]);
             input = &input[take..];
-            if self.samples.len() == CHUNK_FRAMES {
-                completed.push(std::mem::replace(
-                    &mut self.samples,
-                    Vec::with_capacity(CHUNK_FRAMES),
-                ));
+            if self.window.len() == RMS_WINDOW_FRAMES {
+                let window =
+                    std::mem::replace(&mut self.window, Vec::with_capacity(RMS_WINDOW_FRAMES));
+                self.push_window(window, &mut outputs);
             }
         }
-        completed
+        outputs
+    }
+
+    fn push_window(&mut self, window: Vec<i16>, outputs: &mut Vec<SegmentOutput>) {
+        let voiced = is_voiced_window(&window);
+        if voiced {
+            self.speech_active = true;
+            self.phrase_voiced_windows += 1;
+            self.silent_windows = 0;
+        } else if self.speech_active {
+            self.silent_windows += 1;
+        } else {
+            return;
+        }
+
+        self.pending_samples.extend_from_slice(&window);
+        self.pending_voiced.push(voiced);
+
+        if self.pending_samples.len() >= chunk_frames() {
+            if self
+                .pending_voiced
+                .iter()
+                .filter(|is_voiced| **is_voiced)
+                .count()
+                >= MIN_VOICED_WINDOWS
+            {
+                outputs.push(SegmentOutput::Chunk(std::mem::take(
+                    &mut self.pending_samples,
+                )));
+            } else {
+                self.pending_samples.clear();
+            }
+            self.pending_voiced.clear();
+        }
+
+        if self.speech_active && self.silent_windows >= SPEECH_END_SILENT_WINDOWS {
+            if let Some(mut tail) = self.take_boundary_tail() {
+                if tail.len() < MIN_CHUNK_FRAMES {
+                    tail.resize(MIN_CHUNK_FRAMES, 0);
+                }
+                outputs.push(SegmentOutput::Chunk(tail));
+            }
+            if self.phrase_voiced_windows >= MIN_VOICED_WINDOWS {
+                outputs.push(SegmentOutput::SpeechEnd);
+            }
+            self.speech_active = false;
+            self.phrase_voiced_windows = 0;
+            self.silent_windows = 0;
+        }
+    }
+
+    fn take_boundary_tail(&mut self) -> Option<Vec<i16>> {
+        let last_voiced = self.pending_voiced.iter().rposition(|voiced| *voiced);
+        let tail = last_voiced.and_then(|last_voiced| {
+            let end_window =
+                (last_voiced + 1 + TRAILING_SILENCE_WINDOWS).min(self.pending_voiced.len());
+            let voiced = self.pending_voiced[..end_window]
+                .iter()
+                .filter(|is_voiced| **is_voiced)
+                .count();
+            (voiced >= MIN_VOICED_WINDOWS)
+                .then(|| self.pending_samples[..end_window * RMS_WINDOW_FRAMES].to_vec())
+        });
+        self.pending_samples.clear();
+        self.pending_voiced.clear();
+        tail
     }
 
     fn discard_tail(&mut self) {
-        self.samples.clear();
+        self.window.clear();
+        self.pending_samples.clear();
+        self.pending_voiced.clear();
     }
 }
 
-fn is_effectively_silent(samples: &[i16]) -> bool {
+fn is_voiced_window(window: &[i16]) -> bool {
     let threshold_energy = RMS_THRESHOLD_I16 * RMS_THRESHOLD_I16 * RMS_WINDOW_FRAMES as i64;
-    let mut voiced_windows = 0usize;
-    for window in samples.chunks_exact(RMS_WINDOW_FRAMES) {
-        let energy: i64 = window
-            .iter()
-            .map(|sample| {
-                let sample = i64::from(*sample);
-                sample * sample
-            })
-            .sum();
-        if energy >= threshold_energy {
-            voiced_windows += 1;
-            if voiced_windows >= MIN_VOICED_WINDOWS {
-                return false;
-            }
-        }
-    }
-    true
+    let energy: i64 = window
+        .iter()
+        .map(|sample| {
+            let sample = i64::from(*sample);
+            sample * sample
+        })
+        .sum();
+    energy >= threshold_energy
+}
+
+#[cfg(test)]
+fn is_effectively_silent(samples: &[i16]) -> bool {
+    samples
+        .chunks_exact(RMS_WINDOW_FRAMES)
+        .filter(|window| is_voiced_window(window))
+        .take(MIN_VOICED_WINDOWS)
+        .count()
+        < MIN_VOICED_WINDOWS
 }
 
 fn encode_wav(samples: &[i16]) -> Vec<u8> {
@@ -405,7 +525,7 @@ mod platform {
         command_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
         capture_client: &IAudioCaptureClient,
     ) -> Result<(), String> {
-        let mut assembler = ChunkAssembler::default();
+        let mut chunker = SpeechChunker::default();
 
         'capture: while !stop.load(Ordering::Acquire) {
             let mut packet_frames = unsafe {
@@ -448,13 +568,20 @@ mod platform {
                         .map_err(|error| win_error("释放 WASAPI packet", error))?;
                 }
 
-                for chunk in assembler.push(&samples) {
+                for output in chunker.push(&samples) {
                     if stop.load(Ordering::Acquire) {
-                        assembler.discard_tail();
+                        chunker.discard_tail();
                         break 'capture;
                     }
-                    if !is_effectively_silent(&chunk) {
-                        send_chunk(command_tx, &chunk)?;
+                    match output {
+                        SegmentOutput::Chunk(chunk) => send_chunk(command_tx, &chunk)?,
+                        SegmentOutput::SpeechEnd => {
+                            command_tx
+                                .send(EngineCommand::SpeechEnd {
+                                    source: "pc".into(),
+                                })
+                                .map_err(|_| "Live 引擎已停止，语音结束边界无法入队".to_string())?;
+                        }
                     }
                 }
 
@@ -466,8 +593,8 @@ mod platform {
             }
         }
 
-        // 明确不冲刷不足 2.5 秒的尾片。
-        assembler.discard_tail();
+        // 明确不冲刷未满一个分片的尾片。
+        chunker.discard_tail();
         Ok(())
     }
 
@@ -478,14 +605,18 @@ mod platform {
         let chunk_id = GUID::new()
             .map(|guid| format!("{guid:?}").to_ascii_lowercase())
             .map_err(|error| win_error("生成音频分片 ID", error))?;
-        let captured_at_ms = now_ms().saturating_sub(CHUNK_DURATION_MS as u64);
+        // 声明时长必须和 WAV 实际时长一致，后端 `inspect_audio` 会比对两者。
+        // 下限 100 ms 对应 MIN_CHUNK_FRAMES 补齐后的尾片，也是协议的 ge=100。
+        let duration_ms = ((samples.len() as u64 * 1_000) / u64::from(SAMPLE_RATE))
+            .clamp(100, chunk_duration_ms() as u64) as i64;
+        let captured_at_ms = now_ms().saturating_sub(duration_ms as u64);
         command_tx
             .send(EngineCommand::AddChunk(Box::new(NewChunk {
                 chunk_id,
                 // Rust outbox 是持久序号的唯一分配者，此字段仅保留兼容占位。
                 chunk_seq: 0,
                 captured_at: rfc3339_from_unix_ms(captured_at_ms),
-                duration_ms: CHUNK_DURATION_MS,
+                duration_ms,
                 codec: "wav_pcm_s16le".into(),
                 source: "pc".into(),
                 data: encode_wav(samples),
@@ -547,7 +678,7 @@ mod tests {
 
     #[test]
     fn silence_gate_rejects_peaky_noise_floor_and_accepts_three_voiced_windows() {
-        let mut noise_floor = vec![0i16; CHUNK_FRAMES];
+        let mut noise_floor = vec![0i16; RMS_WINDOW_FRAMES * 40];
         for (index, sample) in noise_floor.iter_mut().enumerate() {
             *sample = if index % 2 == 0 { 26 } else { -26 };
         }
@@ -567,17 +698,102 @@ mod tests {
     }
 
     #[test]
-    fn assembler_only_emits_complete_2500ms_chunks() {
-        assert_eq!(CHUNK_DURATION_MS, 2_500);
-        assert_eq!(CHUNK_FRAMES, 40_000);
-        let mut assembler = ChunkAssembler::default();
-        assert!(assembler.push(&vec![100; CHUNK_FRAMES - 1]).is_empty());
-        let completed = assembler.push(&[100]);
+    fn default_chunk_is_400ms_and_lands_on_a_window_boundary() {
+        // 首字延迟直接由这个值决定，改小了要有人知道；改大了要有人解释。
+        assert_eq!(DEFAULT_CHUNK_MS, 400);
+        assert_eq!(frames_for_chunk_ms(400), 6_400);
+        assert_eq!(frames_for_chunk_ms(400) % RMS_WINDOW_FRAMES, 0);
+    }
+
+    #[test]
+    fn chunk_ms_is_clamped_and_snapped_to_the_rms_window() {
+        // 低于协议下限(后端 duration_ms ge=100)和高于 2.5 秒都要被夹回来。
+        assert_eq!(frames_for_chunk_ms(0), frames_for_chunk_ms(MIN_CHUNK_MS));
+        assert_eq!(
+            frames_for_chunk_ms(9_999),
+            frames_for_chunk_ms(MAX_CHUNK_MS)
+        );
+        assert_eq!(frames_for_chunk_ms(MAX_CHUNK_MS), 40_000);
+        // 350 ms 不是 20 ms 的整数倍，向下取整到 340 ms，否则分片永远凑不满。
+        assert_eq!(frames_for_chunk_ms(350), RMS_WINDOW_FRAMES * 17);
+        // 任何配置都不能取整成 0，否则每个窗口都会发一片。
+        assert!(frames_for_chunk_ms(1) >= RMS_WINDOW_FRAMES);
+    }
+
+    #[test]
+    fn speech_chunker_emits_one_chunk_per_configured_window() {
+        let frames = chunk_frames();
+        assert_eq!(frames % RMS_WINDOW_FRAMES, 0);
+        let mut chunker = SpeechChunker::default();
+        let completed = chunker.push(&vec![512; frames]);
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].len(), CHUNK_FRAMES);
-        assert!(assembler.push(&[100; 10]).is_empty());
-        assembler.discard_tail();
-        assert!(assembler.samples.is_empty());
+        assert!(matches!(
+            &completed[0],
+            SegmentOutput::Chunk(samples) if samples.len() == frames
+        ));
+    }
+
+    #[test]
+    fn speech_chunker_delivers_a_short_burst_then_ends_the_phrase() {
+        // 200 ms 的一句短促发言：在默认 400 ms 分片下，它会和后面的静音一起凑满
+        // 一个分片被送出（有声窗口数过阈值），随后 1.6 秒静音收段。
+        // 关键是"短发言不会被吞掉"，而不是分片的确切长度。
+        let mut chunker = SpeechChunker::default();
+        let voiced = vec![512; RMS_WINDOW_FRAMES * 10];
+        let silence = vec![0; RMS_WINDOW_FRAMES * SPEECH_END_SILENT_WINDOWS];
+        assert!(chunker.push(&voiced).is_empty());
+        let outputs = chunker.push(&silence);
+        let chunks: Vec<&Vec<i16>> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                SegmentOutput::Chunk(samples) => Some(samples),
+                SegmentOutput::SpeechEnd => None,
+            })
+            .collect();
+        assert_eq!(chunks.len(), 1, "短发言必须被送出，不能被静音吞掉");
+        assert!(!is_effectively_silent(chunks[0]), "送出的分片必须含有人声");
+        assert!(
+            matches!(outputs.last(), Some(SegmentOutput::SpeechEnd)),
+            "静音够长必须收段，否则后端等不到 utterance 结束"
+        );
+        assert!(chunker.push(&silence).is_empty(), "收段后不能重复收段");
+    }
+
+    #[test]
+    fn boundary_tail_keeps_only_the_trailing_silence_it_needs() {
+        // 语音在分片凑满前就结束时走这条路径：只带 TRAILING_SILENCE_WINDOWS
+        // 个静音窗口交给 ASR，不把整段 1.6 秒静音塞过去。
+        let mut chunker = SpeechChunker::default();
+        chunker.pending_voiced = (0..40).map(|index| index < 10).collect();
+        chunker.pending_samples = vec![512; RMS_WINDOW_FRAMES * 40];
+        let tail = chunker
+            .take_boundary_tail()
+            .expect("有 10 个有声窗口，必须出尾片");
+        assert_eq!(
+            tail.len(),
+            RMS_WINDOW_FRAMES * (10 + TRAILING_SILENCE_WINDOWS)
+        );
+        assert!(chunker.pending_samples.is_empty(), "取过尾片后必须清空缓冲");
+    }
+
+    #[test]
+    fn boundary_tail_drops_a_phrase_that_never_passed_the_voice_gate() {
+        let mut chunker = SpeechChunker::default();
+        chunker.pending_voiced = (0..40)
+            .map(|index| index < MIN_VOICED_WINDOWS - 1)
+            .collect();
+        chunker.pending_samples = vec![512; RMS_WINDOW_FRAMES * 40];
+        assert!(
+            chunker.take_boundary_tail().is_none(),
+            "有声窗口不够不能上传"
+        );
+    }
+
+    #[test]
+    fn speech_chunker_ignores_pure_silence() {
+        let mut chunker = SpeechChunker::default();
+        let silence = vec![0; chunk_frames() * 2];
+        assert!(chunker.push(&silence).is_empty());
     }
 
     #[test]

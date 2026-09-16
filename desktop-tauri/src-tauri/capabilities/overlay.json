@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "悬浮提词窗独有权限：拖动。窗口是无边框的（decorations: false），没有标题栏可拖，只能靠 data-tauri-drag-region 触发 start_dragging。这条权限只给 overlay，主窗口仍然只有 window getter",
+  "windows": ["overlay"],
+  "permissions": ["core:window:allow-start-dragging"]
+}

@@ -19,10 +19,122 @@ body {
   user-select: none;
 }
 
-/* 输入类元素允许选择 */
+/*
+ * 输入类元素允许选择。chrome（工具条/标题栏/按钮）保持继承 body 的
+ * user-select:none；答案正文（Markdown 根节点与问题行挂 select-text）
+ * 放开划选复制。
+ */
 input,
 textarea {
   user-select: text;
+}
+
+/*
+ * 选中高亮跟着窗口走：主窗口用品牌蓝，悬浮窗保持黑白灰（30% 白叠在
+ * 深底上，配合多向描边在亮/暗背景上都可辨）。
+ */
+::selection {
+  background: rgba(79, 124, 255, 0.4);
+}
+body.overlay-root ::selection {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/*
+ * 悬浮提词窗：窗口本身以 transparent: true 创建，但 body 默认是 #0b0f1a 不透明，
+ * 结果整块方形底色压在会议画面上。挂 .overlay-root 把三层背景都清成透明，
+ * 由页面内部自己画圆角毛玻璃卡片。
+ */
+body.overlay-root,
+body.overlay-root #root,
+html:has(body.overlay-root) {
+  background: transparent;
+}
+
+/* 无边框窗口没有标题栏，拖动区靠 data-tauri-drag-region，指针要给出可拖提示。 */
+[data-tauri-drag-region] {
+  cursor: grab;
+}
+
+/*
+ * 悬浮窗动画。刻意只做三件事：卡片整体的透明度过渡、边栏折叠/展开的形变、
+ * 新答案段落的淡入。工具类助手上再多的动效都会变成干扰，而且悬浮窗常年
+ * 置顶在会议画面上，动得越多越显眼。
+ *
+ * 全部只动 opacity / transform：这两个属性走合成器，不触发布局，长时间开着
+ * 也不会持续吃 CPU。宽高动画会让 WebView2 每帧重排整棵树。
+ */
+.overlay-card {
+  /* 背景色过渡：滑条拖动与热键步进都平滑跟手，180ms 不拖沓。 */
+  transition: background-color 180ms ease-out;
+}
+
+/*
+ * 文字对比兜底：不透明度只调背景层（rgba），文字保持全亮；但背景调到很淡、
+ * 悬浮窗又压在亮色内容（对方共享白板、白底网页）上时，浅色文字会洗掉。
+ * 窗口后面是用户的桌面，CSS filter: invert() 之类的滤镜只能作用于页面内
+ * 堆叠上下文，管不到窗外的内容，所以走「多向描边」：四方向 1px 实描边 +
+ * 一圈 4px 晕光，等效给每个字符画一圈轮廓，黑底白字、白底浅字都兜得住。
+ * text-shadow 可继承，挂在卡片根上一层层生效；实色背景下描边几乎不可见，
+ * 不构成额外视觉噪音。
+ */
+.overlay-card,
+.overlay-strip {
+  text-shadow:
+    -1px -1px 0 rgba(0, 0, 0, 0.85),
+    1px -1px 0 rgba(0, 0, 0, 0.85),
+    -1px 1px 0 rgba(0, 0, 0, 0.85),
+    1px 1px 0 rgba(0, 0, 0, 0.85),
+    0 0 4px rgba(0, 0, 0, 0.7);
+}
+
+@keyframes overlay-strip-in {
+  from {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.overlay-strip {
+  animation: overlay-strip-in 160ms ease-out;
+}
+
+@keyframes overlay-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.overlay-panel {
+  animation: overlay-panel-in 200ms ease-out;
+}
+
+@keyframes overlay-answer-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/*
+ * 新答案卡淡入。只在卡片挂载时跑一次，流式增量走的是文本节点更新，
+ * 不会重挂动画，所以每来一个 token 不会闪。
+ */
+.overlay-answer-enter {
+  animation: overlay-answer-in 220ms ease-out;
 }
 
 /* 滚动条:细、深色 */
@@ -42,11 +154,87 @@ textarea {
   background: transparent;
 }
 
+/*
+ * 悬浮窗滚动条：黑白灰 + 跟随背景不透明度。上面那条全局规则是深蓝色写死的，
+ * 在半透明悬浮窗上既突兀也不随透明度变化。thumb 颜色由 OverlayPage 按当前
+ * 不透明度算好，经 CSS 变量挂在悬浮窗根容器上向下级联（答案区、textarea、
+ * partial 区的滚动条都在它里面）。底越不透明 thumb 越亮，半透明时压暗。
+ */
+body.overlay-root ::-webkit-scrollbar-thumb {
+  background: var(--overlay-thumb, rgba(255, 255, 255, 0.35));
+  border: none;
+}
+body.overlay-root ::-webkit-scrollbar-thumb:hover {
+  background: var(--overlay-thumb-hover, rgba(255, 255, 255, 0.5));
+}
+body.overlay-root ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/*
+ * 悬浮窗里的 Markdown 代码块：主窗口的实色浅底（bg-surface）和彩色高亮
+ * （绿/琥珀/蓝）在这里全部不对——悬浮窗是黑白灰 + 半透明底。用稳定钩子类
+ * （code-block / code-lang / code-copy / inline-code，见 Markdown.tsx）覆盖，
+ * 主窗口不受影响。底色用半透明白叠在卡片底上，与答案卡的 bg-white/[0.05]
+ * 同一套语言：背景不透明度变化时它自然跟着变。
+ */
+body.overlay-root .code-block {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+body.overlay-root .code-block > div {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+body.overlay-root .code-block .code-lang {
+  color: rgba(255, 255, 255, 0.45);
+}
+body.overlay-root .code-block .code-copy {
+  color: rgba(255, 255, 255, 0.55);
+}
+body.overlay-root .code-block .code-copy:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.9);
+}
+body.overlay-root .code-block pre {
+  color: rgba(255, 255, 255, 0.9);
+}
+/* 语法高亮降饱和：颜色改亮度分级，只保 keyword 最亮、comment 最暗 */
+body.overlay-root .code-block .text-good {
+  color: rgba(255, 255, 255, 0.8);
+}
+body.overlay-root .code-block .text-warn {
+  color: rgba(255, 255, 255, 0.7);
+}
+body.overlay-root .code-block .text-brand {
+  color: #ffffff;
+}
+body.overlay-root .code-block .text-ink-secondary {
+  color: rgba(255, 255, 255, 0.75);
+}
+body.overlay-root .code-block .text-ink-faint {
+  color: rgba(255, 255, 255, 0.5);
+}
+body.overlay-root .inline-code {
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.9);
+}
+
 /* 键盘可达性:统一焦点环 */
 :focus-visible {
   outline: 2px solid #4f7cff;
   outline-offset: 2px;
   border-radius: 4px;
+}
+
+/*
+ * 悬浮窗例外:表单控件聚焦不画亮色描边(用户拍板)。全局 :focus-visible 的
+ * 亮蓝 outline 写在 utilities 之后,元素上的 outline-none 压不过它;悬浮窗是
+ * 黑白灰配色,这道蓝框也是唯一会冒出来的彩色。textarea 里的光标已经足以
+ * 表达"焦点在这里"。
+ */
+body.overlay-root textarea:focus-visible,
+body.overlay-root input:focus-visible {
+  outline: none;
 }
 
 /* Agent composer 依靠光标表达输入焦点，不改变边框或绘制额外焦点环。 */

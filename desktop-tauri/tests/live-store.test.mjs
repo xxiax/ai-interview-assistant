@@ -8,6 +8,7 @@ await registerTsExtensionResolve()
 const { applyEngineEvent, isValidSessionStatus, mergeHistory, useLiveStore } = await import(
   '../src/stores/live.ts'
 )
+const { buildAnswerFeed, pickDisplayVersion } = await import('../src/shared/answer-threads.ts')
 
 function baseState(overrides = {}) {
   return {
@@ -19,6 +20,8 @@ function baseState(overrides = {}) {
     partialTranscript: null,
     answers: [],
     streamingAnswers: {},
+    captureOn: false,
+    pendingQuestions: [],
     lastEventId: 0,
     synced: true,
     outbox: null,
@@ -67,6 +70,302 @@ function answerRow(id, sessionId, question = `q${id}`) {
   return { id, session_id: sessionId, question, answer: `a${id}`, source: 'llm', created_at: '2026-08-21T00:00:00Z' }
 }
 
+function threadStreamEvent({
+  sessionId = 's1',
+  requestId,
+  threadId = 'th1',
+  revision,
+  question,
+  text,
+  done = false,
+  started = false,
+  failed = false,
+  superseded = false
+}) {
+  return {
+    kind: 'serverMessage',
+    type: 'answer_stream',
+    request_id: requestId,
+    thread_id: threadId,
+    revision,
+    session_id: sessionId,
+    question,
+    channel: 'answer',
+    delta: text,
+    text,
+    thinking: '',
+    answer: text,
+    source: 'llm',
+    done,
+    started,
+    failed,
+    superseded
+  }
+}
+
+test('一卡一答（catch-up swap）：新版开火保留旧段，superseded 冻结旧段', () => {
+  // superseded 是对旧后端终止帧的兼容语义；当前后端各 revision 互不取消。
+  // 前端 catch-up swap:新版的 started 帧**不删**旧段(它正流着被删会让用户
+  // 眼前的答案凭空消失),superseded 帧把旧段冻结成 done+superseded 保留
+  // 兜底;渲染层挑「未被取代里答案最长」的一段展示,新版追平长度即接管。
+  let state = baseState()
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '浏览器输入 URL 后', text: '答案一开头', started: true })
+    )
+  }
+  assert.equal(state.streamingAnswers.req1.answer, '答案一开头')
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req2', revision: 2, question: '浏览器输入 URL 后发生了什么', text: '答案二开头', started: true })
+    )
+  }
+  // 两段并存:旧段最长仍是展示版,新版流式追平前不闪断。
+  assert.deepEqual(Object.keys(state.streamingAnswers).sort(), ['req1', 'req2'])
+  assert.equal(state.streamingAnswers.req2.revision, 2)
+  // rev1 的 superseded 终止帧随后到达:冻结(不删、不算失败、答案保留)。
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '浏览器输入 URL 后', text: '答案一开头', done: true, superseded: true })
+    )
+  }
+  assert.ok(state.streamingAnswers.req1, 'superseded 不删段')
+  assert.equal(state.streamingAnswers.req1.superseded, true)
+  assert.equal(state.streamingAnswers.req1.done, true)
+  assert.equal(state.streamingAnswers.req1.failed, false)
+  assert.equal(state.streamingAnswers.req1.answer, '答案一开头')
+  // rev2 正常收尾;落库答案只是这张卡上的"已入库"标记,流式段保留。
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req2', revision: 2, question: '浏览器输入 URL 后发生了什么', text: '答案二完整', done: true })
+    )
+  }
+  state = {
+    ...state,
+    ...applyEngineEvent(state, {
+      ...answerEvent(9, 's1', '浏览器输入 URL 后发生了什么', 'req2'),
+      thread_id: 'th1'
+    })
+  }
+  assert.equal(state.streamingAnswers.req2.answer, '答案二完整')
+  assert.equal(state.answers.length, 1)
+
+  const feed = buildAnswerFeed(Object.values(state.streamingAnswers), state.answers)
+  assert.equal(feed.threads.length, 1)
+  assert.equal(feed.threads[0].key, 'th1')
+  assert.equal(feed.threads[0].question, '浏览器输入 URL 后发生了什么')
+  // 两段都在卡内(旧版冻结、新版完成),展示版挑未被取代里最长的。
+  assert.equal(feed.threads[0].versions.length, 2)
+  assert.equal(feed.threads[0].persisted?.id, 9)
+  assert.deepEqual(feed.historyAnswers, [])
+  const display = pickDisplayVersion(feed.threads[0].versions)
+  assert.equal(display?.request_id, 'req2', 'superseded 段被跳过,新版是展示版')
+  assert.equal(display?.answer, '答案二完整')
+})
+
+test('superseded 终止帧单独到达也冻结该段（新版 started 帧丢失的兜底）', () => {
+  let state = baseState()
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '半截答案', started: true })
+    )
+  }
+  assert.ok(state.streamingAnswers.req1)
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '半截答案', done: true, superseded: true })
+    )
+  }
+  // 不删段:半截答案冻结保留,它可能仍是这张卡上最长的可读内容。
+  assert.ok(state.streamingAnswers.req1)
+  assert.equal(state.streamingAnswers.req1.superseded, true)
+  assert.equal(state.streamingAnswers.req1.done, true)
+  assert.equal(state.streamingAnswers.req1.answer, '半截答案')
+})
+
+test('pickDisplayVersion：未被取代里挑最长，全空时退回最高 revision', () => {
+  const mk = (rid, rev, answer, extra = {}) => ({
+    request_id: rid,
+    revision: rev,
+    question: 'q',
+    answer,
+    done: false,
+    failed: false,
+    ...extra
+  })
+  // 旧段更长 → 仍由旧段兜底展示。
+  assert.equal(
+    pickDisplayVersion([mk('a', 1, '旧版长答案'.repeat(3)), mk('b', 2, '新版短')])?.request_id,
+    'a'
+  )
+  // 新版追平长度 → 自然接管(并列取 revision 高的)。
+  assert.equal(
+    pickDisplayVersion([mk('a', 1, '等长'), mk('b', 2, '等长')])?.request_id,
+    'b'
+  )
+  // 旧段被取代 → 跳过,即使它更长。
+  assert.equal(
+    pickDisplayVersion([
+      mk('a', 1, '旧版长答案'.repeat(3), { superseded: true }),
+      mk('b', 2, '新版')
+    ])?.request_id,
+    'b'
+  )
+  // 全部被取代(极端)→ 退回 revision 最高的,显示它的状态而不是空白。
+  assert.equal(
+    pickDisplayVersion([
+      mk('a', 1, 'x', { superseded: true }),
+      mk('b', 2, 'y', { superseded: true })
+    ])?.request_id,
+    'b'
+  )
+  // 没有任何一段有答案 → revision 最高的(渲染它的生成中/失败态)。
+  assert.equal(pickDisplayVersion([mk('a', 1, ''), mk('b', 2, '')])?.request_id, 'b')
+  assert.equal(pickDisplayVersion([]), undefined)
+})
+
+test('AnswerFeed 每张卡只渲染 pickDisplayVersion 挑出的一段', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(
+    new URL('../src/pages/feeds/AnswerFeed.tsx', import.meta.url),
+    'utf8'
+  )
+  assert.match(source, /pickDisplayVersion\(thread\.versions\)/)
+  assert.ok(!/>\s*问题：/.test(source), '标题已是累计问题,段内不再重复问题行')
+  assert.ok(!source.includes('index > 0 && <hr'), '单版本渲染没有 hr')
+  // 常驻重新生成:带 thread_id,答案流回同一张卡;生成中也可点。
+  assert.match(source, /api\.live\.regenerate\(thread\.question, false, thread\.key\)/)
+})
+
+test('不同问题线程各自一张卡，落库答案挂到自己那张卡上', () => {
+  let state = baseState()
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'a1', threadId: 'thA', revision: 1, question: '问题 A', text: 'A1' })
+    )
+  }
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'b1', threadId: 'thB', revision: 1, question: '问题 B', text: 'B1' })
+    )
+  }
+  state = {
+    ...state,
+    ...applyEngineEvent(state, { ...answerEvent(10, 's1', '问题 A', 'a1'), thread_id: 'thA' })
+  }
+  assert.equal(state.streamingAnswers.a1.answer, 'A1')
+  assert.equal(state.streamingAnswers.b1.answer, 'B1')
+
+  const feed = buildAnswerFeed(Object.values(state.streamingAnswers), state.answers)
+  assert.deepEqual(
+    feed.threads.map((t) => t.key).sort(),
+    ['thA', 'thB']
+  )
+  const threadA = feed.threads.find((t) => t.key === 'thA')
+  const threadB = feed.threads.find((t) => t.key === 'thB')
+  assert.equal(threadA.persisted?.id, 10)
+  assert.equal(threadB.persisted, undefined)
+  // 已挂到卡片上的落库答案不再出现在历史列表,避免同一段内容渲染两次。
+  assert.deepEqual(feed.historyAnswers, [])
+})
+
+test('思考过程通道的增量被直接丢弃，不进 store', () => {
+  let state = baseState()
+  const patch = applyEngineEvent(state, {
+    kind: 'serverMessage',
+    type: 'answer_stream',
+    request_id: 'r-think',
+    thread_id: 'th1',
+    revision: 1,
+    session_id: 's1',
+    question: '问题',
+    channel: 'thinking',
+    delta: '先分析',
+    text: '先分析',
+    answer: '',
+    source: 'llm',
+    done: false,
+    started: true,
+    failed: false
+  })
+  state = { ...state, ...patch }
+  assert.deepEqual(state.streamingAnswers, {})
+})
+
+test('buildAnswerFeed 保留未被卡片覆盖的历史答案', () => {
+  const answers = [
+    { ...answerRow(1, 's1', '历史问题'), request_id: 'old', thread_id: 'thOld' },
+    { ...answerRow(2, 's1', '实时问题'), request_id: 'live1', thread_id: 'thLive' }
+  ]
+  const streaming = [
+    {
+      request_id: 'live1',
+      thread_id: 'thLive',
+      revision: 1,
+      session_id: 's1',
+      question: '实时问题',
+      answer: '实时答案',
+      source: 'llm',
+      done: true,
+      started: true,
+      failed: false
+    }
+  ]
+  const feed = buildAnswerFeed(streaming, answers)
+  assert.deepEqual(
+    feed.historyAnswers.map((a) => a.id),
+    [1]
+  )
+  assert.equal(feed.threads.length, 1)
+  assert.equal(feed.threads[0].persisted?.id, 2)
+})
+
+test('buildAnswerFeed 按 revision 排序且标题不会被更短的旧问题改回去', () => {
+  const mk = (requestId, revision, question, answer) => ({
+    request_id: requestId,
+    thread_id: 'th1',
+    revision,
+    session_id: 's1',
+    question,
+    answer,
+    source: 'llm',
+    done: true,
+    started: true,
+    failed: false
+  })
+  // 乱序进来:revision 3 先到、revision 1 最后到。
+  const feed = buildAnswerFeed(
+    [
+      mk('r3', 3, '很长的累计问题第三版内容', 'A3'),
+      mk('r1', 1, '短', 'A1'),
+      mk('r2', 2, '中等长度问题', 'A2')
+    ],
+    []
+  )
+  assert.equal(feed.threads.length, 1)
+  assert.equal(feed.threads[0].question, '很长的累计问题第三版内容')
+  assert.deepEqual(
+    feed.threads[0].versions.map((v) => v.answer),
+    ['A1', 'A2', 'A3']
+  )
+})
+
 test('transcript events dedupe by id', () => {
   let state = baseState()
   const event = transcriptEvent(1, 's1', 1)
@@ -112,14 +411,16 @@ test('cross-session transcript/answer events are filtered out', () => {
   assert.equal(state.answers.length, 1)
 })
 
-test('answer stream replaces cumulative text and final answer clears the stream', () => {
+test('answer stream replaces cumulative text and survives the persisted answer', () => {
   let state = baseState()
   state = { ...state, ...applyEngineEvent(state, streamEvent('s1', '第一段')) }
   assert.equal(state.streamingAnswers.r1.answer, '第一段')
   state = { ...state, ...applyEngineEvent(state, streamEvent('s1', '第一段第二段', true)) }
   assert.equal(state.streamingAnswers.r1.done, true)
   state = { ...state, ...applyEngineEvent(state, answerEvent(3, 's1', '流式问题', 'r1')) }
-  assert.deepEqual(state.streamingAnswers, {})
+  // 实时分段不再被落库答案清掉:用户要求每一版都保留到会话结束。
+  assert.equal(state.streamingAnswers.r1.answer, '第一段第二段')
+  assert.equal(state.answers.length, 1)
 })
 
 test('concurrent answer streams remain isolated by request_id', () => {
@@ -133,11 +434,11 @@ test('concurrent answer streams remain isolated by request_id', () => {
   assert.equal(state.streamingAnswers.r2.answer, '第二段输出')
 
   state = { ...state, ...applyEngineEvent(state, answerEvent(1, 's1', '第一段问题', 'r1')) }
-  assert.equal(state.streamingAnswers.r1, undefined)
+  assert.equal(state.streamingAnswers.r1.answer, '第一段完整')
   assert.equal(state.streamingAnswers.r2.question, '第二段问题')
 })
 
-test('final answer keeps upstream thinking content after stream cleanup', () => {
+test('后端仍下发的 thinking 字段被忽略，落库答案只保留正文', () => {
   let state = baseState()
   state = {
     ...state,
@@ -156,6 +457,8 @@ test('final answer keeps upstream thinking content after stream cleanup', () => 
       done: false
     })
   }
+  // 思考过程功能已下线:thinking 通道整条丢弃,不产生任何分段。
+  assert.deepEqual(state.streamingAnswers, {})
   state = {
     ...state,
     ...applyEngineEvent(state, {
@@ -171,8 +474,7 @@ test('final answer keeps upstream thinking content after stream cleanup', () => 
       request_id: 'r4'
     })
   }
-  assert.equal(state.streamingAnswers.r4, undefined)
-  assert.equal(state.answers[0].thinking, '先分析')
+  assert.equal(state.answers[0].answer, '最终答案')
 })
 
 test('audio processing errors keep the backend FunASR network reason', () => {
@@ -368,4 +670,69 @@ test('store mergeHistory action is a no-op for a different session', () => {
   useLiveStore.getState().apply(transcriptEvent(1, 's1', 1))
   useLiveStore.getState().mergeHistory('other', [transcriptRow(9, 'other', 9)], [])
   assert.equal(useLiveStore.getState().transcripts.length, 1)
+})
+
+// ---------- 五轮:captureState 跟随 + pending 提问反馈 ----------
+
+test('captureState flips store captureOn and a disconnect clears it', () => {
+  // 悬浮窗 Ctrl+Alt+Z 开的采集也走 captureState 事件:主窗口的开始/停止
+  // 按钮不能只看本地 systemAudioOn。引擎断开时门必关,不留假"采集中"。
+  const on = applyEngineEvent(baseState(), { kind: 'captureState', active: true })
+  assert.equal(on.captureOn, true)
+  const off = applyEngineEvent(on, { kind: 'captureState', active: false })
+  assert.equal(off.captureOn, false)
+
+  const closed = applyEngineEvent(
+    { ...baseState(), captureOn: true },
+    { kind: 'connection', phase: 'closed', note: '连接已断开' }
+  )
+  assert.equal(closed.captureOn, false, '引擎断开采集门必关')
+})
+
+test('a sent question stays pending until the first stream frame takes over', () => {
+  // 用户痛点:发送后没有任何可见反馈,不知道发没发出去只能反复发。发送
+  // 成功即挂 pending;answer_stream 首帧(started 空帧,后端生成一开始就发)
+  // 同文本即摘除;失败帧同样带 question 也能收尾;断线兜底清空。
+  useLiveStore.getState().reset('s1')
+  const store = useLiveStore.getState()
+  store.addPendingQuestion('讲讲缓存穿透')
+  store.addPendingQuestion('讲讲缓存穿透')
+  assert.equal(useLiveStore.getState().pendingQuestions.length, 2)
+
+  store.apply({
+    kind: 'serverMessage',
+    type: 'answer_stream',
+    session_id: 's1',
+    request_id: 'r1',
+    question: '讲讲缓存穿透',
+    channel: 'answer',
+    text: '',
+    answer: '',
+    started: true,
+    source: 'llm'
+  })
+  assert.equal(useLiveStore.getState().pendingQuestions.length, 0, '首帧即摘除同文本 pending')
+  assert.ok(useLiveStore.getState().streamingAnswers.r1, '真卡已接管')
+
+  store.addPendingQuestion('Q2')
+  store.apply({
+    kind: 'serverMessage',
+    type: 'answer_stream',
+    session_id: 's1',
+    request_id: 'r2',
+    question: 'Q2',
+    channel: 'answer',
+    text: '',
+    answer: '',
+    failed: true,
+    done: true,
+    source: 'llm'
+  })
+  assert.equal(useLiveStore.getState().pendingQuestions.length, 0, '失败帧也要收掉 pending')
+
+  store.addPendingQuestion('Q3')
+  store.apply({ kind: 'connection', phase: 'closed' })
+  assert.equal(useLiveStore.getState().pendingQuestions.length, 0, '断线兜底清空')
+
+  useLiveStore.getState().reset(null)
 })

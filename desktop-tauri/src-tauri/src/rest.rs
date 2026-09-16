@@ -260,6 +260,32 @@ pub async fn sessions_start(
     .await
 }
 
+/// 写入会话级岗位 JD 与简历。空串表示清空。
+pub async fn sessions_set_context(
+    ctx: &RestContext,
+    id: &str,
+    job_description: &str,
+    resume: &str,
+) -> RestResult<crate::protocol::Session> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
+    struct Body<'a> {
+        job_description: &'a str,
+        resume: &'a str,
+    }
+    request(
+        ctx,
+        reqwest::Method::PUT,
+        &format!("/api/sessions/{id}/context"),
+        Some(&Body {
+            job_description,
+            resume,
+        }),
+        Duration::from_secs(15),
+    )
+    .await
+}
+
 pub async fn sessions_end(ctx: &RestContext, id: &str) -> RestResult<crate::protocol::Session> {
     request(
         ctx,

@@ -14,7 +14,7 @@ export type MarkdownBlock =
   | { type: 'heading'; level: number; text: string }
   | { type: 'paragraph'; text: string }
   | { type: 'list'; ordered: boolean; items: string[] }
-  | { type: 'code'; lines: string[] }
+  | { type: 'code'; lines: string[]; lang: string }
 
 export type InlineToken =
   | { kind: 'text'; text: string }
@@ -28,8 +28,10 @@ const HEADING_RE = /^(#{1,4})\s+(.*)$/
 const BULLET_RE = /^[-*+]\s+(.*)$/
 // 有序列表:1. / 1、 / 1)
 const ORDERED_RE = /^\d+(?:[.、)])\s+(.*)$/
-// 围栏代码块:行首(去空白)```
+// 围栏代码块:行首(去空白)``` ,后面可跟语言标记
 const FENCE_RE = /^```/
+// 围栏语言标记:```python / ```ts 。只取首个单词,忽略 ```js {highlight=1} 之类附加参数
+const FENCE_LANG_RE = /^```+\s*([A-Za-z0-9+#._-]*)/
 // 行内标记:代码优先(反引号内的 ** * 保持字面),其次粗体、斜体
 const INLINE_RE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)/g
 
@@ -46,6 +48,7 @@ export function parseBlocks(source: string): MarkdownBlock[] {
     }
     // 围栏代码块:内容原样保留(不做行内解析),直到闭合围栏或末尾
     if (FENCE_RE.test(line.trim())) {
+      const lang = (FENCE_LANG_RE.exec(line.trim())?.[1] ?? '').toLowerCase()
       const buf: string[] = []
       i++
       while (i < lines.length && !FENCE_RE.test(lines[i].trim())) {
@@ -53,7 +56,7 @@ export function parseBlocks(source: string): MarkdownBlock[] {
         i++
       }
       i++ // 跳过闭合围栏(未闭合时容错读到末尾)
-      blocks.push({ type: 'code', lines: buf })
+      blocks.push({ type: 'code', lines: buf, lang })
       continue
     }
     const heading = HEADING_RE.exec(line)

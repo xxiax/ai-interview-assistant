@@ -52,6 +52,12 @@ pub struct Session {
     pub radio_mode: RadioMode,
     pub created_at: String,
     pub ended_at: Option<String>,
+    /// 岗位 JD：会话级答题背景，缺省时后端生成通用答案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_description: Option<String>,
+    /// 简历：会话级答题背景。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

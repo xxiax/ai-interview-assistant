@@ -1,7 +1,7 @@
 # 后端核心实施计划：归档状态
 
 > 原计划日期：2026-08-13
-> 最近按代码复核：2026-08-26
+> 最近按代码复核：2026-09-14
 > 状态：核心后端已实现。本文件不再是可执行接口规范。
 
 原始计划完成后，后端经历了安全、协议、可靠性、成本控制和 ASR 路由修订。旧计划中的部分示例曾包含无鉴权请求、明文 API Key、简化音频消息和不完整的恢复语义，已经不符合当前代码，因此不应复制到客户端或新服务中。当前工作树还包含尚未完成生产收敛的 FunASR 与代理改动；本归档只记录现状，不代表它们已经通过部署审查。
@@ -49,7 +49,7 @@
 | 认证与限流 | 完成 | REST Bearer、WS Token、Origin/Host 和速率限制 |
 | 成本控制 | 完成 | 并发门 + SQLite 持久化预算 |
 | 备份恢复 | 完成代码与测试 | `backend/scripts/` |
-| 自动化测试 | 当前通过 | 2026-08-26 Python 3.10.6：后端 `218 passed`；`ruff` 通过，本轮未重新生成覆盖率，目标 Python 3.12 需重新复现当前测试集 |
+| 自动化测试 | 当前通过 | 2026-09-14 Python 3.10：后端 `260 passed`，`ruff` 通过；目标 Python 3.12 需重新复现当前测试集 |
 | 容器生产实测 | 暂缓 | 资产存在，Docker daemon 不可用时未实测 |
 
 ## 3. 原计划之后形成的关键约束
@@ -108,7 +108,7 @@
 
 ### 当前 ASR 路由
 
-- 默认 `AI_ASR_ENGINE=funasr` 且 `AI_FUNASR_STREAM=true`；WAV 按 `session + source` 复用 FunASR WebSocket，每片独立 `start -> PCM -> stop -> final`。每个 final 创建独立 LLM SSE 请求，会话内默认并发 3 条并以 `request_id` 隔离输出；连接复用不等于整题识别，当前也没有 `speech_end` 或问题线程累积器。只有显式设置 `AI_ASR_ENGINE=llm` 时才使用激活 LLM 配置的主 `model` 做多模态转写。
+- 默认 `AI_ASR_ENGINE=funasr` 且 `AI_FUNASR_STREAM=true`；WAV 按 `session + source` 复用 FunASR WebSocket，并按语音段维持开放式 utterance（段首 `start`、中间只推 PCM、`speech_end` 才 `stop`）。整题合并由客户端 `speech_end` + 后端 `QuestionThread` 完成：网关的累计 `partial` 每长出一截就让问题 `revision += 1` 并立即并发提交一次 LLM SSE 请求（会话内默认并发 3，以 `request_id` 隔离并在前端各占**一张卡内的一段答案**、以 `thread_id` 聚合成一张卡），宽限期到期后只把最新完成的一版写入 `answers`。只有显式设置 `AI_ASR_ENGINE=llm` 时才使用激活 LLM 配置的主 `model` 做多模态转写。
 - 激活的 ASR 配置选择 Whisper 模型或配置名称包含 `groq` 时，WAV 改走 Groq；旧 Groq/Paraformer 组合会使用 `whisper-large-v3`。受支持的非 WAV 编码当前也走 Groq。
 - 所有路径先经过 `ffprobe` 容器、编码、音轨和时长校验。
 - ASR 代理优先级为 `AI_OUTBOUND_PROXY`、active Network 配置、Windows 当前用户系统代理；兼容系统代理单地址和 `http=...;https=...` 写法。
@@ -134,13 +134,13 @@
 python -m pytest -q
 ~~~
 
-2026-08-26 对当前工作树在 Python 3.10.6 的结果为：
+2026-09-14 对当前工作树在 Python 3.10 的结果为：
 
 ~~~text
-218 passed
+260 passed
 ~~~
 
-旧文档中出现过的 `80 passed`、`94 passed`、`113 passed`、`212 passed` 和对应覆盖率均属于更早代码快照，不应继续作为当前验收数字。本轮没有重新生成覆盖率报告；`ruff` 已验证，目标 Python 3.12 仍需重新运行当前 218 项测试。
+旧文档中的较小测试数字均属于更早快照。本轮 `ruff` 已通过但未生成覆盖率报告；目标 Python 3.12 仍需重新运行当前 260 项测试。
 
 测试覆盖的验收面包括：
 
@@ -148,6 +148,7 @@ python -m pytest -q
 - REST/WS 认证与协议拒绝。
 - 状态机和 ended 写屏障。
 - 分片幂等、乱序、缺口、背压、取消水位、当前任务取消、迟到旧片和恢复。
+- `speech_end` 边界校验、来源限制，以及问题线程累积、`revision` 递增、旧版不覆盖新版、宽限关闭后只落库最新一版、全部失败不落库。
 - 事件重放和连接水位。
 - 媒体伪造检测、FunASR 假 WebSocket 协议、Groq/Paraformer 旧配置兼容、Windows 系统代理解析和 Groq 回退。
 - LLM/Search 输入输出边界与降级。
@@ -163,7 +164,8 @@ python -m pytest -q
 - 在真实镜像中复核 `python-socks` 等代理运行时依赖已按生产锁文件和哈希安装。
 - 重新设计 Network 配置的秘密字段、代理 URL 凭据规则和配置失败后是否允许静默直连。
 - 对真实 FunASR/Groq/LLM/Google Search/代理做受控集成测试。
-- 在引入 `speech_end` 后区分短静音片段边界与长静音问题终止，并在保持片级低延迟回答的同时增加累计问题线程。
+- 在真机长时间面试中调参 `AI_QUESTION_THREAD_GRACE_SECONDS`（6 秒）与客户端静音阈值，并统一 `security.py` 的 0.5–30 启动校验与 `realtime._question_grace_seconds()` 的 0.1 运行时下限。
+- 让问题线程状态（`thread_id`、待完成 revision、最新完成结果）在后端重启后可恢复，或至少向客户端明确暴露"未入库分段已丢失"。
 - 在真实客户端验证停止、切 mobile、退出页面和服务端取消并发，确认自动化覆盖的队列/outstanding 计数修复在长时间运行中不泄漏。
 - 增加结构化日志、指标、追踪和告警。
 - 建立显式数据库迁移版本。

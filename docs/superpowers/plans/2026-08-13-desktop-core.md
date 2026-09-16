@@ -2,7 +2,7 @@
 
 > 原计划日期：2026-08-13
 >
-> 最近按代码复核：2026-08-26
+> 最近按代码复核：2026-09-14
 >
 > 状态：**历史资料，不得作为现行实施计划执行。**
 
@@ -51,7 +51,7 @@
 - 真实 `duration_ms`，范围 100–10,000。
 - 可被后端 `ffprobe` 验证的真实容器、编码、单音轨和时长。
 
-现行 Tauri 的标准分片是 16 kHz、单声道、40,000 帧（2.5 秒）。当前只采集电脑播放声，由 WASAPI loopback 处理；WASAPI 线程按 20 ms RMS 窗判断声音，至少 3 个窗口过阈值才成片；静音不会创建 UUID、占用序号或上传，也不会额外发送 `speech_end`。React 中的 `chunk_seq` 仅作兼容展示，持久 PC 序号只由 Rust manifest 原子分配。
+现行 Tauri 的标准分片是 16 kHz、单声道，帧数由 `AI_AUDIO_CHUNK_MS` 决定（默认 400 ms 即 6,400 帧；取值夹到 100–2500 后向下取整到 20 ms RMS 窗的整数倍，解析结果缓存在 `OnceLock`，改环境变量要重启）；语音段边界处还会冲刷一个更短的尾片（带 100 ms 尾部静音，不足 100 ms 零填充），`duration_ms` 按实际采样数计算而非固定值。当前只采集电脑播放声，由 WASAPI loopback 处理；`SpeechChunker` 按 20 ms RMS 窗判断声音，至少 3 个窗口过阈值才成片；静音不会创建 UUID、占用序号或上传。连续 80 个静音窗（约 1.6 秒）时先冲刷短尾片，再发送 `speech_end{source, through_chunk_seq}` 控制消息。React 中的 `chunk_seq` 仅作兼容展示，持久 PC 序号只由 Rust manifest 原子分配。
 
 ### 2.3 本地可靠队列
 
@@ -163,7 +163,7 @@ Infrastructure
 
 ## 5. 历史最低测试矩阵
 
-该矩阵仍可用于扩展 Tauri 自动化测试。当前 `npm test` 有 92 个测试、Rust 有 42 个测试，但真实 Windows 音频设备与腾讯会议场景仍未由这些测试覆盖。
+该矩阵仍可用于扩展 Tauri 自动化测试。当前 `npm test` 为 `170 passed`、`cargo test --locked` 为 `72 passed`（2026-09-14 实测），但真实 Windows 音频设备与腾讯会议场景仍未由这些测试覆盖。
 
 | 类别 | 必测场景 |
 |---|---|
@@ -174,6 +174,8 @@ Infrastructure
 | 恢复 | 客户端重启、后端重启、服务关闭、网络切换 |
 | 双端 | pc/mobile 独立序号、both 模式、来源不允许 |
 | 系统声音 | 默认 `eConsole` 播放设备 loopback、腾讯会议/媒体播放、通信默认或独立端点漏采、静音不成片 |
+| 语音段边界 | 连续静音触发短尾片冲刷与 `speech_end`、边界水位取自 manifest、认证前缓存与重连补发、`speech_end` 不冻结 outbox |
+| 答案卡片 | 按 `thread_id` **一个问题一张卡**，卡内按 `request_id` 一版一段、按 `revision` 升序、段间 `<hr>` 分隔；标题取最长累计问题；单版失败只标记该段；落库 `answer` 不清理分段，只作为该卡的「已入库」标记并从历史列表剔除 |
 | 重复收音 | 当前只上传系统播放声，避免麦克风和系统声音混在同一 `source=pc` |
 | 停止取消 | 停止、切 mobile、退出页面、迟到 invoke、取消水位幂等、当前 ASR task 中止 |
 | 错误提示 | JavaScript `Error`、Tauri 字符串错误、非空 toast 和用户可理解的失败原因 |
@@ -199,4 +201,4 @@ Infrastructure
 
 后续桌面端开发、修复、测试、构建和发布一律在 `desktop-tauri/` 中进行；需要新路线图时，应基于当前 Tauri 源码、[后端协议](../../../backend/README.md)和实际验证缺口另建计划。
 
-截至 2026-08-26，当前自动化证据为前端 `92 passed`、Rust `42 passed`；前端测试包含系统声音采集停止、答案优先布局、手动提问框、partial 转写、并发流式答案、Tauri 字符串错误非空显示和全局提示词回归。本次发布仍需重新执行 `npm run build`、`cargo check --locked`、`cargo fmt --check` 和严格 Clippy。WASAPI 默认 `eConsole` 播放设备、腾讯会议对方声音和真实 FunASR 链路仍待真实设备结果补充；若会议使用通信默认设备或独立端点，当前实现不会捕获。本归档不得把自动化或编译结果表述为真机场景已经验收。
+截至 2026-09-14，前端 `170 passed`、Rust `72 passed`，`npm run build`、Rust fmt/check/严格 Clippy 均通过。测试覆盖语音段切分、一问题一张卡、并发 revision 聚合、悬浮窗、截图解题、快捷键、outbox 与错误边界。WASAPI 默认播放设备、腾讯会议对方声音和真实 FunASR 链路仍待真机验收；自动化与编译结果不能替代该场景。

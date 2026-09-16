@@ -52,6 +52,12 @@ pub enum EngineEvent {
     SeqWatermark {
         next_chunk_seq: i64,
     },
+    /// 本机采集门翻转。悬浮窗据此区分「会话在录」与「本机真的在采」:
+    /// 停止采集后后端会话状态仍是 recording(切收音模式要求如此),
+    /// 只报 sessionState 的话徽标会一直亮"录制中"。
+    CaptureState {
+        active: bool,
+    },
 }
 
 /// WS 阶段字符串(与前端 ConnectionPhase 一致)。
@@ -79,6 +85,10 @@ pub enum EngineCommand {
     Send(Value),
     /// 渲染进程采集的新分片(落盘后由泵按序发送)
     AddChunk(Box<NewChunk>),
+    /// 客户端 VAD 检测到连续静音；WS 任务会附带当前已分配的 PC 序号水位。
+    SpeechEnd {
+        source: String,
+    },
     /// 控制本机采集门禁；关闭时同时持久化并补发服务端取消意图。
     SetCaptureActive {
         active: bool,

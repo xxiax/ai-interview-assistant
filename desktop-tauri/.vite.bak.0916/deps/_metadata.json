@@ -1,0 +1,88 @@
+{
+  "hash": "5686fc38",
+  "configHash": "56a526b7",
+  "lockfileHash": "2de99ef8",
+  "browserHash": "b141121b",
+  "optimized": {
+    "react": {
+      "src": "../../react/index.js",
+      "file": "react.js",
+      "fileHash": "fbb2596c",
+      "needsInterop": true
+    },
+    "react-dom": {
+      "src": "../../react-dom/index.js",
+      "file": "react-dom.js",
+      "fileHash": "cf42a665",
+      "needsInterop": true
+    },
+    "react/jsx-dev-runtime": {
+      "src": "../../react/jsx-dev-runtime.js",
+      "file": "react_jsx-dev-runtime.js",
+      "fileHash": "20b8b3ad",
+      "needsInterop": true
+    },
+    "react/jsx-runtime": {
+      "src": "../../react/jsx-runtime.js",
+      "file": "react_jsx-runtime.js",
+      "fileHash": "c467ec5b",
+      "needsInterop": true
+    },
+    "@tauri-apps/api/core": {
+      "src": "../../@tauri-apps/api/core.js",
+      "file": "@tauri-apps_api_core.js",
+      "fileHash": "1cd0538d",
+      "needsInterop": false
+    },
+    "@tauri-apps/api/event": {
+      "src": "../../@tauri-apps/api/event.js",
+      "file": "@tauri-apps_api_event.js",
+      "fileHash": "e772a470",
+      "needsInterop": false
+    },
+    "dayjs": {
+      "src": "../../dayjs/dayjs.min.js",
+      "file": "dayjs.js",
+      "fileHash": "c2765e4a",
+      "needsInterop": true
+    },
+    "lucide-react": {
+      "src": "../../lucide-react/dist/esm/lucide-react.js",
+      "file": "lucide-react.js",
+      "fileHash": "822b8e72",
+      "needsInterop": false
+    },
+    "react-dom/client": {
+      "src": "../../react-dom/client.js",
+      "file": "react-dom_client.js",
+      "fileHash": "ae81b82c",
+      "needsInterop": true
+    },
+    "react-router-dom": {
+      "src": "../../react-router-dom/dist/index.mjs",
+      "file": "react-router-dom.js",
+      "fileHash": "c044da49",
+      "needsInterop": false
+    },
+    "zustand": {
+      "src": "../../zustand/esm/index.mjs",
+      "file": "zustand.js",
+      "fileHash": "d58ae5a4",
+      "needsInterop": false
+    }
+  },
+  "chunks": {
+    "chunk-G7S6KQDI": {
+      "file": "chunk-G7S6KQDI.js"
+    },
+    "chunk-TI2F7RXM": {
+      "file": "chunk-TI2F7RXM.js"
+    },
+    "chunk-TAJOU4CS": {
+      "file": "chunk-TAJOU4CS.js"
+    },
+    "chunk-PX6F3LHL": {
+      "file": "chunk-PX6F3LHL.js"
+    }
+  }
+}

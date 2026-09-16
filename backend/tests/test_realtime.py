@@ -586,7 +586,7 @@ async def test_answer_stream_is_broadcast_before_final_answer_is_persisted(monke
     async def capture_broadcast(_session_id, message):
         messages.append(message)
 
-    async def fake_stream(question, context=""):
+    async def fake_stream(question, context="", *_ctx):
         assert question == "请介绍一下你的项目"
         yield realtime_module.llm.LLMStreamPart(thinking="先梳理项目背景")
         yield realtime_module.llm.LLMStreamPart(text="先给出项目背景")
@@ -620,14 +620,13 @@ async def test_answer_stream_is_broadcast_before_final_answer_is_persisted(monke
         "和技术方案。",
     ]
     assert "".join(message["delta"] for message in answer_stream_messages if message["delta"]) == "先给出项目背景和技术方案。"
-    thinking_stream_messages = [
-        message for message in stream_messages if message["channel"] == "thinking"
-    ]
-    assert "".join(message["delta"] for message in thinking_stream_messages) == "先梳理项目背景"
-    assert thinking_stream_messages[-1]["thinking"] == "先梳理项目背景"
+    # 思考过程功能已下线:上游 reasoning 增量不再产生 channel="thinking" 广播,
+    # answer 事件也不再携带 thinking 字段。
+    assert all(message["channel"] == "answer" for message in stream_messages)
+    assert all("thinking" not in message for message in stream_messages)
     assert stream_messages[-1]["done"] is True
     final_answer_event = next(message for message in messages if message.get("type") == "answer")
-    assert final_answer_event["thinking"] == "先梳理项目背景"
+    assert "thinking" not in final_answer_event
     conn = db.get_db()
     try:
         answers = db.get_answers(conn, session["id"])
@@ -654,7 +653,7 @@ async def test_answer_search_is_only_used_when_explicitly_requested(monkeypatch)
         raise AssertionError("use_search=true 时不应调用纯 LLM 链路")
         yield  # pragma: no cover
 
-    async def fake_search(question, context=""):
+    async def fake_search(question, context="", *_ctx):
         calls["search"] += 1
         assert question == "需要搜索的问题"
         yield realtime_module.llm.LLMStreamPart(text="搜索答案"), True
@@ -683,9 +682,62 @@ async def test_answer_search_is_only_used_when_explicitly_requested(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_funasr_partial_is_immediate_and_final_is_persisted_without_question_detection(
+async def test_revision_gate_is_geometric_with_sentence_end_override(monkeypatch):
+    """revision 几何节流:纯追加的累计 partial 要长到上一版的 1.5 倍才开新火;
+    追加部分出现句末标点则立即开火;ASR 改稿(非前缀)也立即开火。
+
+    断言用 `thread.revision`：它只由闸门决定，和并发任务的完成顺序无关。
+    """
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "revision 几何节流")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    async def fake_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text=f"回答:{question}")
+
+    async def capture_broadcast(_session_id, _message):
+        return None
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    segment = realtime_module.FunAsrSegment(session_id=key[0], source=key[1])
+
+    # 7 版累计 partial(字符数 4/6/8/11/13/16/17),预期只开 4 火:
+    #   6 字 = 4×1.5 边界开火;8 字 < 6×1.5=9 被闸;11 字 ≥ 9 开火;
+    #   13、16 字都 < 11×1.5=16.5 被闸;17 字仍不足但追加带"？",句末标点开火。
+    fired_revisions = []
+    for text in (
+        "请你介绍",
+        "请你介绍一下",
+        "请你介绍一下自己",
+        "请你介绍一下自己的经历",
+        "请你介绍一下自己的经历和",
+        "请你介绍一下自己的经历和主要项目",
+        "请你介绍一下自己的经历和主要项目？",
+    ):
+        await pipeline._dispatch_segment_revision(key, segment, text)
+        fired_revisions.append(pipeline._question_threads[key].revision)
+    assert fired_revisions == [1, 2, 2, 3, 3, 3, 4]
+    # ASR 改稿:新文本不以旧文开头,立即开火,不能被倍率闸住。
+    await pipeline._dispatch_segment_revision(key, segment, "换个话题")
+    assert pipeline._question_threads[key].revision == 5
+    await pipeline.stop_session(session["id"])
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_funasr_cumulative_partial_drives_revisions_and_one_transcript_per_segment(
     monkeypatch,
 ):
+    """开放式 utterance：分片推流即 ack done，累计 partial 逐版问 LLM，段末一条转写。"""
     conn = db.get_db()
     try:
         session = db.create_session(conn, "无问题检测实时流")
@@ -695,29 +747,35 @@ async def test_funasr_partial_is_immediate_and_final_is_persisted_without_questi
 
     monkeypatch.setenv("AI_ASR_ENGINE", "funasr")
     monkeypatch.setenv("AI_FUNASR_STREAM", "true")
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    # 每片只多 3 个字;默认 1.5 倍几何闸门下 6 字 ≥ 3×1.5,两片各自触发一版,
+    # 不再需要把增量闸门压到 1。
     messages = []
 
     class FakeStream:
+        """模拟网关：partial 是当前 utterance 的累计全文，final 只在 stop 后出现。"""
+
         def __init__(self):
             self.push_count = 0
+            self.text = ""
 
         async def connect(self):
             return None
 
         async def push_wav(self, _audio_bytes, _duration_ms):
             self.push_count += 1
-            return [
-                asr.FunAsrEvent("partial", text=f"还没说完{self.push_count}"),
-                asr.FunAsrEvent("final", text=f"最终切片{self.push_count}"),
-            ]
+            self.text += f"第{self.push_count}片"
+            return [asr.FunAsrEvent("partial", text=self.text)]
 
         async def finish(self):
-            return []
+            if not self.text:
+                return []
+            return [asr.FunAsrEvent("final", text=self.text)]
 
         async def close(self):
             return None
 
-    async def fake_stream(question, context=""):
+    async def fake_stream(question, context="", *_ctx):
         yield realtime_module.llm.LLMStreamPart(text=f"回答:{question}")
 
     monkeypatch.setattr(realtime_module.asr, "FunAsrStream", FakeStream)
@@ -743,7 +801,13 @@ async def test_funasr_partial_is_immediate_and_final_is_persisted_without_questi
         assert accepted
 
     await asyncio.sleep(0.1)
-    assert any(message["type"] == "transcript_partial" for message in messages)
+    # 累计 partial 每来一版都要立刻广播，客户端做整句替换显示。
+    partial_texts = [
+        message["text"] for message in messages if message["type"] == "transcript_partial"
+    ]
+    assert "第1片" in partial_texts
+    assert "第1片第2片" in partial_texts
+    # 分片一推进网关就 ack done，不等段末 final，否则长问题会顶满客户端发件箱。
     for _ in range(100):
         conn = db.get_db()
         try:
@@ -758,10 +822,8 @@ async def test_funasr_partial_is_immediate_and_final_is_persisted_without_questi
         await asyncio.sleep(0.01)
     conn = db.get_db()
     try:
-        assert [item["text"] for item in db.get_transcripts(conn, session["id"])] == [
-            "最终切片1",
-            "最终切片2",
-        ]
+        # 语音段还没结束，段末 final 还没产生，因此此刻不应有任何转写入库。
+        assert db.get_transcripts(conn, session["id"]) == []
         chunk_statuses = conn.execute(
             "SELECT chunk_seq, status FROM audio_chunks WHERE session_id = ? ORDER BY chunk_seq",
             (session["id"],),
@@ -770,27 +832,34 @@ async def test_funasr_partial_is_immediate_and_final_is_persisted_without_questi
     finally:
         conn.close()
 
+    await pipeline.mark_speech_end(session["id"], "pc", 1)
     for _ in range(100):
         if any(message["type"] == "answer" for message in messages):
             break
         await asyncio.sleep(0.01)
+    # 两片各触发一次 revision，段末 final 再强制一版；入库答案对应段末全文。
     assert any(
-        message["type"] == "answer"
-        and message["question"] in {"最终切片1", "最终切片2"}
+        message["type"] == "answer" and message["question"] == "第1片第2片"
         for message in messages
     )
+    answer_questions = [
+        message["question"] for message in messages if message["type"] == "answer_stream"
+    ]
+    assert "第1片" in answer_questions
     conn = db.get_db()
     try:
         db.end_session(conn, session["id"])
         transcripts = db.get_transcripts(conn, session["id"])
     finally:
         conn.close()
-    assert [item["text"] for item in transcripts] == ["最终切片1", "最终切片2"]
+    # 一个语音段只落一条转写，而不是每片一条。
+    assert [item["text"] for item in transcripts] == ["第1片第2片"]
     await pipeline.stop_session(session["id"])
 
 
 @pytest.mark.asyncio
-async def test_automatic_answers_run_concurrently_and_all_are_persisted(monkeypatch):
+async def test_question_revisions_run_concurrently_and_only_latest_is_persisted(monkeypatch):
+    """同一问题的累计修订都执行，前端按 thread_id 聚合，最终只落最新版。"""
     conn = db.get_db()
     try:
         session = db.create_session(conn, "低延迟答案续写")
@@ -803,7 +872,7 @@ async def test_automatic_answers_run_concurrently_and_all_are_persisted(monkeypa
     started_questions = set()
     messages = []
 
-    async def fake_stream(question, context=""):
+    async def fake_stream(question, context="", *_ctx):
         started_questions.add(question)
         if len(started_questions) == 2:
             both_started.set()
@@ -816,18 +885,25 @@ async def test_automatic_answers_run_concurrently_and_all_are_persisted(monkeypa
 
     monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
     monkeypatch.setenv("AI_LLM_SESSION_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
     pipeline = RealtimePipeline(capture_broadcast)
-    assert await pipeline.enqueue_answer(
-        AnswerWork(session["id"], "第一片", False)
-    )
-    assert await pipeline.enqueue_answer(
-        AnswerWork(session["id"], "第二片", False)
+    key = (session["id"], "pc")
+    assert await pipeline._enqueue_question_revision(key, "浏览器输入 URL 后", 0)
+    assert await pipeline._enqueue_question_revision(
+        key, "浏览器输入 URL 后发生了什么？", 1
     )
     await asyncio.wait_for(both_started.wait(), timeout=1)
+    assert started_questions == {
+        "浏览器输入 URL 后",
+        "浏览器输入 URL 后发生了什么？",
+    }
+
+    await pipeline.mark_speech_end(session["id"], "pc", 1)
     release.set()
 
     for _ in range(100):
-        if len([message for message in messages if message.get("type") == "answer"]) == 2:
+        if len([message for message in messages if message.get("type") == "answer"]) == 1:
             break
         await asyncio.sleep(0.01)
 
@@ -837,17 +913,109 @@ async def test_automatic_answers_run_concurrently_and_all_are_persisted(monkeypa
         db.end_session(conn, session["id"])
     finally:
         conn.close()
-    assert {answer["question"] for answer in answers} == {"第一片", "第二片"}
+    assert [answer["question"] for answer in answers] == [
+        "浏览器输入 URL 后发生了什么？"
+    ]
     stream_request_ids = {
         message["request_id"]
         for message in messages
         if message.get("type") == "answer_stream"
     }
-    final_request_ids = {
-        message["request_id"] for message in messages if message.get("type") == "answer"
+    stream_thread_ids = {
+        message["thread_id"]
+        for message in messages
+        if message.get("type") == "answer_stream"
     }
+    final = next(message for message in messages if message.get("type") == "answer")
     assert len(stream_request_ids) == 2
-    assert final_request_ids == stream_request_ids
+    assert len(stream_thread_ids) == 1
+    assert final["thread_id"] in stream_thread_ids
+    assert final["revision"] == 2
+    assert final["request_id"] in stream_request_ids
+    completed_revisions = {
+        message["revision"]
+        for message in messages
+        if message.get("type") == "answer_stream"
+        and message.get("done") is True
+        and message.get("failed") is not True
+    }
+    assert completed_revisions == {1, 2}
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_speech_end_before_asr_final_still_closes_the_question_thread(monkeypatch):
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "边界先于 final")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    messages = []
+
+    async def fake_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text=f"回答:{question}")
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    pipeline = RealtimePipeline(capture_broadcast)
+    await pipeline.mark_speech_end(session["id"], "pc", 0)
+    assert await pipeline._enqueue_question_revision(
+        (session["id"], "pc"), "DNS 查询过程是什么？", 0
+    )
+
+    for _ in range(100):
+        if any(message.get("type") == "answer" for message in messages):
+            break
+        await asyncio.sleep(0.01)
+
+    final = next(message for message in messages if message.get("type") == "answer")
+    assert final["question"] == "DNS 查询过程是什么？"
+    assert final["revision"] == 1
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_newer_chunk_within_grace_keeps_the_same_question_thread(monkeypatch):
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "短暂停顿后续问")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    messages = []
+
+    async def fake_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text=f"回答:{question}")
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.2")
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    assert await pipeline._enqueue_question_revision(key, "Claude Code", 0)
+    await pipeline.mark_speech_end(session["id"], "pc", 0)
+    # 段末 final 会固化前缀；下一段的累计 partial 只覆盖新段，必须拼在前缀后面。
+    await pipeline._commit_question_prefix(key)
+    assert await pipeline._enqueue_question_revision(key, "和 Codex 的优劣势？", 1)
+    await asyncio.sleep(0.25)
+    assert not any(message.get("type") == "answer" for message in messages)
+
+    await pipeline.mark_speech_end(session["id"], "pc", 1)
+    for _ in range(100):
+        if any(message.get("type") == "answer" for message in messages):
+            break
+        await asyncio.sleep(0.01)
+    final = next(message for message in messages if message.get("type") == "answer")
+    assert final["question"] == "Claude Code和 Codex 的优劣势？"
+    assert final["revision"] == 2
     await pipeline.stop_session(session["id"])
 
 
@@ -1152,6 +1320,295 @@ async def test_gap_abandon_requeue_does_not_leak_audio_outstanding(monkeypatch):
             break
         await asyncio.sleep(0.01)
     assert pipeline._audio_outstanding.get(key, 0) == 0
+
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_regenerate_thread_answer_reopens_a_closed_thread(monkeypatch):
+    """重问某张问题卡:已关闭线程被重开,revision+1,新答案落库到同一线程。
+
+    线程入库后保留在 by_id(regenerate 的前提),且可连续 regenerate。
+    """
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "重新生成问题卡")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    messages = []
+
+    async def fake_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text=f"重答:{question}")
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+
+    # 走一遍正常提问→宽限关闭→落库。
+    assert await pipeline._enqueue_question_revision(key, "讲讲缓存一致性", 0)
+    await pipeline.mark_speech_end(session["id"], "pc", 0)
+
+    def _final_answers():
+        return [m for m in messages if m.get("type") == "answer" and m.get("thread_id")]
+
+    # 落库先于 broadcast,轮询要等广播消息(比 DB 可见更晚)。
+    for _ in range(100):
+        if _final_answers():
+            break
+        await asyncio.sleep(0.01)
+    final_messages = _final_answers()
+    assert len(final_messages) == 1
+    thread_id = final_messages[0]["thread_id"]
+    assert final_messages[0]["revision"] == 1
+    conn = db.get_db()
+    try:
+        answers = db.get_answers(conn, session["id"])
+    finally:
+        conn.close()
+    assert len(answers) == 1
+    # 关闭并入库后,线程必须仍保留在 by_id:否则 regenerate 没有靶子。
+    assert thread_id in pipeline._question_threads_by_id
+    assert pipeline._question_threads_by_id[thread_id].closed
+    assert pipeline._question_threads_by_id[thread_id].persisted
+
+    # regenerate:同线程重开,revision 递增,答案流回同 thread_id。
+    assert await pipeline.regenerate_thread_answer(
+        session["id"], thread_id, "讲讲缓存一致性", False
+    )
+    reopened = pipeline._question_threads_by_id[thread_id]
+    assert reopened.revision == 2, "regenerate 必须在同一线程上递增 revision"
+    assert reopened.persisted is False, "重开后的线程要重新等这次生成落库"
+
+    for _ in range(100):
+        if len(_final_answers()) == 2:
+            break
+        await asyncio.sleep(0.01)
+    final_messages = _final_answers()
+    assert [m["revision"] for m in final_messages] == [1, 2]
+    conn = db.get_db()
+    try:
+        answers = db.get_answers(conn, session["id"])
+    finally:
+        conn.close()
+    assert len(answers) == 2
+    assert answers[1]["answer"].startswith("重答")
+    assert {m["thread_id"] for m in final_messages} == {thread_id}
+    stream_frames = [
+        m
+        for m in messages
+        if m.get("type") == "answer_stream" and m.get("revision") == 2
+    ]
+    assert stream_frames, "重新生成的答案必须流回前端"
+
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+    await pipeline.stop_session(session["id"])
+    # 会话结束后保留的线程必须清干净,否则整场的线程对象泄漏到进程退出。
+    assert thread_id not in pipeline._question_threads_by_id
+
+
+@pytest.mark.asyncio
+async def test_failed_regenerate_does_not_duplicate_the_previous_persisted_answer(
+    monkeypatch,
+):
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "重新生成失败不重复历史")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    should_fail = False
+    messages = []
+
+    async def fake_stream(question, context="", *_ctx):
+        if should_fail:
+            raise RuntimeError("regenerate failed")
+        yield realtime_module.llm.LLMStreamPart(text=f"首次:{question}")
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    assert await pipeline._enqueue_question_revision(key, "什么是幂等？", 0)
+    await pipeline.mark_speech_end(session["id"], "pc", 0)
+    for _ in range(100):
+        finals = [m for m in messages if m.get("type") == "answer"]
+        if finals:
+            break
+        await asyncio.sleep(0.01)
+    thread_id = finals[0]["thread_id"]
+
+    should_fail = True
+    assert await pipeline.regenerate_thread_answer(
+        session["id"], thread_id, "什么是幂等？", False
+    )
+    for _ in range(100):
+        if any(m.get("failed") is True for m in messages):
+            break
+        await asyncio.sleep(0.01)
+
+    conn = db.get_db()
+    try:
+        answers = db.get_answers(conn, session["id"])
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+    assert len(answers) == 1
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_regenerate_thread_answer_recreates_a_missing_thread_with_same_id(
+    monkeypatch,
+):
+    """线程找不到(后端重启过)时以相同 thread_id 重建,答案照常落库。
+
+    重建的线程只进 by_id,不进 key 映射——不打断同 key 上正在问的新问题。
+    """
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "重建丢失的线程")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    async def fake_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text=f"重建:{question}")
+
+    messages = []
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    pipeline = RealtimePipeline(capture_broadcast)
+    orphan_id = str(uuid4())
+
+    assert await pipeline.regenerate_thread_answer(
+        session["id"], orphan_id, "重建后的问题", False
+    )
+    recreated = pipeline._question_threads_by_id.get(orphan_id)
+    assert recreated is not None
+    assert recreated.session_id == session["id"]
+    assert recreated.revision == 1
+    # 重建线程不占用 key 映射:该 key 上的新问题照常开自己的线程。
+    assert (session["id"], "pc") not in pipeline._question_threads
+    assert await pipeline._enqueue_question_revision(
+        (session["id"], "pc"), "新问题", 0
+    )
+    new_thread = pipeline._question_threads[(session["id"], "pc")]
+    assert new_thread.thread_id != orphan_id
+    # 新问题走正常语音段收尾,宽限期后落库。
+    await pipeline.mark_speech_end(session["id"], "pc", 0)
+
+    # 重建线程的答案按原 thread_id 落库(事件载荷),新问题落自己的新 id。
+    for _ in range(100):
+        finals = [m for m in messages if m.get("type") == "answer" and m.get("thread_id")]
+        if len(finals) == 2:
+            break
+        await asyncio.sleep(0.01)
+    by_thread = {m["thread_id"]: m for m in finals}
+    assert orphan_id in by_thread
+    assert by_thread[orphan_id]["answer"].startswith("重建")
+    assert new_thread.thread_id in by_thread
+
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_one_revision_failure_does_not_cancel_a_newer_revision(monkeypatch):
+    """并发修订互不取消：旧版失败可见，新版仍完成并成为落库答案。"""
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "取消伪装成传输错误")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    messages = []
+    started = set()
+
+    async def fake_stream(question, context="", *_ctx):
+        started.add(question)
+        if len(started) == 2:
+            both_started.set()
+        if question == "旧问题":
+            yield realtime_module.llm.LLMStreamPart(text="半截")
+            await release.wait()
+            raise RuntimeError("peer closed connection without response")
+        await release.wait()
+        yield realtime_module.llm.LLMStreamPart(text="新版完整答案")
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_LLM_SESSION_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    assert await pipeline._enqueue_question_revision(key, "旧问题", 0)
+    assert await pipeline._enqueue_question_revision(key, "旧问题完整版？", 1)
+    await asyncio.wait_for(both_started.wait(), timeout=1)
+    await pipeline.mark_speech_end(session["id"], "pc", 1)
+    release.set()
+
+    for _ in range(100):
+        done_new = [
+            m
+            for m in messages
+            if m.get("type") == "answer_stream"
+            and m.get("revision") == 2
+            and m.get("done") is True
+        ]
+        if done_new:
+            break
+        await asyncio.sleep(0.01)
+    assert done_new, "新版要正常收尾"
+
+    assert [
+        m
+        for m in messages
+        if m.get("type") == "answer_stream" and m.get("revision") == 1 and m.get("failed")
+    ], "旧版真实失败应只标记自己的 revision"
+    assert [
+        m for m in messages if m.get("code") == "answer_generation_failed"
+    ]
+
+    for _ in range(100):
+        finals = [m for m in messages if m.get("type") == "answer"]
+        if finals:
+            break
+        await asyncio.sleep(0.01)
+    assert len(finals) == 1
+    assert finals[0]["revision"] == 2
+    assert finals[0]["answer"] == "新版完整答案"
 
     conn = db.get_db()
     try:

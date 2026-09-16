@@ -67,6 +67,7 @@ def validate_security_config() -> None:
         "AI_LLM_ANSWER_MAX_COMPLETION_TOKENS": (1, 16_384, 512),
         "AI_LLM_REVIEW_MAX_COMPLETION_TOKENS": (1, 65_536, 2_048),
         "AI_LLM_TRANSCRIBE_MAX_TOKENS": (1, 65_536, 2_048),
+        "AI_LLM_SOLVE_MAX_COMPLETION_TOKENS": (1, 65_536, 1_536),
     }
     for name, (minimum, maximum, default) in integer_limits.items():
         raw_value = os.environ.get(name, str(default))
@@ -83,11 +84,40 @@ def validate_security_config() -> None:
     if not 0.1 <= reorder_wait <= 60:
         raise RuntimeError("AI_AUDIO_REORDER_WAIT_SECONDS 必须在 0.1 到 60 之间")
     try:
+        question_grace = float(
+            os.environ.get("AI_QUESTION_THREAD_GRACE_SECONDS", "6")
+        )
+    except ValueError as exc:
+        raise RuntimeError("AI_QUESTION_THREAD_GRACE_SECONDS 必须是数字") from exc
+    if not 0.5 <= question_grace <= 30:
+        raise RuntimeError(
+            "AI_QUESTION_THREAD_GRACE_SECONDS 必须在 0.5 到 30 之间"
+        )
+    try:
         paid_wait = float(os.environ.get("AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS", "1.0"))
     except ValueError as exc:
         raise RuntimeError("AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS 必须是数字") from exc
     if not 0.01 <= paid_wait <= 60:
         raise RuntimeError("AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS 必须在 0.01 到 60 之间")
+    try:
+        revision_ratio = float(
+            os.environ.get("AI_QUESTION_REVISION_GROWTH_RATIO", "1.5")
+        )
+    except ValueError as exc:
+        raise RuntimeError("AI_QUESTION_REVISION_GROWTH_RATIO 必须是数字") from exc
+    if not 1.0 <= revision_ratio <= 5.0:
+        raise RuntimeError("AI_QUESTION_REVISION_GROWTH_RATIO 必须在 1.0 到 5.0 之间")
+    # FunASR 开放式 utterance:推流后收取累计 partial 的空闲窗口与总上限。
+    for name, default, low, high in (
+        ("AI_FUNASR_PARTIAL_IDLE_SECONDS", "0.6", 0.05, 5.0),
+        ("AI_FUNASR_PARTIAL_MAX_WAIT_SECONDS", "3.0", 0.2, 15.0),
+    ):
+        try:
+            value = float(os.environ.get(name, default))
+        except ValueError as exc:
+            raise RuntimeError(f"{name} 必须是数字") from exc
+        if not low <= value <= high:
+            raise RuntimeError(f"{name} 必须在 {low} 到 {high} 之间")
     if "*" in {
         item.strip() for item in os.environ.get("AI_ALLOWED_ORIGINS", "").split(",")
     }:

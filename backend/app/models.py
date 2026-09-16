@@ -43,6 +43,15 @@ class SessionResponse(StrictModel):
     radio_mode: RadioMode
     created_at: datetime
     ended_at: datetime | None = None
+    job_description: str | None = None
+    resume: str | None = None
+
+
+class UpdateSessionContextRequest(StrictModel):
+    """岗位 JD 与简历：会话级答题背景，缺省即通用答案。"""
+
+    job_description: Annotated[str, Field(max_length=8000)] = ""
+    resume: Annotated[str, Field(max_length=8000)] = ""
 
 
 class TranscriptResponse(StrictModel):

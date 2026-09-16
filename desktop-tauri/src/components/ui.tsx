@@ -155,9 +155,9 @@ export function Modal({ open, title, onClose, children, footer, width = 440 }: M
         aria-label={title}
         tabIndex={-1}
         style={{ width }}
-        className="animate-slide-up rounded-2xl border border-stroke bg-surface-card shadow-pop outline-none"
+        className="animate-slide-up flex max-h-[85vh] flex-col rounded-2xl border border-stroke bg-surface-card shadow-pop outline-none"
       >
-        <div className="flex items-center justify-between border-b border-stroke-subtle px-5 py-4">
+        <div className="flex shrink-0 items-center justify-between border-b border-stroke-subtle px-5 py-4">
           <h2 className="text-[15px] font-semibold text-ink-primary">{title}</h2>
           {onClose && (
             <button
@@ -169,9 +169,10 @@ export function Modal({ open, title, onClose, children, footer, width = 440 }: M
             </button>
           )}
         </div>
-        <div className="px-5 py-4">{children}</div>
+        {/* max-h + 内部滚动：弹窗内容再长也不能顶出窗口，否则上边的内容永远够不到 */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
         {footer && (
-          <div className="flex justify-end gap-2 border-t border-stroke-subtle px-5 py-4">
+          <div className="flex shrink-0 justify-end gap-2 border-t border-stroke-subtle px-5 py-4">
             {footer}
           </div>
         )}

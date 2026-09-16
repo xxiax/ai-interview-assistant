@@ -23,11 +23,10 @@ function toast(kind: string, message: string) {
   window.dispatchEvent(new CustomEvent('app-toast', { detail: { kind, message } }))
 }
 
-// ---------- 服务器连接卡片 ----------
+// ---------- 访问令牌卡片 ----------
 
-function ServerCard() {
+function TokenCard() {
   const { settings, loading, load, save, check, checking, lastCheck } = useSettingsStore()
-  const [serverUrl, setServerUrl] = useState('')
   const [token, setToken] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -35,14 +34,10 @@ function ServerCard() {
     void load()
   }, [load])
 
-  useEffect(() => {
-    if (settings) setServerUrl(settings.serverUrl)
-  }, [settings])
-
   const handleSave = async () => {
     setSaving(true)
     try {
-      await save({ serverUrl, token: token.trim() || undefined })
+      await save({ token: token.trim() || undefined })
       setToken('')
       toast('success', '设置已保存')
     } catch (err) {
@@ -66,19 +61,14 @@ function ServerCard() {
           <Server size={16} />
         </div>
         <div>
-          <h2 className="text-sm font-semibold text-ink-primary">服务器连接</h2>
-          <p className="text-xs text-ink-faint">后端地址与访问令牌(令牌加密存储于本机)</p>
+          <h2 className="text-sm font-semibold text-ink-primary">访问令牌</h2>
+          <p className="text-xs text-ink-faint">
+            后端固定运行在本机 http://127.0.0.1:8000,只需配置令牌(加密存储于本机)
+          </p>
         </div>
       </div>
 
       <div className="space-y-4">
-        <Input
-          label="服务器地址"
-          placeholder="http://127.0.0.1:8000"
-          value={serverUrl}
-          onChange={(e) => setServerUrl(e.target.value)}
-          hint="本机调试可使用 http://127.0.0.1；远程服务器必须使用 HTTPS"
-        />
         <div>
           <Input
             label="访问令牌"
@@ -711,9 +701,9 @@ export default function SettingsPage() {
       <div className="mx-auto max-w-2xl space-y-5 px-8 py-8">
         <div>
           <h1 className="text-xl font-semibold tracking-tight text-ink-primary">设置</h1>
-          <p className="mt-1 text-[13px] text-ink-faint">服务连接与 AI 配置</p>
+          <p className="mt-1 text-[13px] text-ink-faint">访问令牌与 AI 配置</p>
         </div>
-        <ServerCard />
+        <TokenCard />
         <PromptCard />
         <ConfigCard type="asr" />
         <ConfigCard type="network" />

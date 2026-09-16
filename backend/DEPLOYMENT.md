@@ -2,9 +2,9 @@
 
 ## 当前结论
 
-容器和生产上线不是当前开发优先级。仓库已经准备 Docker、Compose、Caddy、健康检查以及 SQLite 备份/恢复资产，但截至 2026-08-26：
+容器和生产上线不是当前开发优先级。仓库已经准备 Docker、Compose、Caddy、健康检查以及 SQLite 备份/恢复资产，但截至 2026-09-14：
 
-2026-08-26 使用本地 Python `3.10.6` 对当前工作树执行完整后端自动化测试，结果为 `218 passed`；`ruff` 通过。本轮没有重新生成覆盖率报告。此前 Python 3.10.6 与 3.12.11 的 `212 passed` 双运行时结果以及旧文档中的较小数字都属于较早快照；正式发布仍需在目标 Python 3.12 复现当前 218 项测试。
+2026-09-14 使用本地 Python 3.10 对当前工作树执行完整后端自动化测试，结果为 **`260 passed`**，`ruff` 通过。本轮没有生成覆盖率报告；正式发布仍需在目标 Python 3.12 复现当前测试集。
 - 当前环境的 Docker daemon 不可用，因此没有完成真实镜像构建、Compose 启动、Caddy TLS、容器健康检查或公网 WSS 验证。
 - 代理秘密模型和真实外部服务链路仍有部署前必须解决的收敛项。
 - 本文件是未来恢复上线工作时的操作基线，不是“已经可以直接上线”的证明。
@@ -33,10 +33,11 @@
 1. 当前默认使用 FunASR 转写；只有设置 `AI_ASR_ENGINE=llm` 时才启用多模态 LLM。FunASR Token 只从 `AI_FUNASR_TOKEN` 读取，源码没有默认凭据。
 2. `python-socks` 已进入生产锁文件和哈希集合，但仍需在真实镜像构建和代理端到端测试中确认 SOCKS 路径可用。
 3. LLM 配置的实时答案/复盘思考强度默认为 `low`，可选 `medium`/`high`；仅 GPT-5、o1、o3、o4 系列模型发送 `reasoning_effort`，普通 OpenAI-compatible 模型保持 `temperature` 兼容路径。Network 配置当前要求保存一个加密 `api_key`，但运行时只使用公开的 `proxy_url`；代理秘密、URL 内嵌凭据、失败后是否允许直连等策略尚未完成生产设计。当前 FunASR 同机隧道使用 `ws://127.0.0.1:10096/ws`。
-4. 当前 ASR 路径为：默认 `AI_ASR_ENGINE=funasr` 且 `AI_FUNASR_STREAM=true`，WAV 按 `session + source` 复用 FunASR WebSocket，同时每个切片独立执行 `start -> PCM -> stop -> final`，只减少重复握手但不形成整题 utterance。每片 final 独立触发 LLM；当前没有 `speech_end` 或问题线程累积。只有 `AI_ASR_ENGINE=llm` 才复用激活 LLM 配置的主 `model`，`groq` 或非 WAV 编码走 Groq。
+4. 当前 ASR 路径为：默认 `AI_ASR_ENGINE=funasr` 且 `AI_FUNASR_STREAM=true`，WAV 按 `session + source` 复用 FunASR WebSocket，一个语音段对应一个 utterance：段首一次 `start`，中间分片只推裸 PCM，客户端 `speech_end` 才 `stop` 取段末 `final`。累计 `partial` 经几何节流后形成多个 LLM revision；它们互不取消，在会话并发上限内同时运行，线程关闭后只落库最高成功版本。容量评估必须按“每问题 N 次 LLM 调用”而不是“一次”计算，N 由倍率和句读密度决定。只有 `AI_ASR_ENGINE=llm` 才复用激活 LLM 主模型做多模态转写，`groq` 或非 WAV 编码走 Groq。
 5. ASR 代理优先级为 `AI_OUTBOUND_PROXY`、active Network 配置、Windows 当前用户系统代理；Linux 容器没有 Windows 代理回退，生产必须显式配置环境变量或 Network 配置。代理单地址和 `http=...;https=...` 解析已有自动化测试，但真实生产代理仍未验收。
 6. Google 只是可选搜索增强，不是向量 RAG；Bing 新配置已退役，部署验收不应假设存在本地知识库、Embedding 或向量数据库。
 7. `cancel_audio_source` 的水位目前只保存在后端进程内；已落库 cancelled 状态可恢复，但尚未 reserve 的空洞取消范围不会跨服务重启。部署故障测试必须覆盖取消与重启并发，不能只验证正常重连。
+8. 问题线程（`thread_id`、累积问题、待完成 revision、最新完成结果、宽限定时器）同样只在进程内。滚动重启会丢失所有未关闭线程尚未入库的分段答案，已入库 `answer` 不受影响。这也是必须 `--workers 1` 的原因之一。
 
 ## 恢复部署工作前的准入条件
 
@@ -193,6 +194,6 @@ docker compose --env-file /secure/path/ai-interview.env -f compose.prod.yml star
 - 备份、异机复制、恢复和灾难演练。
 - 长连接、音频队列、服务重启、磁盘满、第三方超时和预算耗尽压测。
 - 日志脱敏、监控、告警和密钥轮换流程。
-- 在目标 Python 3.12 重新运行当前 `218` 项测试、覆盖率和 `ruff`，而不是引用更早的历史结果。
+- 在目标 Python 3.12 重新运行当前 `228` 项测试、覆盖率和 `ruff`，而不是引用更早的历史结果。
 
 完成这些验证前，部署状态应继续标记为“资产已准备、上线未验证”。

@@ -16,6 +16,7 @@ from .models import (
     SessionResponse,
     StartSessionRequest,
     TranscriptResponse,
+    UpdateSessionContextRequest,
 )
 from .protocol import event_message
 from .realtime import run_db
@@ -66,6 +67,17 @@ async def list_sessions(
 async def get_session(session_id: str):
     try:
         return await run_db(db.require_session, session_id)
+    except Exception as exc:
+        raise _translate_db_error(exc) from exc
+
+
+@router.put("/{session_id}/context", response_model=SessionResponse)
+async def update_session_context(session_id: str, req: UpdateSessionContextRequest):
+    """写入会话级岗位 JD 与简历。任何会话状态都允许，不广播事件。"""
+    try:
+        return await run_db(
+            db.set_session_context, session_id, req.job_description, req.resume
+        )
     except Exception as exc:
         raise _translate_db_error(exc) from exc
 

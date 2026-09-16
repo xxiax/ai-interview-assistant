@@ -1,8 +1,10 @@
 # AI 面试助手后端
 
-本目录实现一个 FastAPI + SQLite 的单用户后端，负责会话状态、实时音频分片、FunASR/Groq 转写、FunASR WebSocket 连接复用与片级 partial/final、LLM 答案、可选搜索增强、断线恢复、配置管理和会后复盘。桌面与其他客户端的完成度以各自目录为准；本文只定义后端的当前行为。
+本目录实现一个 FastAPI + SQLite 的单用户后端，负责会话状态、实时音频分片、FunASR/Groq 转写、FunASR WebSocket 连接复用与按语音段的开放式 utterance（累计 partial / 段末 final）、客户端 `speech_end` 语音段边界与问题线程累积、LLM 答案、可选搜索增强、断线恢复、配置管理和会后复盘。桌面与其他客户端的完成度以各自目录为准；本文只定义后端的当前行为。
 
 本文是客户端和后续开发 AI 应使用的当前权威契约。代码仍是最终事实来源；历史计划中的无鉴权请求、明文 API Key 和旧 WebSocket 消息均已废弃。
+
+> 改造前快照保存在 `codex/current-code-snapshot`（`de6b26c`）；当前实现位于 `codex/question-thread-accumulator`。
 
 ## 1. 运行模型
 
@@ -23,12 +25,12 @@
 |---|---|
 | `app/main.py` | 加载环境、应用生命周期、中间件、安全响应头、路由和健康检查 |
 | `app/models.py` | 严格 REST 请求/响应模型 |
-| `app/protocol.py` | WebSocket v1 消息模型、`cancel_audio_source` 和版本校验 |
+| `app/protocol.py` | WebSocket v1 消息模型、`cancel_audio_source`、`speech_end` 和版本校验 |
 | `app/routes_sessions.py` | 会话、删除、转写、答案、音频状态和事件 REST API |
 | `app/routes_configs.py` | LLM/Search/ASR/Network 配置保存、脱敏读取、激活和删除 |
 | `app/routes_review.py` | ended 会话复盘、幂等缓存和 single-flight |
 | `app/ws.py` | WebSocket 认证、事件同步、业务消息和连接管理 |
-| `app/realtime.py` | 音频排序、背压、按来源取消水位、当前任务中止、FunASR 连接复用、片级最终转写、流式答案和队列 |
+| `app/realtime.py` | 音频排序、背压、按来源取消水位、当前任务中止、FunASR 连接复用与语音段 utterance（`FunAsrSegment`）、段末转写、问题线程累积（`QuestionThread`）、流式答案和队列 |
 | `app/db.py` | SQLite 表、迁移、状态机、事件日志、幂等分片、持久取消结果和预算 |
 | `app/security.py` | Token、Fernet、SSRF、Origin、限流和启动校验 |
 | `app/cost_control.py` | LLM/Search/ASR 并发门和持久化用量预算 |
@@ -99,6 +101,7 @@ idle -> recording -> ended
 - `end` 只能结束 `recording`；对已经 `ended` 的会话重复结束是幂等的。
 - ended 后实时管线停止，仍排队的分片标为 `cancelled/session_ended`，并关闭该会话 WebSocket。
 - 复盘只能对 `ended` 会话生成。
+- **启动恢复：`recording` 只存活于进程内**（问题线程、ASR 任务都在内存），后端启动（`init_db`）时把库里残留的 `recording` 会话一律收回 `idle`——被杀/崩溃的后端不可能还在录，不重置的话客户端下次连接会照着库里的旧值报告"录制中"（悬浮窗误报的根因）。回到 `idle` 而不是 `ended`：会话没正常走完，用户仍可重新开始这一场。
 
 ## 6. REST API
 
@@ -113,6 +116,7 @@ idle -> recording -> ended
 | `GET` | `/api/sessions/{id}` | — | 会话详情 |
 | `POST` | `/api/sessions/{id}/start` | `{"radio_mode":"pc"}` | 开始；模式为 `pc/mobile/both` |
 | `POST` | `/api/sessions/{id}/end` | — | 结束会话并停止实时任务 |
+| `PUT` | `/api/sessions/{id}/context` | `{"job_description":"...","resume":"..."}` | 写入会话级答题背景（岗位 JD 与简历） |
 | `DELETE` | `/api/sessions/{id}` | — | 删除 idle/ended 会话并级联清理子数据；recording 返回 `409` |
 | `GET` | `/api/sessions/{id}/transcripts` | — | 按会话内 `seq` 升序读取转写 |
 | `GET` | `/api/sessions/{id}/answers` | — | 按 ID 升序读取答案 |
@@ -120,6 +124,8 @@ idle -> recording -> ended
 | `GET` | `/api/sessions/{id}/events` | `after_event_id=0`；`limit=200`，范围 1–200 | 按事件游标补拉 |
 
 `audio-chunks` 按 `(source, chunk_seq)` 排序。指定 `source` 时，只需把上一页最后一项的 `chunk_seq` 作为 `after_chunk_seq`；不指定 `source` 时，必须同时把上一页最后一项的 `source` 和 `chunk_seq` 作为 `after_source`、`after_chunk_seq`。跨来源请求只传旧式 `after_chunk_seq` 会返回 `422`，避免 PC 与移动端各自从 0 编号时静默漏数据。
+
+`PUT /api/sessions/{id}/context` 写入该场面试的**答题背景**：岗位 JD 与简历两个可选文本字段，各自上限 8,000 字符（`MAX_SESSION_CONTEXT_CHARS`），保存后返回会话详情。任何会话状态（idle/recording/ended）都允许写入，方便面试中途粘贴；不广播事件。两个字段存储在 `sessions` 表上而非全局配置——每场面试的岗位和投递简历都不同。生成答案（含截图解题）时，非空字段会注入提示词，要求答案贴合该岗位要求与候选人真实经历、不编造简历里没有的内容；留空则不注入，回到通用答案。JD 与简历同样被列为不可信数据，不能覆盖系统指令。
 
 ### 6.2 复盘
 
@@ -255,7 +261,10 @@ WS /ws/{session_id}
 {"v":1,"type":"start_session","radio_mode":"pc"}
 {"v":1,"type":"set_radio_mode","mode":"both"}
 {"v":1,"type":"cancel_audio_source","source":"pc","through_chunk_seq":17,"reason":"capture_stopped"}
+{"v":1,"type":"speech_end","source":"pc","through_chunk_seq":17}
 {"v":1,"type":"regenerate_answer","question":"什么是 FastAPI？","use_search":false}
+{"v":1,"type":"regenerate_answer","question":"什么是 FastAPI？","use_search":false,"thread_id":"<uuid>"}
+{"v":1,"type":"solve_screenshot","image":"<base64 PNG/JPEG>","mime":"image/png","note":"可选备注，≤500 字符"}
 {"v":1,"type":"resume","after_event_id":12}
 {"v":1,"type":"ping"}
 {"v":1,"type":"end_session"}
@@ -297,6 +306,23 @@ WS /ws/{session_id}
 - 取消水位本身目前不单独落库。已经写成 cancelled 的分片会跨重启保留，但尚未 reserve 的空洞取消范围不会跨后端重启；客户端持久取消意图并在重连补发可以覆盖常规路径，极端的“取消后立即重启、旧包随后迟到”仍可能返回来源不允许或序号冲突。
 - `set_radio_mode: mobile` 也会由服务端自动取消当时已知的 PC 序号水位，防止旧 PC 分片在切换后触发 `source_not_allowed`。
 
+`speech_end` 用于客户端把 VAD 语音段边界告知后端，与 `cancel_audio_source` 是完全不同的语义：
+
+- `source`：`pc` 或 `mobile`，必须被当前 `radio_mode` 允许，否则返回 `source_not_allowed`。
+- `through_chunk_seq`：0 到 `CHUNK_SEQ_MAX` 的严格整数，表示"这段语音到此序号为止"。
+- 会话必须处于 `recording`（内部调用 `ensure_recording`）。
+- **不取消任何分片、不冻结队列、不影响 ASR**。它只记录边界并为该 `(session, source)` 的问题线程启动/重排宽限定时器。
+- 边界在进程内单调推进：收到比已记录边界更小的 `through_chunk_seq` 时直接忽略。
+- 该消息不产生任何持久化事件，也没有回执；客户端不应等待响应。
+- 客户端在认证完成前或 capture gate 关闭时不应发送；当前 Tauri 会在退避期间缓存该命令并在重连后补发。
+
+`solve_screenshot` 是笔试辅助入口：客户端截屏（PNG/JPEG）加可选备注（≤500 字符），走激活 LLM 的多模态能力解题。
+
+- `image`：严格 Base64；解码后大小受 `AI_MAX_SCREENSHOT_BYTES` 限制（默认 6 MiB），超限返回 `invalid_screenshot`。
+- `mime`：仅允许 `image/png` 和 `image/jpeg`。
+- 会话必须处于 `recording`。与 `regenerate_answer` 共用同一条 10 次/60 秒限流键（两者都是用户手点触发的付费调用）。
+- 截图只在内存里流转：不进 SQLite、不进事件流，落库的只有生成出来的答案文本（`question` 为备注或固定占位「截图题目」，`source="llm"`）。若该会话设置了岗位 JD/简历，解题提示词同样注入。输出形态与实时提词不同：按「思路 / 代码 / 复杂度」三段组织。
+
 ### 7.3 分片可靠性
 
 服务端在调用 ASR 前先保存 `audio_chunks` 记录和 `chunk_ack: queued` 事件：
@@ -327,7 +353,21 @@ WS /ws/{session_id}
 | `transcript` | 转写正文、来源、会话内序号和音频元数据 |
 | `answer` | 问题、答案、来源和时间 |
 
-`error`、`pong`、`sync_complete` 是纯传输消息。重复音频分片的当前状态也可能以没有新 `event_id` 的 `chunk_ack` 即时返回，因为没有发生新的持久化变更。
+`transcript_partial`、`answer_stream`、`error`、`pong`、`sync_complete` 是纯传输消息，永不写入 `session_events`。重复音频分片的当前状态也可能以没有新 `event_id` 的 `chunk_ack` 即时返回，因为没有发生新的持久化变更。
+
+`answer_stream` 的字段（除 `request_id`、`question`、`delta`、`answer`、`done` 之外）：
+
+| 字段 | 含义 |
+|---|---|
+| `thread_id` | 问题线程 ID；问题线程驱动的答案和带 `thread_id` 的 `regenerate_answer` 都有，手动提问式的 `regenerate_answer` 为 `null` |
+| `revision` | 该线程的第几版累积问题，从 1 开始 |
+| `started` | 该 revision 刚开始生成时的首帧标记，此时正文为空 |
+| `failed` | 该 revision 生成失败；前端只标记这一段，不影响同一卡片内的其他分段 |
+| `channel` | 恒为 `"answer"`。思考过程功能已下线，后端不再广播 `channel="thinking"`，`answer_stream` 与 `answer` 都不携带 `thinking` 字段 |
+
+持久化 `answer` 事件和 `POST` 响应也会回显 `thread_id` 与 `revision`。客户端按 `thread_id` 把同一问题的并发 revision 聚合成一张卡，标题取见过的最长累计问题；catch-up swap 在卡内选择答案最长的版本展示，新版内容追平后自然接管。持久化 `answer` 只作为该卡的“已入库”标记，实时分段保留到会话结束。单个 revision `failed` 只标记自己的分段，不影响同卡其他版本。
+
+不同 revision 的流式帧会交错到达，客户端必须按 `request_id`/`revision` 归位，不能按到达顺序整体覆盖。
 
 客户端必须：
 
@@ -339,11 +379,24 @@ WS /ws/{session_id}
 
 `end_session` 的服务端时序说明：会话结束后端先写入 `session_state: ended` 事件并广播，随后取消在途任务、把仍在队列中的分片批量标为 `cancelled/session_ended`。这个批量取消**不会再逐个广播** `chunk_ack: cancelled`（避免连接关闭前的事件风暴）。因此客户端不应假设在连接关闭（关闭码 `1000`）之前能收齐所有被取消分片的 ACK；正确的终态来源是 `GET /api/sessions/{id}/audio-chunks` 对账结果。
 
-### 7.5 实时转写和答案生成
+### 7.5 实时转写、问题线程和答案生成
 
-当前默认 FunASR 路径按 `session + source` 复用同一条 WebSocket，但每个音频切片都独立执行 `start -> PCM -> stop -> final`；这样只避免重复握手，并没有把多片合成一个 FunASR utterance。每片 final 都会立即入库并驱动自动答案。partial 只广播到实时转写区，不做问题关键词、标点、长度或静音结束检测；当前协议也没有 `speech_end` 或“整个问题 final”。
+ASR 层：默认 FunASR 路径按 `session + source` 复用同一条 WebSocket，并且**一个语音段就是一个 FunASR utterance**：段首发一次 `start`，中间每个分片只推裸 PCM，直到客户端 `speech_end` 才发一次 `stop` 并等段末 `final`。整题共享同一份声学上下文，跨片截断（DNS 丢首字母、TCP 被切成两半）不会再出现。网关的 `partial` 是**当前语音段的累计全文**，通过非持久化 `transcript_partial` 整句替换显示；与旧实现不同，累计 partial **会**驱动 LLM 答案（见下）。分片一旦推进网关就立刻 ack `done`——一个 40 秒的问题有 16 个分片，若等段末 `final` 才 ack 会顶满客户端发件箱（8 槽）并冻结采集。段末 `final` 作为**一条** transcript 入库（不再是每片一条），且不携带 `chunk_id`（对应分片早已 `done`，而 `db.add_transcript` 只接受 `queued` 分片）。后端自身**不做**问题关键词、标点、长度或静音结束检测——语音段边界完全由客户端的 `speech_end` 提供。
 
-LLM 答案请求使用 OpenAI-compatible SSE：每个 ASR final 都创建独立请求，同一会话由 `AI_LLM_SESSION_MAX_CONCURRENCY` 控制并发数（默认 3），全局由 `AI_LLM_MAX_CONCURRENCY` 控制（默认 4）。`answer_stream` 和最终 `answer` 都携带 `request_id`，前端可同时显示多个问题及其独立输出。只有完整生成的答案才写入 `answers` 表。答案上下文最多取最近 20 条转写，LLM 问题截断到 2,000 字符、上下文截断到 20,000 字符。
+问题线程层（`app/realtime.py` 的 `QuestionThread`，全部是进程内状态，不落库）：
+
+- 每个 `(session_id, source)` 最多有一个活动线程，`thread_id` 是随机 UUID。
+- 每收到一版更长的累计 `partial`，问题文本更新为 `committed_prefix + 累计全文`（截断到 `MAX_QUESTION_CHARS`，2,000），`revision += 1`，然后立刻提交一次 LLM 请求，产出这一版答案。目的是「不管问题是什么，都先问一部分」，避免开口卡壳。开火受**几何节流**闸门约束（`AI_QUESTION_REVISION_GROWTH_RATIO`，默认 1.5）：仅当文本是上一版的纯追加时，字符数要长到上一版的这个倍数、或追加部分出现句末标点（`。！？!?；;…`）才开新火；第一版立即发，ASR 改稿（不以旧文开头）立即发，段末 `final` 无条件强制再问一版，保证入库答案对应段末文本。固定增量闸门（旧 `AI_QUESTION_MIN_REVISION_DELTA_CHARS=4`）对短句太吵、对长句太密——60 字的问题能刷十几个 revision；按倍数增长后整题 revision 数收敛到对数级（约 4/6/9/14/21… 字各一版）。
+- 每个通过节流闸门的 revision 都进入答案队列，不取消在途旧版，也不丢弃排队旧版。答案 worker 在 `AI_LLM_SESSION_MAX_CONCURRENCY` 上限内用独立任务并发执行，因此“问题前半句”和“累计完整问题”可以同时生成。
+- 每一版的 `answer_stream` 都携带 `thread_id`/`revision`/`started`/`failed`。线程记录 revision 最高的成功 `AnswerCompletion`；线程关闭后，如果最高 revision 已成功则无需等待更旧版本即可落库，若最高 revision 失败则等其余版本收尾后选择最高成功版本。单版异常正常广播失败帧和错误，但不会清空或取消其他 revision。
+- 收到 `speech_end` 后启动/重排宽限定时器 `AI_QUESTION_THREAD_GRACE_SECONDS`（默认 6 秒），同时结束当前 FunASR 语音段。宽限期内说话人继续说会开启**新语音段**：`partial` 只在单个 utterance 内累计，所以段末会把问题固化为 `committed_prefix`，新段的累计文本拼在前缀之后并入同一线程并重排定时器。
+- 序号高于已记录 `speech_end` 边界的新语音会丢弃该边界并取消关闭定时器，等下一个 `speech_end` 重新定界。
+- 线程在宽限到期、`flush_session`（结束会话）时关闭：只把 revision 最高的成功版本写入 `answers` 并广播持久化 `answer`（不是"最后完成的"那一版——若最高 revision 失败，等其余版本收尾后取其中 revision 最高的成功版本）。若该线程所有 revision 都失败，则不落库。
+- `stop_session`、`cancel_audio_source`（停止采集/切到 mobile）和进程 `shutdown` 会先冲刷在途语音段再清理，避免段内文本泄漏到下一轮采集的 utterance 里。
+
+`regenerate_answer` 有两种形态。**不带 `thread_id`**（手动提问）：不走问题线程，完成后立即入库。**带 `thread_id`**（卡片上的「重新生成」）：重开或重建同 id 的问题线程，`revision += 1` 后作为新的并发版本回到同一张卡；原本已关闭的线程在该版本完成后再次落库。两种形态共享 10 次/60 秒限流（按 token 指纹）。
+
+LLM 答案请求使用 OpenAI-compatible SSE：同一会话由 `AI_LLM_SESSION_MAX_CONCURRENCY` 控制并发数（默认 3），全局由 `AI_LLM_MAX_CONCURRENCY` 控制（默认 4）。答案 worker 用 `asyncio.create_task` 扇出；同一问题的多个 revision 与手动提问、截图解题共享这些并发槽，超过会话上限的请求在有界队列等待。全局门抢不到槽位时该版本单独失败，不影响其他版本。只有完整生成且被线程选中的最高成功答案才写入 `answers` 表。答案上下文最多取最近 20 条转写，问题截断到 2,000 字符、上下文截断到 20,000 字符。若会话通过 `PUT /api/sessions/{id}/context` 设置了非空的岗位 JD 或简历，这些字段一并注入答案载荷（各截断到 8,000 字符），提示词要求答案贴合该岗位与候选人真实经历、不编造简历外的内容；两者均为不可信数据。
 
 ## 8. 数据库
 
@@ -367,6 +420,8 @@ LLM 答案请求使用 OpenAI-compatible SSE：每个 ASR final 都创建独立�
 - 把上次进程遗留的 `queued` 分片标为 `failed/service_restart`，写入 `chunk_ack` 事件，并允许相同分片重试。
 
 实时排序的“下一个序号”会把 `done`、`cancelled` 和不可重试 failed 视为已消费终态，因此显式取消不会在下一轮采集制造永久缺序。Tauri 页面重进、WebSocket 重连或应用重启不会自动恢复旧采集；只有用户重新开始后产生的更高序号分片会继续上传。
+
+问题线程没有自己的表。`thread_id` 和 `revision` 只出现在 `answer` 事件负载与 REST/WS 响应里，**不是 `answers` 表的列**；线程本身（累积文本、待完成 revision 集合、最新完成结果、宽限定时器）完全存在进程内存中，不跨重启。
 
 ## 9. 安全与成本边界
 
@@ -392,7 +447,7 @@ LLM 答案请求使用 OpenAI-compatible SSE：每个 ASR final 都创建独立�
 | `AI_FUNASR_URL` | `ws://127.0.0.1:10096/ws` | FunASR WebSocket 地址；本地 SSH 隧道或同机宿主进程使用本机服务。Docker 容器访问宿主机时使用 `ws://host.docker.internal:10096/ws` |
 | `AI_ASR_ENGINE` | `funasr` | `funasr` 使用 FunASR；`llm` 使用多模态 LLM；`groq` 启用 Groq |
 | `AI_FUNASR_TOKEN` | FunASR 路径必填 | FunASR Token；只允许通过环境变量或 Secret Manager 注入 |
-| `AI_FUNASR_STREAM` | `true` | 复用每个 `session + source` 的 WebSocket；当前每片仍独立发送 `start/PCM/stop` 并等待自己的 final |
+| `AI_FUNASR_STREAM` | `true` | 复用每个 `session + source` 的 WebSocket，并按语音段维持开放式 utterance：段首一次 `start`，中间只推 PCM，`speech_end` 才 `stop` |
 | `AI_DB_PATH` | `interview.db` | SQLite 路径 |
 | `AI_ENV_FILE` | `backend/.env` | 显式指定环境文件 |
 | `GROQ_API_KEY` | Groq 路径调用时必填 | Groq Whisper Key；active ASR 配置中的密钥优先 |
@@ -419,14 +474,19 @@ LLM 答案请求使用 OpenAI-compatible SSE：每个 ASR final 都创建独立�
 |---|---|---|
 | `AI_REST_RATE_LIMIT_PER_MINUTE` | 300 | 每 IP + Token 的 REST 上限 |
 | `AI_MAX_AUDIO_CHUNK_BYTES` | 2,097,152 | Base64 解码后字节上限；启动校验最大 8 MiB |
+| `AI_MAX_SCREENSHOT_BYTES` | 6,291,456 | `solve_screenshot` 的 Base64 解码后字节上限（6 MiB）；超限返回 `invalid_screenshot` |
 | `AI_MAX_AUDIO_DURATION_MS` | 10,000 | 媒体探测上限基值；实际检查另有 250 毫秒余量，WebSocket 声明值仍固定最多 10,000 |
 | `AI_AUDIO_DURATION_TOLERANCE_MS` | 750 | 声明/实际时长误差下限；实际容差取它与真实时长 20% 的较大值 |
 | `AI_AUDIO_QUEUE_SIZE` | 8 | 每会话/来源的音频在途上限 |
 | `AI_ANSWER_QUEUE_SIZE` | 8 | 每会话答案队列上限 |
 | `AI_LLM_SESSION_MAX_CONCURRENCY` | 3 | 单个会话同时生成的独立答案数 |
 | `AI_AUDIO_REORDER_WAIT_SECONDS` | 5 | 等待缺失序号的时长，允许 0.1–60 |
-| `AI_FUNASR_FINAL_TIMEOUT_SECONDS` | 5 | 发送 stop 后等待 final 的最长时间 |
+| `AI_FUNASR_FINAL_TIMEOUT_SECONDS` | 5 | 发送 stop 后等待段末 final 的最长时间 |
+| `AI_FUNASR_PARTIAL_IDLE_SECONDS` | 0.2 | 推流后等待新的累计 partial：空闲这么久即返回，允许 0.05–5。功能默认压到 0.2 秒是为了让音频 worker 在 400 ms 分片下仍有余量（`.env.production.example` 显式覆盖为 0.6） |
+| `AI_FUNASR_PARTIAL_MAX_WAIT_SECONDS` | 1 | 单个分片推流后收取 partial 的总上限，防止拖慢音频 worker，允许 0.2–15（`.env.production.example` 显式覆盖为 3） |
 | `AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS` | 10 | 结束会话前等待已入队最终答案的最长时间 |
+| `AI_QUESTION_THREAD_GRACE_SECONDS` | 6 | 收到 `speech_end` 后关闭问题线程前的宽限期，允许 0.5–30 秒 |
+| `AI_QUESTION_REVISION_GROWTH_RATIO` | 1.5 | revision 几何节流倍率：纯追加的累计 partial 要长到上一版提交 LLM 全文的这个倍数（或追加部分带句末标点）才开新 revision，允许 1.0–5.0；第一版、ASR 改稿和段末 final 不受此限 |
 | `AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS` | 1 | 等待付费服务并发槽，允许 0.01–60 |
 
 ### 10.4 付费服务并发与预算
@@ -446,6 +506,7 @@ LLM 答案请求使用 OpenAI-compatible SSE：每个 ASR final 都创建独立�
 | `AI_LLM_ANSWER_MAX_COMPLETION_TOKENS` | 512 |
 | `AI_LLM_REVIEW_MAX_COMPLETION_TOKENS` | 2,048 |
 | `AI_LLM_TRANSCRIBE_MAX_TOKENS` | 2,048 |
+| `AI_LLM_SOLVE_MAX_COMPLETION_TOKENS` | 1,536 |
 
 变量的允许范围由 `app/security.py` 启动校验；不要只根据表格猜测可配置的最大值。
 
@@ -458,15 +519,16 @@ python -m pytest --cov=app --cov-report=term-missing -q
 python -m ruff check app tests scripts
 ~~~
 
-2026-08-26 对当前工作树执行完整后端测试：本地 Python `3.10.6` 为 `218 passed`，`ruff check app tests scripts` 通过。本轮没有重新生成覆盖率报告；此前 Python 3.10.6 与 3.12.11 的 `212 passed` 双运行时结果以及更小的测试数字都属于较早快照。正式发布仍需在目标 Python 3.12 复现当前 218 项测试。测试覆盖：
+2026-09-14 对当前工作树执行完整后端测试：本地 Python 3.10 为 **`260 passed`**，`ruff check app tests scripts` 通过。本轮未生成覆盖率报告；目标 Python 3.12 仍需复现当前测试集。测试覆盖：
 
 - 匿名健康检查、FunASR readiness 探测、Bearer/OpenAPI、安全响应头和启动失败保护。
 - 会话状态机、ended 写屏障、复合游标分页、整数边界和音频状态对账。
-- WebSocket 首包认证、Origin、严格协议、`cancel_audio_source`、事件补洞重放、并发发送去重和控制消息。
+- WebSocket 首包认证、Origin、严格协议、`cancel_audio_source`、`speech_end` 边界校验与来源限制、事件补洞重放、并发发送去重和控制消息。
+- 问题线程累积：累计 partial 合并为同一 `thread_id`、revision 几何节流、同线程多 revision 真实并发、旧 revision 不覆盖新版、单版失败隔离、宽限期后只落库最高成功版本、全部失败不落库，以及 `speech_end` 后更高序号续接/新线程行为。
 - 分片幂等、终态不可回退、冲突、乱序、缺口、背压、按来源取消水位、当前任务取消、晚到旧分片拒绝、结束/关闭取消、重启后跳过连续已消费终态和重试。
 - `ffprobe` 失败关闭、codec 映射、伪造时长拒绝、FunASR 协议假实现、Groq/Paraformer 旧配置兼容、Windows 系统代理解析、Groq 回退和 ASR 全链路并发限制。
-- LLM 输入隔离、输出形状、搜索降级、复盘幂等与输入上限。
-- 四类配置的加密/脱敏/激活/删除、SSRF、限流、付费并发/预算、运行态锁释放、容器探针配置和 SQLite 备份恢复。
+- LLM 输入隔离、输出形状、岗位 JD/简历注入与截断、截图解题载荷、搜索降级、复盘幂等与输入上限。
+- 四类配置的加密/脱敏/激活/删除、SSRF、限流、付费并发/预算、`AI_QUESTION_THREAD_GRACE_SECONDS` 启动校验、运行态锁释放、容器探针配置和 SQLite 备份恢复。
 
 测试结果不代表真实 FunASR/Groq/LLM/Search、代理、Windows WASAPI/腾讯会议采集、容器镜像或生产网络已完成端到端验证。
 

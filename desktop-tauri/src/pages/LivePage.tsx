@@ -4,18 +4,25 @@ import {
   CircleStop,
   Headphones,
   Laptop,
+  Layers,
   Loader2,
+  ScanText,
   SendHorizontal,
+  Target,
   Volume2,
   VolumeX,
   Smartphone
 } from 'lucide-react'
 import { api } from '../api/bridge'
 import { useLiveStore } from '../stores/live'
-import type { RadioMode } from '../shared/types'
+import type { RadioMode, Session } from '../shared/types'
 import { errorMessage } from '../shared/errors'
+import { useOverlayControl } from '../shared/overlay-control'
 import { groupFinalTranscripts } from '../shared/transcript-display'
+import { buildAnswerFeed } from '../shared/answer-threads'
 import { Badge, Button, CenterSpin, Modal } from '../components/ui'
+import OverlayPanel from '../components/OverlayPanel'
+import SessionContextModal from '../components/SessionContextModal'
 import TranscriptFeed from './feeds/TranscriptFeed'
 import AnswerFeed from './feeds/AnswerFeed'
 
@@ -105,7 +112,11 @@ function TopBar(props: {
   recording: boolean
   radioMode: RadioMode
   queued: number
+  contextReady: boolean
+  overlayVisible: boolean
   onModeChange: (m: RadioMode) => void
+  onOpenContext: () => void
+  onOpenOverlay: () => void
   onEnd: () => void
   ending: boolean
   modeChanging: boolean
@@ -126,6 +137,38 @@ function TopBar(props: {
         )}
       </div>
       <div className="flex items-center gap-3">
+        <Button
+          variant="default"
+          icon={<Target size={14} />}
+          onClick={props.onOpenContext}
+          title={
+            props.contextReady
+              ? '已填岗位 JD / 简历，AI 会按这个岗位答题'
+              : '填岗位 JD 和简历，让答案贴合这个岗位而不是通用答案'
+          }
+        >
+          答题背景
+          {props.contextReady && (
+            <span
+              aria-label="已配置"
+              className="h-1.5 w-1.5 rounded-full bg-good shadow-[0_0_6px_rgba(34,197,94,0.6)]"
+            />
+          )}
+        </Button>
+        <Button
+          variant="default"
+          icon={<Layers size={14} />}
+          onClick={props.onOpenOverlay}
+          title="悬浮提词窗：盖在会议窗口之上显示答案，可对屏幕共享隐身"
+        >
+          悬浮窗
+          {props.overlayVisible && (
+            <span
+              aria-label="已显示"
+              className="h-1.5 w-1.5 rounded-full bg-good shadow-[0_0_6px_rgba(34,197,94,0.6)]"
+            />
+          )}
+        </Button>
         <ModeSwitch
           value={props.radioMode}
           disabled={!props.recording || props.modeChanging}
@@ -155,11 +198,21 @@ export default function LivePage() {
     () => groupFinalTranscripts(live.transcripts).length,
     [live.transcripts]
   )
-  const streamingAnswers = useMemo(
-    () => Object.values(live.streamingAnswers),
-    [live.streamingAnswers]
+  // 一个问题一张卡：后端对累计 partial 的有效 revision 并发请求 LLM；
+  // 展示层保留各版状态，但同一时刻只渲染 catch-up swap 选中的一版。
+  // 已落库答案挂到对应卡片上，不再单独渲染重复卡。
+  const { historyAnswers, threads } = useMemo(
+    () => buildAnswerFeed(Object.values(live.streamingAnswers), live.answers),
+    [live.streamingAnswers, live.answers]
   )
   const [sessionTitle, setSessionTitle] = useState('')
+  // 会话快照：标题之外还带 job_description / resume，供答题背景弹窗回填。
+  const [session, setSession] = useState<Session | null>(null)
+  const [contextOpen, setContextOpen] = useState(false)
+  const [overlayOpen, setOverlayOpen] = useState(false)
+  // 只用它的 state.visible 点亮 TopBar 上那颗绿点；真正的动作都在 OverlayPanel 里。
+  // 两处各订阅一次 overlay:state，热键改了状态两边都会跟上。
+  const { state: overlayState } = useOverlayControl()
   const [ending, setEnding] = useState(false)
   const [startOpen, setStartOpen] = useState(false)
   const [startMode, setStartMode] = useState<RadioMode>('pc')
@@ -169,6 +222,7 @@ export default function LivePage() {
   const [historyLoading, setHistoryLoading] = useState(false)
   const [manualQuestion, setManualQuestion] = useState('')
   const [manualSending, setManualSending] = useState(false)
+  const [solving, setSolving] = useState(false)
   const startedRef = useRef(false)
   const captureEpochRef = useRef(0)
   const captureStartingRef = useRef(false)
@@ -205,6 +259,8 @@ export default function LivePage() {
     let disposed = false
     useLiveStore.getState().reset(sessionId)
     setSessionTitle('')
+    setSession(null)
+    setContextOpen(false)
     setStartOpen(false)
     setStartMode('pc')
     startedRef.current = false
@@ -232,6 +288,7 @@ export default function LivePage() {
       .then((s) => {
         if (disposed) return
         setSessionTitle(s.title)
+        setSession(s)
         if (s.status === 'ended') {
           navigate(`/session/${sessionId}`, { replace: true })
         } else if (s.status === 'idle') {
@@ -339,6 +396,9 @@ export default function LivePage() {
       const ok = await api.live.regenerate(question, false)
       if (!ok) throw new Error('问题发送失败，请确认连接和答案队列状态')
       setManualQuestion('')
+      // 发送成功立刻挂"正在思考"卡：有没有发出去、AI 开始答没有一眼可见，
+      // 不用盯着按钮转圈猜。answer_stream 首帧（started 空帧）到达自动交棒。
+      useLiveStore.getState().addPendingQuestion(question)
     } catch (err) {
       showToast('error', errorMessage(err))
     } finally {
@@ -346,9 +406,36 @@ export default function LivePage() {
     }
   }
 
-  const toggleCapture = async () => {
-    if (!sessionId || captureStartingRef.current) return
-    if (systemAudioOn) {
+  /**
+   * 笔试辅助：抓当前屏幕交给后端多模态解题。
+   *
+   * 输入框里的文字当作备注一起送过去（"只解第二题"这类），送出后清空，
+   * 因为它已经消费掉了。答案按普通 answer 事件回到右侧列表。
+   */
+  const handleSolveScreenshot = async () => {
+    if (solving) return
+    if (live.phase !== 'ready' || live.sessionStatus !== 'recording') {
+      showToast('warning', '面试连接未就绪，暂时无法解题')
+      return
+    }
+    setSolving(true)
+    try {
+      const ok = await api.live.solveScreenshot(manualQuestion.trim() || undefined)
+      if (!ok) throw new Error('截图发送失败，请确认连接和答案队列状态')
+      setManualQuestion('')
+      showToast('info', '截图已发送，正在解题')
+    } catch (err) {
+      showToast('error', errorMessage(err))
+    } finally {
+      setSolving(false)
+    }
+  }
+
+  const toggleCapture = async () => {    if (!sessionId || captureStartingRef.current) return
+    // 悬浮窗 Ctrl+Alt+Z 开的采集：本页 systemAudioOn 没翻，但上传门禁开着
+    // （store 的 captureOn 跟着 captureState 事件走）。这里统一导向停止，
+    // 不能误判成"没在录"再开一次。
+    if (systemAudioOn || useLiveStore.getState().captureOn) {
       await stopCapture()
       return
     }
@@ -446,7 +533,10 @@ export default function LivePage() {
   }, [live.sessionStatus, sessionId, navigate])
 
   const connecting = live.phase === 'idle' || live.phase === 'connecting'
-  const captureOn = systemAudioOn
+  // 按钮状态跟着事件走(captureState),不能只看本地 systemAudioOn:悬浮窗
+  // Ctrl+Alt+Z 开的采集也要让这个按钮如实变成"停止系统采集"。
+  const captureOn = systemAudioOn || live.captureOn
+  const contextReady = !!(session?.job_description?.trim() || session?.resume?.trim())
 
   return (
     <div className="flex h-full flex-col">
@@ -457,7 +547,11 @@ export default function LivePage() {
         recording={live.sessionStatus === 'recording'}
         radioMode={live.radioMode}
         queued={live.outbox?.queued ?? 0}
+        contextReady={contextReady}
+        overlayVisible={overlayState.visible}
         onModeChange={handleModeChange}
+        onOpenContext={() => setContextOpen(true)}
+        onOpenOverlay={() => setOverlayOpen(true)}
         onEnd={() => void handleEnd()}
         ending={ending}
         modeChanging={modeChanging}
@@ -522,6 +616,20 @@ export default function LivePage() {
                 className="agent-prompt-input h-9 max-h-24 min-h-9 flex-1 resize-none bg-transparent py-2 text-left text-[13px] leading-5 text-ink-primary outline-none placeholder:text-ink-faint "
               />
               <button
+                type="button"
+                onClick={() => void handleSolveScreenshot()}
+                disabled={solving || live.phase !== 'ready' || live.sessionStatus !== 'recording'}
+                aria-label="截图解题"
+                title="截图解题（Ctrl+Alt+Q）；输入框内容会作为备注一起发送"
+                className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-stroke-subtle bg-surface text-ink-secondary shadow-sm transition-colors hover:bg-surface-hover hover:text-ink-primary disabled:cursor-not-allowed disabled:text-ink-faint disabled:opacity-100"
+              >
+                {solving ? (
+                  <Loader2 size={15} className="animate-spin" />
+                ) : (
+                  <ScanText size={15} />
+                )}
+              </button>
+              <button
                 type="submit"
                 disabled={
                   !manualQuestion.trim() ||
@@ -547,13 +655,12 @@ export default function LivePage() {
           <div className="flex items-center gap-2 border-b border-brand/20 bg-brand/[0.045] px-6 py-2.5">
             <span className="h-1.5 w-1.5 rounded-full bg-good shadow-[0_0_8px_rgba(34,197,94,0.55)]" />
             <span className="text-[13px] font-semibold text-ink-primary">AI 回答建议</span>
-            <span className="tnum ml-auto text-[11px] text-ink-faint">{live.answers.length} 条</span>
+            <span className="tnum ml-auto text-[11px] text-ink-faint">
+              {historyAnswers.length + threads.length + live.pendingQuestions.length} 条
+            </span>
           </div>
           <div className="min-h-0 flex-1 bg-[radial-gradient(circle_at_top_right,rgba(79,124,255,0.055),transparent_38%)]">
-            <AnswerFeed
-              answers={live.answers}
-              streamingAnswers={streamingAnswers}
-            />
+            <AnswerFeed answers={historyAnswers} threads={threads} pending={live.pendingQuestions} />
           </div>
         </section>
       </div>
@@ -650,7 +757,31 @@ export default function LivePage() {
             等待连接就绪…
           </div>
         )}
+        {!contextReady && (
+          <div className="mt-4 rounded-lg border border-warn/25 bg-warn/[0.07] px-3 py-2.5 text-xs leading-5 text-ink-secondary">
+            还没填岗位 JD 和简历，AI 只能给通用答案。
+            <button
+              onClick={() => setContextOpen(true)}
+              className="ml-1 cursor-pointer font-medium text-brand underline-offset-2 hover:underline"
+            >
+              现在补上
+            </button>
+            （面试中途也能改）
+          </div>
+        )}
       </Modal>
+
+      {sessionId && (
+        <SessionContextModal
+          open={contextOpen}
+          sessionId={sessionId}
+          session={session}
+          onClose={() => setContextOpen(false)}
+          onSaved={(next) => setSession(next)}
+        />
+      )}
+
+      <OverlayPanel open={overlayOpen} onClose={() => setOverlayOpen(false)} />
     </div>
   )
 }

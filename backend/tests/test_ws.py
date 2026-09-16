@@ -10,9 +10,12 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from app import asr, db, llm
-from app.ws import ConnectionManager, pipeline
+from app.ws import ConnectionManager, _decode_screenshot, pipeline
 
 AUTH_TOKEN = "test-access-token-0123456789abcdef0123456789"
+
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
 
 
 @pytest.mark.asyncio
@@ -328,7 +331,7 @@ def test_ws_control_messages_and_regenerate_answer(client, auth_headers, monkeyp
         "/api/sessions", json={"title": "控制消息"}, headers=auth_headers
     ).json()
 
-    async def fake_stream(question, context=""):
+    async def fake_stream(question, context="", job_description="", resume=""):
         yield llm.LLMStreamPart(text=f"回答:{question}:{context}")
 
     monkeypatch.setattr(llm, "stream_answer", fake_stream)
@@ -363,6 +366,9 @@ def test_ws_control_messages_and_regenerate_answer(client, auth_headers, monkeyp
         stream_seen = False
         while True:
             answer = ws.receive_json()
+            # 出错帧要立刻炸掉：以前只等 answer/answer_stream，服务端一旦回 error
+            # 这个循环就空转到超时，看起来像挂死，掩盖了真正的失败原因。
+            assert answer["type"] != "error", answer
             if answer["type"] == "answer_stream":
                 stream_seen = True
             if answer["type"] == "answer":
@@ -377,6 +383,32 @@ def test_ws_control_messages_and_regenerate_answer(client, auth_headers, monkeyp
         assert ws.receive_json()["status"] == "ended"
         with pytest.raises(WebSocketDisconnect):
             ws.receive_json()
+
+
+def test_ws_speech_end_reaches_question_accumulator(client, auth_headers, monkeypatch):
+    session_id = _create_and_start(client, auth_headers)
+    captured = []
+
+    async def fake_mark_speech_end(session_id_arg, source, through_chunk_seq):
+        captured.append((session_id_arg, source, through_chunk_seq))
+
+    monkeypatch.setattr(
+        "app.ws.pipeline.mark_speech_end", fake_mark_speech_end
+    )
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        _authenticate(ws)
+        ws.send_json(
+            {
+                "v": 1,
+                "type": "speech_end",
+                "source": "pc",
+                "through_chunk_seq": 7,
+            }
+        )
+        ws.send_json({"v": 1, "type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+
+    assert captured == [(session_id, "pc", 7)]
 
 
 def test_ws_cancel_audio_source_is_broadcast_and_idempotent(
@@ -625,3 +657,90 @@ def test_gap_timeout_advances_expected_sequence(client, auth_headers, monkeypatc
                 conn.close()
             done = bool(row and row["status"] == "done")
         assert done, "洞后的分片应完成转写(done),而非永远卡在缺口上"
+
+
+def test_decode_screenshot_requires_png_or_jpeg_container():
+    png = _PNG_MAGIC + b"payload"
+    assert _decode_screenshot(base64.b64encode(png).decode()) == png
+    jpeg = _JPEG_MAGIC + b"payload"
+    assert _decode_screenshot(base64.b64encode(jpeg).decode()) == jpeg
+
+    # mime 由客户端声明,不能作为容器判断依据:必须按魔数拦下任意二进制。
+    with pytest.raises(ValueError, match="PNG 或 JPEG"):
+        _decode_screenshot(base64.b64encode(b"GIF89a-not-an-image").decode())
+    with pytest.raises(ValueError, match="Base64"):
+        _decode_screenshot("!!!not-base64!!!")
+
+
+def test_decode_screenshot_enforces_size_limit(monkeypatch):
+    monkeypatch.setenv("AI_MAX_SCREENSHOT_BYTES", "64")
+    small = _PNG_MAGIC + b"x" * 8
+    assert _decode_screenshot(base64.b64encode(small).decode()) == small
+    with pytest.raises(ValueError, match="过大|非法"):
+        _decode_screenshot(base64.b64encode(_PNG_MAGIC + b"x" * 4096).decode())
+
+
+def test_ws_solve_screenshot_streams_answer_and_persists_as_llm(
+    client, auth_headers, monkeypatch
+):
+    session_id = _create_and_start(client, auth_headers)
+    captured = {}
+
+    async def fake_solve(
+        image_bytes, mime_type="image/png", note="", job_description="", resume=""
+    ):
+        captured.update(
+            {"image": image_bytes, "mime": mime_type, "note": note}
+        )
+        yield llm.LLMStreamPart(text="**思路**\n- 用哈希表")
+        yield llm.LLMStreamPart(text="\n**复杂度**：O(n)/O(n)")
+
+    monkeypatch.setattr(llm, "stream_solve_screenshot", fake_solve)
+    image = _PNG_MAGIC + b"screenshot-bytes"
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        _authenticate(ws)
+        ws.send_json(
+            {
+                "v": 1,
+                "type": "solve_screenshot",
+                "image": base64.b64encode(image).decode(),
+                "mime": "image/png",
+                "note": "第二题",
+            }
+        )
+        stream_seen = False
+        while True:
+            message = ws.receive_json()
+            assert message["type"] != "error", message
+            if message["type"] == "answer_stream":
+                stream_seen = True
+            if message["type"] == "answer":
+                break
+
+    assert stream_seen
+    # 截图题以 note 当标题:answers.question 非空是 db 层硬约束。
+    assert message["question"] == "第二题"
+    # source 是闭集,截图答案必须落在 llm 上而不是新增取值。
+    assert message["source"] == "llm"
+    assert "哈希表" in message["answer"]
+    assert captured["image"] == image
+    assert captured["mime"] == "image/png"
+    assert captured["note"] == "第二题"
+
+
+def test_ws_solve_screenshot_rejects_non_image_payload(client, auth_headers):
+    session_id = _create_and_start(client, auth_headers)
+    with client.websocket_connect(f"/ws/{session_id}") as ws:
+        _authenticate(ws)
+        ws.send_json(
+            {
+                "v": 1,
+                "type": "solve_screenshot",
+                "image": base64.b64encode(b"GIF89a-nope").decode(),
+            }
+        )
+        while True:
+            message = ws.receive_json()
+            if message["type"] == "error":
+                break
+    assert message["code"] == "invalid_screenshot"

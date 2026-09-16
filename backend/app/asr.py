@@ -469,11 +469,44 @@ def _funasr_token() -> str:
 
 
 def use_funasr_stream(codec: str) -> bool:
-    """实时 WAV 默认复用 FunASR WebSocket；每片仍有独立 start/stop/final。"""
+    """实时 WAV 走 FunASR 长连接:一个语音段一个 utterance,跨分片保留声学上下文。"""
     return (
         os.environ.get("AI_ASR_ENGINE", "funasr").strip().lower() == "funasr"
         and codec == "wav_pcm_s16le"
         and os.environ.get("AI_FUNASR_STREAM", "true").strip().lower() == "true"
+    )
+
+
+def _funasr_env_float(name: str, default: float, *, low: float, high: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if math.isnan(value) or value < low or value > high:
+        return default
+    return value
+
+
+def _funasr_partial_idle_seconds() -> float:
+    """推流后等待新 partial 的空闲窗口(秒)。
+
+    这是每个分片必然要付出的等待:循环末尾一定靠超时退出。分片时长(客户端
+    `AI_AUDIO_CHUNK_MS`,默认 400 ms)比这个值小的时候,音频 worker 追不上采集
+    线程,队列填满后背压回踩,首字反而更慢。默认值因此压到 0.2 秒,让 worker
+    在 400 ms 分片下仍有余量。
+    """
+    return _funasr_env_float(
+        "AI_FUNASR_PARTIAL_IDLE_SECONDS", 0.2, low=0.05, high=5.0
+    )
+
+
+def _funasr_partial_max_wait_seconds() -> float:
+    """单个分片推流后收取 partial 的总上限(秒),防止拖慢音频 worker。"""
+    return _funasr_env_float(
+        "AI_FUNASR_PARTIAL_MAX_WAIT_SECONDS", 1.0, low=0.2, high=15.0
     )
 
 
@@ -554,11 +587,18 @@ class FunAsrEvent:
 
 
 class FunAsrStream:
-    """一个 session/source 复用的 FunASR WebSocket 长连接。
+    """一个 session/source 复用的 FunASR WebSocket 长连接与开放式 utterance。
 
-    当前每个音频分片都独立发送 start、PCM、stop 并等待自己的 final；
-    这里只复用底层连接。服务端返回的 partial 不写数据库，final 由实时
-    流水线落历史。读取任务和发送任务分离，避免接收循环阻塞发送路径。
+    一个语音段(speech segment)对应一个 utterance:`start` 只在语音段开始时
+    发一次,随后每个音频分片只推裸 PCM,**不发 stop**,`stop` 只在客户端
+    `speech_end` 到达时发一次。这样 FunASR 才能跨分片保留声学上下文,
+    避免词被切在分片边界上(例如 DNS 只剩 NS、TCP 被拆到两片)。
+
+    按网关文档(`{ASR}/docs`),`partial` 是**当前 utterance 的累计全文**,
+    客户端应整段替换显示;`final` 是段末固化文本。因此上层不需要自己拼接
+    分片文本:最新 partial 就是"分片 1..n"的全文。
+
+    读取任务和发送任务分离,避免接收循环阻塞发送路径。
     """
 
     def __init__(self) -> None:
@@ -678,19 +718,61 @@ class FunAsrStream:
             events.append(event)
             if event.type == "final":
                 break
+        self._sweep_ready(events)
+        return events
+
+    def _sweep_ready(self, events: list[FunAsrEvent]) -> None:
+        """把已经排队的事件全部收走，不等待。"""
         while True:
             try:
                 event = self._events.get_nowait()
             except asyncio.QueueEmpty:
-                break
+                return
             if event.type == "error":
                 raise RuntimeError(f"FunASR 错误:{event.message}")
             events.append(event)
+
+    async def _drain_until_idle(
+        self, idle_timeout: float, max_wait: float
+    ) -> list[FunAsrEvent]:
+        """推流后收取累计 partial:拿到就走,最多等 min(idle_timeout, max_wait)。
+
+        推流阶段不能等 final(整段结束前不会有 final),也不能每收一条就再等一个
+        空闲窗口 —— 那样每个分片都要付掉一整个 idle_timeout,分片比这个值短的
+        时候音频 worker 直接被采集线程甩开,队列填满后背压回踩,首字反而更慢。
+
+        partial 是**累计全文**,所以"最新一条"就够用,不必为"可能更新的下一条"
+        守着。真的又来了新 partial,它会在下一个分片推流时被立刻扫走,或者在
+        `finish()` 的 `_read_for` 里收尾,不会丢。
+        """
+        events: list[FunAsrEvent] = []
+        # 上一次推流之后网关可能已经吐了新 partial，先白拿，一毫秒都不等。
+        self._sweep_ready(events)
+        if events:
+            return events
+        budget = min(idle_timeout, max_wait)
+        if budget <= 0:
+            return events
+        try:
+            events.append(await asyncio.wait_for(self._events.get(), timeout=budget))
+        except asyncio.TimeoutError:
+            return events
+        if events[-1].type == "error":
+            raise RuntimeError(f"FunASR 错误:{events.pop().message}")
+        # 同一时刻队列里可能已经堆了更新的 partial，一并收走再返回。
+        self._sweep_ready(events)
         return events
 
     async def push_wav(
         self, audio_bytes: bytes, declared_duration_ms: int
     ) -> list[FunAsrEvent]:
+        """把一个分片推进**当前 utterance**,不结束它。
+
+        `start` 只在语音段的第一个分片发送;后续分片只推裸 PCM。这里**不发
+        `stop`**,因此返回值里通常只有 `partial`(当前语音段的累计全文),
+        `final` 只会在 `finish()` 里出现。返回空列表是正常情况(网关还没吐
+        新的 partial),调用方不得据此判定超时。
+        """
         await self.connect()
         async with self._lock:
             if self._closed or self._ws is None:
@@ -698,34 +780,31 @@ class FunAsrStream:
             actual_duration_ms = await asyncio.to_thread(
                 inspect_audio, audio_bytes, "wav_pcm_s16le", declared_duration_ms
             )
-            await cost_control.reserve_asr_seconds(
-                _funasr_token(), math.ceil(actual_duration_ms / 1000)
+            await cost_control.reserve_asr_millis(
+                _funasr_token(), actual_duration_ms
             )
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "type": "start",
-                        "sample_rate": 16000,
-                        "format": "pcm_s16le",
-                        "channels": 1,
-                    }
+            if not self._utterance_active:
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "type": "start",
+                            "sample_rate": 16000,
+                            "format": "pcm_s16le",
+                            "channels": 1,
+                        }
+                    )
                 )
-            )
-            self._utterance_active = True
+                self._utterance_active = True
             await self._ws.send(_wav_payload(audio_bytes))
-            await self._ws.send(json.dumps({"type": "stop"}))
-            events = await self._read_for(
-                max(
-                    float(os.environ.get("AI_FUNASR_FINAL_TIMEOUT_SECONDS", "5")),
-                    actual_duration_ms / 1000 + 2,
-                )
+            events = await self._drain_until_idle(
+                _funasr_partial_idle_seconds(), _funasr_partial_max_wait_seconds()
             )
-            if not any(event.type == "final" for event in events):
-                raise RuntimeError("FunASR 响应超时")
-            self._utterance_active = False
+            if any(event.type == "final" for event in events):
+                self._utterance_active = False
             return events
 
     async def finish(self) -> list[FunAsrEvent]:
+        """结束当前 utterance:发一次 `stop` 并等待段末 `final`。"""
         async with self._lock:
             if self._closed or self._ws is None or not self._utterance_active:
                 return []
@@ -791,9 +870,7 @@ async def _transcribe_funasr(audio_bytes: bytes, declared_duration_ms: int) -> s
         actual_duration_ms = await asyncio.to_thread(
             inspect_audio, audio_bytes, "wav_pcm_s16le", declared_duration_ms
         )
-        await cost_control.reserve_asr_seconds(
-            funasr_token, math.ceil(actual_duration_ms / 1000)
-        )
+        await cost_control.reserve_asr_millis(funasr_token, actual_duration_ms)
         try:
             connect_kwargs = {
                 "proxy_url": proxy_url,
@@ -892,9 +969,7 @@ async def _transcribe_groq(
         actual_duration_ms = await asyncio.to_thread(
             inspect_audio, audio_bytes, codec, declared_duration_ms
         )
-        await cost_control.reserve_asr_seconds(
-            context["api_key"], math.ceil(actual_duration_ms / 1000)
-        )
+        await cost_control.reserve_asr_millis(context["api_key"], actual_duration_ms)
         async with httpx.AsyncClient(**context["client_kwargs"]) as client:
             for attempt in range(3):
                 resp = await client.post(

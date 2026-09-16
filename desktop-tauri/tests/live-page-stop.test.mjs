@@ -52,7 +52,30 @@ test('live transcript rail includes an Agent-style manual AI prompt', () => {
   assert.match(livePageSource, /event\.key === 'Enter' && !event\.shiftKey/)
   assert.match(livePageSource, /Shift\+Enter 换行/)
   assert.match(livePageSource, /aria-label="发送问题"/)
-  assert.match(livePageSource, /\[&::placeholder\]:text-center/)
+  // 提词输入是单行 composer，占位文字跟着正文左对齐；居中占位会把阅读轴线打断。
+  assert.match(livePageSource, /text-left[^\n]*placeholder:text-ink-faint/)
   assert.doesNotMatch(livePageSource, /focus-within:border-brand/)
   assert.match(livePageSource, /disabled:bg-surface-hover/)
+})
+
+// ---------- 五轮:采集按钮跟随事件 + 手动提问即时反馈 ----------
+
+test('capture button state follows captureState events, including overlay-started capture', async () => {
+  // 悬浮窗 Ctrl+Alt+Z 开的采集:本页 systemAudioOn 没翻,但 store 的
+  // captureOn 跟着 captureState 事件走——按钮必须如实变"停止系统采集",
+  // toggle 也不能把门开着的场景误判成"再开一次"。
+  assert.match(livePageSource, /const captureOn = systemAudioOn \|\| live\.captureOn/)
+  assert.match(livePageSource, /if \(systemAudioOn \|\| useLiveStore\.getState\(\)\.captureOn\)/)
+})
+
+test('manual question send mounts a pending card immediately', async () => {
+  // 发送成功即挂"正在思考"卡,answer_stream 首帧接棒;不再让用户盯着
+  // 按钮转圈猜有没有发出去。
+  const answerFeedSource = await readFile(
+    new URL('../src/pages/feeds/AnswerFeed.tsx', import.meta.url),
+    'utf8'
+  )
+  assert.match(livePageSource, /addPendingQuestion\(question\)/)
+  assert.match(livePageSource, /pending=\{live\.pendingQuestions\}/)
+  assert.match(answerFeedSource, /已发送 · 正在思考…/)
 })

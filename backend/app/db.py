@@ -32,6 +32,8 @@ RETRYABLE_AUDIO_ERROR_CODES = {
 }
 CHUNK_SEQ_MAX = 2_147_483_647
 SQLITE_INT_MAX = 9_223_372_036_854_775_807
+# 岗位 JD 与简历上限：足够放完整 JD 和一页简历，同时挡住把整本文档塞进 prompt。
+MAX_SESSION_CONTEXT_CHARS = 8_000
 _write_lock = threading.RLock()
 
 
@@ -298,6 +300,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "transcripts", "captured_at", "TEXT")
     _ensure_column(conn, "audio_chunks", "content_sha256", "TEXT")
     _ensure_column(conn, "reviews", "request_key", "TEXT")
+    # 岗位 JD 与简历：会话级答题背景，供 LLM 生成针对岗位的答案而不是通用答案。
+    _ensure_column(conn, "sessions", "job_description", "TEXT")
+    _ensure_column(conn, "sessions", "resume", "TEXT")
 
     conn.execute(
         "UPDATE sessions SET status = 'idle' WHERE status NOT IN ('idle', 'recording', 'ended')"
@@ -305,6 +310,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE sessions SET radio_mode = 'pc' WHERE radio_mode NOT IN ('pc', 'mobile', 'both')"
     )
+    # 僵尸 recording 恢复：recording 只存活于进程内存（问题线程、ASR 任务都在
+    # 进程内），后端被杀/崩溃后不可能还在录。不重置的话，客户端下次连接时
+    # sync_complete 会照着库里的 'recording' 报告状态，悬浮窗/主窗口凭空显示
+    # "录制中"。这里回到 idle 而不是 ended：会话没有正常走完，用户仍可重新
+    # 开始这场面试（start_session 要求 idle）。
+    conn.execute("UPDATE sessions SET status = 'idle' WHERE status = 'recording'")
     interrupted_chunks = conn.execute(
         "SELECT * FROM audio_chunks WHERE status = 'queued'"
     ).fetchall()
@@ -535,6 +546,45 @@ def end_session(conn: sqlite3.Connection, session_id: str) -> tuple[dict, dict |
             conn, session_id, "session_state", _session_payload(session)
         )
     return session, event
+
+
+def set_session_context(
+    conn: sqlite3.Connection,
+    session_id: str,
+    job_description: str | None,
+    resume: str | None,
+) -> dict:
+    """更新会话级答题背景（岗位 JD 与简历）。
+
+    只写 job_description / resume 两列，不碰 status 与 radio_mode，
+    因此不会触发 trg_sessions_validate_update。已结束的会话仍可补录背景，
+    因为复盘生成也会用到这份上下文。
+    """
+    jd = (job_description or "").strip()
+    cv = (resume or "").strip()
+    if len(jd) > MAX_SESSION_CONTEXT_CHARS or len(cv) > MAX_SESSION_CONTEXT_CHARS:
+        raise ValueError(f"岗位 JD 与简历各自不能超过 {MAX_SESSION_CONTEXT_CHARS} 个字符")
+    with _transaction(conn):
+        require_session(conn, session_id)
+        conn.execute(
+            "UPDATE sessions SET job_description = ?, resume = ? WHERE id = ?",
+            (jd or None, cv or None, session_id),
+        )
+        session = require_session(conn, session_id)
+    return session
+
+
+def get_session_context(conn: sqlite3.Connection, session_id: str) -> tuple[str, str]:
+    """取会话级 JD 与简历；会话不存在时返回空串而不是抛错。
+
+    调用点在实时答案链路上，缺背景只应降级成通用答案，不应中断答案生成。
+    """
+    row = conn.execute(
+        "SELECT job_description, resume FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if not row:
+        return "", ""
+    return str(row["job_description"] or ""), str(row["resume"] or "")
 
 
 def ensure_recording(conn: sqlite3.Connection, session_id: str) -> dict:
@@ -1021,6 +1071,8 @@ def add_answer(
     answer: str,
     source: str = "llm",
     request_id: str | None = None,
+    thread_id: str | None = None,
+    revision: int | None = None,
 ) -> dict:
     question = question.strip()
     answer = answer.strip()
@@ -1046,10 +1098,18 @@ def add_answer(
         event_payload = dict(result)
         if request_id:
             event_payload["request_id"] = request_id
+        if thread_id:
+            event_payload["thread_id"] = thread_id
+        if revision is not None:
+            event_payload["revision"] = revision
         event = _insert_event(conn, session_id, "answer", event_payload)
     result["event_id"] = event["event_id"]
     if request_id:
         result["request_id"] = request_id
+    if thread_id:
+        result["thread_id"] = thread_id
+    if revision is not None:
+        result["revision"] = revision
     return result
 
 

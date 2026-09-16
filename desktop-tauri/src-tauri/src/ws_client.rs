@@ -99,6 +99,15 @@ fn cancel_audio_source_message(intent: &CancelIntent) -> Value {
     })
 }
 
+fn speech_end_message(source: &str, through_chunk_seq: i64) -> Value {
+    json!({
+        "v": PROTOCOL_VERSION,
+        "type": "speech_end",
+        "source": source,
+        "through_chunk_seq": through_chunk_seq,
+    })
+}
+
 /// 发送持久化取消边界。只要还有 CancelPending 就保留意图，供下次重连补发。
 async fn send_pending_cancel(
     write: &mut WsWrite,
@@ -638,8 +647,43 @@ pub async fn run_ws(
                                 .await;
                             }
                         }
+                        Some(EngineCommand::SpeechEnd { source }) => {
+                            if !authenticated {
+                                pending_commands.push_back(EngineCommand::SpeechEnd { source });
+                                continue;
+                            }
+                            if !pc_upload_allowed(
+                                capture_active,
+                                &current_session_status,
+                                &current_radio_mode,
+                            ) {
+                                continue;
+                            }
+                            let through_chunk_seq = {
+                                let m = manifest.lock().await;
+                                m.next_chunk_seq - 1
+                            };
+                            if through_chunk_seq < 0 {
+                                continue;
+                            }
+                            let message = speech_end_message(&source, through_chunk_seq);
+                            if write
+                                .send(WsMessage::Text(message.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                pending_commands.push_front(EngineCommand::SpeechEnd {
+                                    source: message["source"]
+                                        .as_str()
+                                        .unwrap_or("pc")
+                                        .to_string(),
+                                });
+                                break;
+                            }
+                        }
                         Some(EngineCommand::SetCaptureActive { active, reason, ack }) => {
                             capture_active = active;
+                            emit(EngineEvent::CaptureState { active });
                             if !active {
                                 capture_inactive_reason = if reason.is_empty() {
                                     "capture_stopped".into()
@@ -812,6 +856,18 @@ pub async fn run_ws(
         {
             break;
         }
+    }
+
+    // 引擎被停掉（离开实时页 / live_disconnect）时上面的循环直接 break，
+    // 不经过正常关链路，也就没有任何事件通知前端。悬浮窗会因此永远停在
+    // 最后一次会话状态（比如"录制中"）。这里补一条 closed 把状态收干净；
+    // 正常结束（close 码 1000）路径在循环里已经发过 closed，不会走到这。
+    if stopped {
+        emit(EngineEvent::Connection {
+            phase: engine::phase::CLOSED,
+            note: Some("连接已断开".into()),
+            retry_after_ms: None,
+        });
     }
 }
 
@@ -1197,6 +1253,7 @@ async fn sleep_interruptible(
                 }
                 Some(EngineCommand::SetCaptureActive { active, reason, ack }) => {
                     *capture_active = active;
+                    emit(EngineEvent::CaptureState { active });
                     if !active {
                         *capture_inactive_reason = if reason.is_empty() {
                             "capture_stopped".into()
@@ -1281,6 +1338,15 @@ mod tests {
         assert_eq!(message["source"], "pc");
         assert_eq!(message["through_chunk_seq"], 17);
         assert_eq!(message["reason"], "capture_stopped");
+    }
+
+    #[test]
+    fn speech_end_message_carries_current_sequence_boundary() {
+        let message = speech_end_message("pc", 23);
+        assert_eq!(message["v"], PROTOCOL_VERSION);
+        assert_eq!(message["type"], "speech_end");
+        assert_eq!(message["source"], "pc");
+        assert_eq!(message["through_chunk_seq"], 23);
     }
 
     #[tokio::test]

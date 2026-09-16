@@ -1,7 +1,7 @@
 # AI 面试助手：历史设计与现状修订
 
 > 初始日期：2026-08-13
-> 最近按代码修订：2026-08-26
+> 最近按代码修订：2026-09-14
 > 状态：这是历史设计文档的现状修订版；后端和 Tauri 桌面端已实现，移动端未实现，旧 Electron 客户端已废弃并从当前工作树删除，容器上线验证暂缓。
 
 本文最初记录 2026-08-13 的方案，现已按当前代码纠正实现状态和技术边界。它不是逐步执行计划：后端接口以 [后端权威文档](../../../backend/README.md) 和 `backend/app/` 为准，桌面端以 [Tauri 客户端文档](../../../desktop-tauri/README.md)、`desktop-tauri/src/` 和 `desktop-tauri/src-tauri/src/` 为准。
@@ -18,8 +18,9 @@
 - 可认证、可恢复的 WebSocket v1。
 - 默认 `AI_ASR_ENGINE=funasr`：WAV 走 FunASR；设置为 `llm` 才使用激活 LLM 配置的主 `model` 做多模态转写，设置为 `groq` 或使用非 WAV 编码时走 Groq。
 - OpenAI-compatible LLM，以及 Google 可选搜索增强；Bing 新配置已退役，搜索不是向量 RAG。
+- 客户端 `speech_end` 语音段边界 + 后端 `QuestionThread` 问题线程累积：同一问题的多个切片合并为一张答案卡片，只落库最新完成的一版。
 - `llm`、`search`、`asr`、`network` 四类服务端配置的新增、脱敏读取、激活和删除。
-- Tauri 2 + React 19 + TypeScript + Rust 的 Windows 桌面客户端，开始采集时只使用默认播放设备 WASAPI loopback，并包含静音门控、本地 outbox、取消水位、断线恢复、历史和设置界面。
+- Tauri 2 + React 19 + TypeScript + Rust 的 Windows 桌面客户端，开始采集时只使用默认播放设备 WASAPI loopback，并包含静音门控、语音段切分、本地 outbox、取消水位、断线恢复、历史和设置界面。
 - 后端测试、SQLite 备份恢复脚本和未完成实测的生产容器资产。
 
 当前仓库没有：
@@ -62,9 +63,9 @@ Tauri 桌面端和后端方框代表已有代码；移动客户端仍是未来�
 |---|---|---|
 | 应用边界 | `main.py` | 环境加载、启动校验、数据库初始化、中间件、健康检查、优雅关闭 |
 | REST 模型 | `models.py` | 严格字段、长度、枚举、SecretStr 和响应类型 |
-| WS 协议 | `protocol.py` | `v: 1`、首包认证、`cancel_audio_source`、业务消息分派、拒绝未知字段 |
+| WS 协议 | `protocol.py` | `v: 1`、首包认证、`cancel_audio_source`、`speech_end`、业务消息分派、拒绝未知字段 |
 | 实时入口 | `ws.py` | Origin/Token、快照同步、事件重放、连接广播、错误和关闭码 |
-| 实时流水线 | `realtime.py` | 按来源排序、背压、取消水位、当前任务中止、默认 FunASR 连接复用、片级 final、答案并发、结束/关闭清理 |
+| 实时流水线 | `realtime.py` | 按来源排序、背压、取消水位、当前任务中止、默认 FunASR 连接复用与语音段 utterance（`FunAsrSegment`）、段末 final、`QuestionThread` 问题线程按累计 partial 累积与宽限关闭、答案并发、结束/关闭清理 |
 | 持久层 | `db.py` | 状态机、事务、幂等、取消终态、事件、秘密、复盘和预算 |
 | 外部服务 | `asr.py`、`llm.py`、`search.py` | 媒体校验、第三方请求、输出验证和降级 |
 | 防护 | `security.py`、`cost_control.py` | 认证、加密、SSRF、限流、并发和预算 |
@@ -76,12 +77,11 @@ Tauri 桌面端和后端方框代表已有代码；移动客户端仍是未来�
 | 组件 | 代码 | 设计责任 |
 |---|---|---|
 | React 界面 | `desktop-tauri/src/pages/`、`src/stores/` | 会话列表、实时转写与答案、历史复盘、四类配置、删除交互和 Tauri 字符串错误归一化 |
-| 音频采集 | `desktop-tauri/src-tauri/src/system_audio.rs` | Windows 默认播放设备 WASAPI loopback、16 kHz 单声道 PCM、2.5 秒 WAV 和 20 ms RMS 静音门控；麦克风模块保留但当前不启用 |
-| 系统声音采集 | `desktop-tauri/src-tauri/src/system_audio.rs` | Windows 默认 `eConsole` Render endpoint WASAPI loopback、16 kHz 单声道 PCM、2.5 秒组帧、静音门控和停止尾片丢弃 |
+| 系统声音采集 | `desktop-tauri/src-tauri/src/system_audio.rs` | Windows 默认 `eConsole` Render endpoint WASAPI loopback、16 kHz 单声道 PCM、`SpeechChunker` 语音段切分（20 ms RMS 窗、按 `AI_AUDIO_CHUNK_MS` 成片（默认 400 ms，夹到 100–2500 并对齐 20 ms 窗）、约 1.6 秒静音冲刷短尾片并产出 `SpeechEnd`）；麦克风模块保留但当前不启用 |
 | 前后端桥 | `desktop-tauri/src/api/bridge.ts` | Tauri `invoke` / `listen` 的类型化封装 |
 | Tauri 命令 | `desktop-tauri/src-tauri/src/lib.rs` | 设置、会话、历史、配置、live 引擎和音频命令注册 |
 | 网络与恢复 | `rest.rs`、`ws_client.rs`、`engine.rs`、`outbox.rs`、`reconcile.rs` | REST/WS、capture gate、Rust 唯一序号分配、取消意图、有限重试、游标、重连、落盘 outbox 和对账 |
-| 本地秘密 | `settings.rs` | 服务器地址文件和 Windows Credential Manager 访问令牌 |
+| 本地秘密 | `settings.rs` | 写死的本机后端地址常量 `SERVER_URL`（`http://127.0.0.1:8000`）和 Windows Credential Manager 访问令牌；没有 `settings.json` |
 
 ## 4. 核心领域模型
 
@@ -140,6 +140,7 @@ queued -> done
 
 - 每条转写有会话内单调 `seq`，并可关联音频 `chunk_id/chunk_seq`。
 - 答案记录问题、答案正文和实际来源 `llm/search+llm`；生成中的流式内容只通过 `answer_stream` 消息展示，完成后才写入历史。
+- 自动答案由问题线程驱动：`thread_id` 和 `revision` 只出现在事件负载与响应中，**不是 `answers` 表的列**；同一线程只落库最新完成的一版，所以一个问题在历史里只有一条答案。
 - 复盘只属于 ended 会话，不写入实时事件流。
 - 复盘请求键包含转写、答案、协议版本和 `use_search`；相同内容版本复用结果。
 
@@ -156,13 +157,14 @@ audio_chunk
   ├─ AI_ASR_ENGINE=llm + WAV + active LLM model → 多模态 LLM
   │    └─ 激活 Whisper 或名称为 Groq 的兼容配置时改走 Groq
   ├─ 非 WAV 编码当前走 Groq
-  ├─ transcript 事件 + chunk_ack(done) 事件
-  ├─ 每个片级 final 独立创建 AnswerWork
+  ├─ 分片推进 FunASR 即 chunk_ack(done)（不等段末 final，避免客户端背压）
+  ├─ 每版更长的累计 partial 并入 QuestionThread → revision + 1 → AnswerWork(persist_immediately=False)
+  ├─ speech_end → stop → 段末 final → 一条 transcript 事件 + 强制一版 revision
   └─ 每 session 答案队列与并发任务
        ├─ 最近转写上下文
        ├─ 可选搜索
-       ├─ LLM
-       └─ answer 事件
+       ├─ LLM（answer_stream 携带 thread_id/revision/started/failed）
+       └─ 线程关闭时才写 answers 并广播 answer 事件
 ~~~
 
 `audio_chunk` 之前的当前 PC 采集链路为：
@@ -172,10 +174,12 @@ audio_chunk
   └─ 电脑播放声：Windows 默认 eConsole 播放设备 WASAPI loopback
        │
        ├─ 转换为 16 kHz / mono / PCM s16le
-       ├─ 每 2.5 秒形成候选窗口
-       ├─ 20 ms RMS 窗，至少 3 个有效窗
-       ├─ 非静音候选 → UUID → Rust manifest 分配唯一 chunk_seq
-       └─ 静音候选直接丢弃；当前不发送 speech_end
+       ├─ SpeechChunker：20 ms RMS 窗，至少 3 个有声窗才成片
+       ├─ 满一个分片（AI_AUDIO_CHUNK_MS，默认 400 ms）→ 候选分片 → UUID → Rust manifest 分配唯一 chunk_seq
+       ├─ 静音候选直接丢弃（不分配 UUID、不占序号、不落盘）
+       └─ 连续 80 个静音窗（约 1.6 秒）
+            ├─ 先冲刷携带 100 ms 尾部静音的短尾片（不足 100 ms 零填充）
+            └─ 再发送 speech_end{source, through_chunk_seq}
 ~~~
 
 系统声音初始化失败时，LivePage 停止启动并显示具体错误。真实 Windows 设备和腾讯会议声音采集结果仍待本轮真机验证，不能从编译或单元测试推断已可用。
@@ -201,16 +205,18 @@ ASR 前通过 `ffprobe` 失败关闭：
 - 实际时长必须在 100 毫秒到 `AI_MAX_AUDIO_DURATION_MS + 250` 毫秒之间。
 - 声明/实际时长误差不能超过 `max(AI_AUDIO_DURATION_TOLERANCE_MS, 真实时长的 20%)`。
 
-通过后按 `AI_ASR_ENGINE` 路由：`llm` 使用激活 LLM 的主 `model` 处理 WAV；默认 `funasr` 的 WAV 按 `session_id + source` 复用 WebSocket，但无论连接是否复用，每个切片都独立执行 `start -> PCM -> stop -> final`；`AI_FUNASR_STREAM=false` 只会退回“每片重新建连”的兼容路径。`groq` 和非 WAV 编码走 Groq。默认路径收到片级 final 后新增 transcript 并触发答案；不再做问题关键词、标点、长度或静音结束检测。
+通过后按 `AI_ASR_ENGINE` 路由：`llm` 使用激活 LLM 的主 `model` 处理 WAV；默认 `funasr` 的 WAV 按 `session_id + source` 复用 WebSocket，并按语音段维持**开放式 utterance**——段首一次 `start`，中间分片只推裸 PCM，客户端 `speech_end` 才 `stop` 并等段末 `final`；`AI_FUNASR_STREAM=false` 只会退回“每片重新建连、每片自己 start/stop”的兼容路径。`groq` 和非 WAV 编码走 Groq。默认路径把段末 final 写成**一条** transcript，段内每版累计 `partial` 并入对应的问题线程；后端自身仍不做问题关键词、标点、长度或静音结束检测，语音段边界只由客户端 `speech_end` 提供。
 
 ### 5.3 实时转写和答案
 
-- 默认 FunASR 每个 `session + source` 复用一条 WebSocket；每个切片独立执行 `start -> PCM -> stop -> final` 并创建独立 LLM 请求。会话内答案有界并发，`request_id` 用于隔离交错到达的流式事件；相邻 final 只在转写 UI 显示层合并。
-- `partial` 只通过非持久化 `transcript_partial` 事件显示在实时转写区，不触发 LLM。
-- `final` 到达后才写入历史，清除临时转写，更新最终答案。
-- LLM 使用 OpenAI-compatible SSE；每段上游增量立即通过非持久化 `answer_stream` 广播，不增加逐字符人工延迟，流结束后才写入 `answers` 并广播持久化 `answer`。
-- 当前没有客户端 `speech_end`、服务端 endpoint gap 或逻辑问题线程；“没有新分片”不会触发任何控制消息。停止整个会话前仍会 flush 已在处理的任务。
-- 客户端保留手动 `regenerate_answer`，用于用户主动重算答案。
+- 默认 FunASR 每个 `session + source` 复用一条 WebSocket；一个语音段就是一个 utterance（段首 `start`、中间只推 PCM、`speech_end` 才 `stop`）。`request_id` 隔离交错流，`thread_id` 把同一问题的并发 revision 聚合成一张卡；展示层只显示当前答案最长的一版，落库 `answer` 只作为该卡的“已入库”标记。
+- `partial` 是**当前语音段的累计全文**，通过非持久化 `transcript_partial` 事件在实时转写区整句替换显示，同时驱动问题线程的下一个 revision。
+- 段末 `final` 写入 `transcripts`（一段一条，不带 `chunk_id`），并强制触发该问题线程的最后一个 revision。分片在推进 FunASR 时就已 ack `done`。
+- LLM 使用 OpenAI-compatible SSE；每段上游增量立即通过非持久化 `answer_stream` 广播（携带 `thread_id`、`revision`、`started`、`failed`），不增加逐字符人工延迟。
+- **问题线程（`QuestionThread`，进程内状态）**：每版有效累计 `partial` 让问题变为 `committed_prefix + 累计全文`、`revision += 1`，经 `AI_QUESTION_REVISION_GROWTH_RATIO` 几何节流后立即提交 LLM。各 revision 互不取消，在会话并发上限内真正并发；旧 revision 完成后不会覆盖更高 revision。
+- 客户端 `speech_end` 结束当前语音段并启动/重排宽限定时器 `AI_QUESTION_THREAD_GRACE_SECONDS`（默认 6 秒）。宽限到期或 `flush_session` 时关闭线程，把最新完成的一版写入 `answers` 并广播持久化 `answer`；全部 revision 失败则不落库。宽限期内的新语音会丢弃旧边界并取消关闭定时器，其累计文本拼在已固化的 `committed_prefix` 之后继续同一线程。
+- 后端重启会丢失所有未关闭线程；已入库的 `answer` 不受影响。
+- 客户端保留手动 `regenerate_answer`：不走问题线程，没有 `thread_id`，完成后立即入库。
 
 ## 6. 同步与恢复协议
 
@@ -224,6 +230,8 @@ ASR 前通过 `ffprobe` 失败关闭：
 - `answer`
 
 每个事件有数据库自增 `event_id`。客户端可以通过 REST 或 WebSocket 重放游标后的事件。
+
+`transcript_partial`、`answer_stream`、`error`、`pong`、`sync_complete` 永不写入 `session_events`。客户端发送的 `speech_end` 同样不产生持久化事件，也没有回执。
 
 ### 6.2 建连同步
 
@@ -287,7 +295,7 @@ ASR 前通过 `ffprobe` 失败关闭：
 
 - REST Bearer Token 和 WebSocket 首包 Token 使用常量时间比较。
 - 配置 API Key 用 Fernet 加密，响应只显示 `secret_configured`。
-- Tauri 桌面端访问令牌保存在 Windows Credential Manager，不写入 `settings.json`。
+- Tauri 桌面端访问令牌保存在 Windows Credential Manager；后端地址不是用户可配置项，写死为同机 `http://127.0.0.1:8000`，客户端不再落盘任何 `settings.json`。
 - LLM URL 默认只允许 HTTPS、无凭据、无 query/fragment 和非私网 DNS 结果；当前不再维护额外的主机白名单。
 - 浏览器 Origin 精确白名单且禁止 `*`；原生客户端可以省略 Origin。
 - 可选 Trusted Host、HTTPS 重定向和 HSTS。
@@ -337,14 +345,15 @@ usage_buckets
 
 已验证：
 
-- 2026-08-26 使用本地 Python `3.10.6` 执行后端当前测试集，结果为 `218 passed`；`ruff` 通过，本轮没有重新生成覆盖率报告。此前 Python 3.10.6 与 3.12.11 的 `212 passed` 属于较早快照；目标 Python 3.12 仍需重新复现当前测试集。
-- 后端自动化测试覆盖状态机、认证、幂等、乱序、重放、关闭恢复、FunASR 协议假实现、Groq 回退、四类配置、删除、成本限制、密钥加密、SSRF、复盘和备份恢复。
-- Tauri 前端 `npm test` 为 `92 passed`，覆盖系统声音采集、答案优先布局、手动提问框、partial 转写、并发流式答案、事件去重、配置表单、全局提示词、Markdown、静音门控和错误显示；本次发布仍需重新执行 `npm run build`。
-- Rust `cargo test --locked` 为 `42 passed`；`cargo check --locked`、`cargo fmt --check` 与严格 Clippy 通过。
+- 2026-09-14 使用本地 Python 3.10 执行后端当前测试集，结果为 **`260 passed`**；`ruff` 通过，本轮未生成覆盖率报告，目标 Python 3.12 仍需复现。
+- 后端自动化测试覆盖状态机、认证、幂等、乱序、重放、关闭恢复、`speech_end` 边界校验、问题线程累积/宽限关闭/最新版落库、FunASR 协议假实现、Groq 回退、四类配置、删除、成本限制、密钥加密、SSRF、复盘和备份恢复。
+- Tauri 前端 `npm test` 为 **`170 passed` / `0 failed`**，`npm run build` 通过（2026-09-14 实测）。
+- Rust `cargo test --locked` 为 **`72 passed` / `0 failed`**；fmt/check/严格 Clippy 均通过。
 
 未验证：
 
 - 真实 Windows 默认播放设备 WASAPI loopback、腾讯会议对方声音，以及静音/停止/切换在真实进程中的结果；待本轮真实设备验证结果补充。
+- `SPEECH_END_SILENT_WINDOWS`（约 1.6 秒）、`TRAILING_SILENCE_WINDOWS`（100 ms）与 `AI_QUESTION_THREAD_GRACE_SECONDS`（6 秒）三个阈值只有单元测试覆盖，缺少真实语速与停顿证据。
 - WASAPI 当前只选择默认 `eConsole` Render endpoint；腾讯会议若使用默认通信设备、独立声卡或蓝牙通话端点会漏采。
 - 取消后端与后端重启并发时，未 reserve 空洞水位不持久化的极端迟到包行为。
 - 真实系统声音到 FunASR/Groq/LLM、Google、代理的完整用户流程。
@@ -368,17 +377,17 @@ usage_buckets
 - 录音 codec 与后端媒体校验匹配。
 - 网络切换、权限拒绝、后台限制、背压和预算耗尽 UX。
 
-### 已确认的下一阶段实验（尚未实现）
+### 语音段与问题线程（已实现）
 
-当前方案把“2.5 秒有效音频片”“FunASR final”“完整面试问题”错误地绑定在同一层：每片都有自己的 ASR final 和独立 LLM 请求，但客户端静音门控又不向后端报告静音边界。下一阶段应把三者拆开：
+早期快照把"一个有效音频片""FunASR final""完整面试问题"错误地绑定在同一层。当前工作树已按下面的设计把三者拆开，本节保留为设计意图与验收口径：
 
-1. 客户端继续只采集系统播放声；静音音频不上传，但在连续静音达到阈值后发送轻量 `speech_end` 控制消息。
-2. 短静音只结束一个 ASR 语音片段并尽快产出草稿答案，不立刻关闭逻辑问题线程。
-3. 同一问题后续片段到达时，把累计文本作为新的问题修订再次发送给 LLM，以速度优先的草稿逐步提高准确率。
-4. 因为当前不会采集面试者麦克风，面试官问完后用户回答期间的长静音可以作为问题线程硬关闭信号；仍需为会议停顿、网络抖动和面试官思考留出宽限时间。
-5. 该设计必须保持多个 LLM 请求可并发、通过稳定线程/修订 ID 隔离输出，并避免旧修订完成后覆盖新修订。
+1. 客户端继续只采集系统播放声；静音音频不上传，但在连续静音达到 `SPEECH_END_SILENT_WINDOWS`（80 个 20 ms 窗，约 1.6 秒）后先冲刷携带 100 ms 尾部静音的短尾片，再发送轻量 `speech_end{source, through_chunk_seq}`。
+2. 短静音只结束一个 ASR 语音片段并尽快产出这一版答案，不立刻关闭逻辑问题线程。
+3. 同一问题后续片段到达时，把累计文本作为新的 `revision` 再次发送给 LLM，以速度优先的多版答案逐步提高准确率，所有版本都保留在同一张卡内。
+4. `speech_end` 之后进入 `AI_QUESTION_THREAD_GRACE_SECONDS`（默认 6 秒）宽限期，为会议停顿、网络抖动和面试官思考留出时间；宽限到期或会话结束 flush 才硬关闭线程。
+5. 多个 LLM revision 真实并发，通过稳定 `thread_id + revision + request_id` 隔离输出；线程选择 revision 最高的成功答案写入 `answers`，单版失败不取消其他版本。
 
-这些条目是下一提交的设计目标，不属于本快照已经实现的协议。
+三个时间/增长阈值仍没有真机调参证据。
 
 ### 多实例
 

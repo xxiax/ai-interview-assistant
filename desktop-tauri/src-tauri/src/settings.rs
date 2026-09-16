@@ -1,66 +1,20 @@
-//! 应用设置持久化:serverUrl 明文 JSON;Token 走 OS 凭据管理器(Windows Credential Manager)。
-//! 对应 desktop/src/main/settings/store.ts(Electron safeStorage → keyring)。
+//! 应用设置:后端地址写死为本机 loopback;Token 走 OS 凭据管理器(Windows Credential Manager)。
+//!
+//! 后端与本客户端始终运行在同一台机器上(上线后后端与 ASR 同机),因此服务器地址
+//! 不再是用户可配置项,也不再有 `settings.json`。唯一的本地设置是访问令牌。
 
-use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 const KEYRING_SERVICE: &str = "com.aiinterview.desktop";
 const KEYRING_USER: &str = "auth-token";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StoredSettings {
-    #[serde(rename = "serverUrl", default)]
-    pub server_url: String,
-}
+/// 后端固定地址。改端口只能改这里并重新构建;运行时不可配置。
+pub const SERVER_URL: &str = "http://127.0.0.1:8000";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
-    pub server_url: String,
     pub has_token: bool,
-}
-
-fn settings_path(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("settings.json")
-}
-
-fn atomic_write(path: &Path, data: &str) {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(mut f) = std::fs::File::create(&tmp) else {
-        return;
-    };
-    if f.write_all(data.as_bytes()).is_err() {
-        return;
-    }
-    drop(f);
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => {}
-        Err(_) => {
-            let _ = std::fs::remove_file(path);
-            if std::fs::rename(&tmp, path).is_err() {
-                let _ = std::fs::copy(&tmp, path).map(|_| ());
-                let _ = std::fs::remove_file(&tmp);
-            }
-        }
-    }
-}
-
-pub fn load_settings(app_data_dir: &Path) -> StoredSettings {
-    let Ok(raw) = std::fs::read_to_string(settings_path(app_data_dir)) else {
-        return Default::default();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-pub fn save_settings(app_data_dir: &Path, settings: &StoredSettings) {
-    if let Ok(body) = serde_json::to_string_pretty(settings) {
-        atomic_write(&settings_path(app_data_dir), &body);
-    }
 }
 
 // ---------- Token(OS 凭据管理器) ----------

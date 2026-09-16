@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
+# 悬浮提词窗的全局快捷键：窗口不接受焦点，只能靠系统级热键控制显隐/穿透/隐身。
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -24,6 +26,8 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 sha2 = "0.10"
 base64 = "0.22"
+# 笔试辅助：屏幕抓帧后要编成 PNG 再走 WS。纯 Rust 实现，不引入 C 依赖。
+png = "0.18.1"
 thiserror = "2"
 keyring = { version = "3", features = ["windows-native"] }
 
@@ -34,6 +38,11 @@ windows = { version = "0.61.3", features = [
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Variant",
+  # 笔试辅助截图：GDI BitBlt 抓虚拟屏 + GetSystemMetrics 取尺寸。
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  # 悬浮窗穿透时按住 Ctrl 临时交互：GetAsyncKeyState 轮询左 Ctrl。
+  "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [profile.release]

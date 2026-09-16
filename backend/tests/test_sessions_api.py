@@ -284,3 +284,66 @@ def test_delete_recording_session_is_rejected(client, auth_headers):
 
 def test_delete_missing_session_returns_404(client, auth_headers):
     assert client.delete("/api/sessions/00000000-0000-0000-0000-000000000000", headers=auth_headers).status_code == 404
+
+
+def test_session_context_defaults_to_null_and_round_trips(client, auth_headers):
+    session = _create(client, auth_headers, title="带岗位背景")
+    assert session["job_description"] is None
+    assert session["resume"] is None
+
+    saved = client.put(
+        f"/api/sessions/{session['id']}/context",
+        json={"job_description": "后端工程师，要求 Python 与分布式", "resume": "五年 Python"},
+        headers=auth_headers,
+    )
+    assert saved.status_code == 200
+    assert saved.json()["job_description"] == "后端工程师，要求 Python 与分布式"
+    assert saved.json()["resume"] == "五年 Python"
+
+    fetched = client.get(f"/api/sessions/{session['id']}", headers=auth_headers)
+    assert fetched.json()["job_description"] == "后端工程师，要求 Python 与分布式"
+
+    cleared = client.put(
+        f"/api/sessions/{session['id']}/context",
+        json={"job_description": "", "resume": ""},
+        headers=auth_headers,
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["job_description"] is None
+    assert cleared.json()["resume"] is None
+
+
+def test_session_context_rejects_oversized_payload(client, auth_headers):
+    session = _create(client, auth_headers, title="超长背景")
+    response = client.put(
+        f"/api/sessions/{session['id']}/context",
+        json={"job_description": "岗" * 8001, "resume": ""},
+        headers=auth_headers,
+    )
+    assert response.status_code == 422
+
+
+def test_session_context_on_missing_session_returns_404(client, auth_headers):
+    response = client.put(
+        "/api/sessions/00000000-0000-0000-0000-000000000000/context",
+        json={"job_description": "x", "resume": "y"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 404
+
+
+def test_session_context_can_be_written_while_recording(client, auth_headers):
+    session = _create(client, auth_headers, title="进行中补录背景")
+    client.post(
+        f"/api/sessions/{session['id']}/start",
+        json={"radio_mode": "pc"},
+        headers=auth_headers,
+    )
+    response = client.put(
+        f"/api/sessions/{session['id']}/context",
+        json={"job_description": "面试进行中补录", "resume": ""},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "recording"
+    assert response.json()["job_description"] == "面试进行中补录"

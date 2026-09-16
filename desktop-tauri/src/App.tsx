@@ -1,7 +1,16 @@
 import { useEffect } from 'react'
-import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
+import {
+  HashRouter,
+  Navigate,
+  Outlet,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate
+} from 'react-router-dom'
 import {
   History,
+  Layers,
   Mic,
   Settings,
   SignalHigh,
@@ -11,9 +20,11 @@ import {
 } from 'lucide-react'
 import { api } from './api/bridge'
 import { useLiveStore } from './stores/live'
+import { useOverlayControl } from './shared/overlay-control'
 import { Toaster } from './components/ui'
 import HomePage from './pages/HomePage'
 import LivePage from './pages/LivePage'
+import OverlayPage from './pages/OverlayPage'
 import SessionDetailPage from './pages/SessionDetailPage'
 import SettingsPage from './pages/SettingsPage'
 
@@ -134,21 +145,54 @@ function Sidebar() {
         ))}
       </nav>
 
-      {/* 底部:连接状态 */}
-      <div className="border-t border-stroke-subtle px-5 py-4">
-        <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-ink-faint">
-          服务连接
+      {/* 底部:悬浮窗开关 + 连接状态 */}
+      <div className="space-y-3 border-t border-stroke-subtle px-5 py-4">
+        <OverlayToggle />
+        <div>
+          <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-ink-faint">
+            服务连接
+          </div>
+          <ConnIndicator />
         </div>
-        <ConnIndicator />
       </div>
     </aside>
+  )
+}
+
+/**
+ * 侧边栏里的悬浮窗开关。
+ *
+ * 为什么放这里：悬浮窗以前只能从 LivePage 顶栏的弹窗里打开，也就是必须先建会话
+ * 再进面试页才能发现它。它是全程可用的功能（会话之前就可以摆好位置和透明度），
+ * 入口必须在常驻的侧边栏上。详细开关仍在面试页的弹窗里，这里只管显隐。
+ */
+function OverlayToggle() {
+  const { state, busy, actions } = useOverlayControl()
+  return (
+    <button
+      type="button"
+      onClick={() => void actions.toggle()}
+      disabled={busy}
+      aria-pressed={state.visible}
+      title="悬浮提词窗：盖在会议窗口之上显示答案，对系统录屏/共享隐身（Ctrl+Alt+O）"
+      className={`flex w-full cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+        state.visible
+          ? 'border-brand/40 bg-brand/12 text-brand'
+          : 'border-stroke bg-surface text-ink-secondary hover:border-brand/35 hover:text-ink-primary'
+      }`}
+    >
+      <Layers size={15} strokeWidth={state.visible ? 2.2 : 1.8} />
+      <span className="flex-1 text-left font-medium">悬浮提词窗</span>
+      <kbd className="tnum shrink-0 rounded bg-white/10 px-1.5 py-px text-[9px] text-ink-faint">
+        Ctrl+Alt+O
+      </kbd>
+    </button>
   )
 }
 
 // ---------- 布局 ----------
 
 function AppLayout() {
-  const location = useLocation()
   const toasts = useLiveStore((s) => s.toasts)
   const dismissToast = useLiveStore((s) => s.dismissToast)
 
@@ -187,19 +231,30 @@ function AppLayout() {
     return () => window.removeEventListener('app-toast', onToast)
   }, [])
 
-  // /history 路由改为首页内列表(保留路径兼容旧跳转)
+  // Rust 侧提示(悬浮窗热键失败等)转成同一个 CustomEvent,复用上面那条出口
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void api.events
+      .onToast((payload) => {
+        if (disposed) return
+        window.dispatchEvent(new CustomEvent('app-toast', { detail: payload }))
+      })
+      .then((fn) => {
+        if (disposed) fn()
+        else unlisten = fn
+      })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
   return (
     <div className="flex h-full">
       <Sidebar />
       <main className="min-w-0 flex-1 overflow-hidden bg-surface">
-        <Routes location={location}>
-          <Route path="/" element={<HomePage mode="active" />} />
-          <Route path="/live/:sessionId" element={<LivePage />} />
-          <Route path="/history" element={<HomePage mode="history" />} />
-          <Route path="/session/:sessionId" element={<SessionDetailPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <Outlet />
       </main>
       <Toaster toasts={toasts} onDismiss={dismissToast} />
     </div>
@@ -209,7 +264,23 @@ function AppLayout() {
 export default function App() {
   return (
     <HashRouter>
-      <AppLayout />
+      <Routes>
+        {/*
+          悬浮提词窗走独立顶层路由，不套 AppLayout：它不能有侧边栏和 main 容器，
+          也不该复用 AppLayout 里的全局订阅（那份订阅驱动的是主窗口的 Zustand
+          store，悬浮窗有自己的 reducer）。
+        */}
+        <Route path="/overlay" element={<OverlayPage />} />
+        {/* /history 保留路径兼容旧跳转，实际渲染首页内列表 */}
+        <Route element={<AppLayout />}>
+          <Route path="/" element={<HomePage mode="active" />} />
+          <Route path="/live/:sessionId" element={<LivePage />} />
+          <Route path="/history" element={<HomePage mode="history" />} />
+          <Route path="/session/:sessionId" element={<SessionDetailPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
     </HashRouter>
   )
 }

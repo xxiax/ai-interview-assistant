@@ -8,7 +8,7 @@ interface SettingsState {
   checking: boolean
   lastCheck: ConnectivityResult | null
   load: () => Promise<void>
-  save: (input: { serverUrl: string; token?: string }) => Promise<void>
+  save: (input: { token?: string }) => Promise<void>
   check: () => Promise<ConnectivityResult>
 }
 

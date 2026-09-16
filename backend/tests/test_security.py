@@ -127,6 +127,11 @@ def test_runtime_security_config_rejects_invalid_limits(monkeypatch):
     with pytest.raises(RuntimeError, match="通配符"):
         security.validate_security_config()
 
+    monkeypatch.setenv("AI_ALLOWED_ORIGINS", "")
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.1")
+    with pytest.raises(RuntimeError, match="AI_QUESTION_THREAD_GRACE_SECONDS"):
+        security.validate_security_config()
+
 
 def test_rest_rate_limit_is_applied_after_auth(client, auth_headers, monkeypatch):
     monkeypatch.setenv("AI_REST_RATE_LIMIT_PER_MINUTE", "1")

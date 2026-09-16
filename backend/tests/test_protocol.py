@@ -58,6 +58,33 @@ def test_cancel_audio_source_message_is_strict_and_versioned():
     assert message.reason == "capture_stopped"
 
 
+def test_speech_end_message_carries_strict_sequence_boundary():
+    message = parse_client_message(
+        {
+            "v": 1,
+            "type": "speech_end",
+            "source": "pc",
+            "through_chunk_seq": 12,
+        }
+    )
+
+    assert message.source == "pc"
+    assert message.through_chunk_seq == 12
+
+
+@pytest.mark.parametrize("through_chunk_seq", [-1, CHUNK_SEQ_MAX + 1, "0", True])
+def test_speech_end_message_rejects_invalid_boundary(through_chunk_seq):
+    with pytest.raises(ValueError, match="字段"):
+        parse_client_message(
+            {
+                "v": 1,
+                "type": "speech_end",
+                "source": "pc",
+                "through_chunk_seq": through_chunk_seq,
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -167,3 +194,42 @@ def test_event_message_strips_envelope_fields_from_payload():
     assert message["chunk_id"] == "abc"
     assert message["status"] == "done"
     assert "wrong" not in str(message)
+
+
+def test_solve_screenshot_message_defaults_and_strictness():
+    message = parse_client_message(
+        {"v": 1, "type": "solve_screenshot", "image": "aGk="}
+    )
+    assert message.mime == "image/png"
+    assert message.note == ""
+
+    with_note = parse_client_message(
+        {
+            "v": 1,
+            "type": "solve_screenshot",
+            "image": "aGk=",
+            "mime": "image/jpeg",
+            "note": "只解第二题",
+        }
+    )
+    assert with_note.mime == "image/jpeg"
+    assert with_note.note == "只解第二题"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"image": ""},
+        # 只放行 PNG/JPEG：其他容器多模态网关支持面参差不齐。
+        {"mime": "image/gif"},
+        {"mime": "application/pdf"},
+        {"note": "x" * 501},
+        {"v": 2},
+        {"extra": True},
+    ],
+)
+def test_solve_screenshot_message_rejects_invalid_fields(overrides):
+    payload = {"v": 1, "type": "solve_screenshot", "image": "aGk="}
+    payload.update(overrides)
+    with pytest.raises(ValueError, match="字段"):
+        parse_client_message(payload)
