@@ -21,7 +21,6 @@
   - `lib.rs`：Tauri 命令注册、单活动会话生命周期、前端事件广播、悬浮窗权威状态（`OverlayStateHandle`）与全局热键注册。
 - **React 前端**（`src/`）负责界面、状态和系统声音采集编排：
   - `api/bridge.ts`：Tauri `invoke` / `listen` 桥接。
-  - `audio/` 与 `public/worklets/`：未被 LivePage 导入的历史麦克风采集模块和对应测试；当前生产实时流程不创建它们，系统声音由 Rust WASAPI loopback 采集并执行 20 ms RMS 静音门控。
   - `stores/`：设置、会话和实时事件状态；`stores/live.ts` 按 `request_id` 保存并发 revision，再由 `thread_id` 聚合为一张问题卡。catch-up swap 保留旧答案，直到新版内容长度追上后再接管；落库答案不清流式分段。
   - `pages/LivePage.tsx`：启动系统声音采集、停止顺序、音频故障熔断、Tauri 字符串错误归一化和收音模式 UI；用 `shared/answer-threads.ts` 的 `buildAnswerFeed` 把流式分段聚合成「一个问题一张卡」。
   - `shared/answer-threads.ts`：纯聚合函数，把 `StreamingAnswer[]` 按 `thread_id ?? request_id` 分组为卡片、按 `revision` 排序、卡片标题取最长的累计问题，每一段保留该 revision 的问题文本（`AnswerVersion.question`），并把已落库的 `answer` 挂到对应卡片上（同时从历史列表剔除，避免重复渲染）；`pickDisplayVersion` 从卡内多段中挑展示版：未被取代里答案最长的（同长取 revision 高者），全部被取代时退回 revision 最高的一段。
@@ -110,12 +109,11 @@ REST 与 WebSocket 只从 Rust 侧发起；前端不直接连接后端。
 
 停止采集、切到 `mobile`、离开实时页或连接中断时，LivePage 按以下顺序收敛本机音频：
 
-1. 递增 capture epoch，使旧 AudioWorklet 回调立即失效。
+1. 递增 capture epoch；新采集已接管时，旧的收尾步骤不再执行。
 2. 停止 WASAPI 线程并等待其退出，避免停止边界后又落入一个完整系统音频片。
-3. 等待已经发起的 `audio_chunk` invoke 完成。
-4. 关闭 Rust capture gate。门关闭后迟到的 `AddChunk` 会在分配序号和落盘前被拒绝。
-5. 冻结本地 outbox，并持久化 `cancel_audio_source` 意图：`source`、`through_chunk_seq`、`reason`。
-6. 后端取消该来源水位以内的 `queued`、可重试 `failed` 和当前 ASR 任务，写入并广播 `chunk_ack: cancelled`；更高序号的新一轮采集仍可继续。
+3. 关闭 Rust capture gate。门关闭后迟到的 `AddChunk` 会在分配序号和落盘前被拒绝。
+4. 冻结本地 outbox，并持久化 `cancel_audio_source` 意图：`source`、`through_chunk_seq`、`reason`。
+5. 后端取消该来源水位以内的 `queued`、可重试 `failed` 和当前 ASR 任务，写入并广播 `chunk_ack: cancelled`；更高序号的新一轮采集仍可继续。
 
 协议允许的取消原因是 `capture_stopped` 和 `source_disabled`。页面退出或连接被替换的内部 `capture_interrupted` 会在发送到后端前规范化为 `capture_stopped`。
 

@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict'
 
-// 1) 裸说明符 ./wav-meta → ./wav-meta.ts(recorder.ts 内部相对导入)
+// 1) TS 源码里的无扩展名相对导入(如 ./foo)补成 ./foo.ts,
 //    通过自定义模块解析 hook 重写。
 export async function registerTsExtensionResolve() {
   const { register } = await import('node:module')

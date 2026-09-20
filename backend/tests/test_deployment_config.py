@@ -47,3 +47,22 @@ def test_windows_requirements_resolve():
     )
     # universal 编译的哈希应包含 Windows 轮子（以 colorama win32 标记为代表）
     assert "colorama==0.4.6 ; sys_platform == 'win32'" in lock
+
+
+def test_compose_schedules_daily_backup_by_default():
+    """B1：备份不能只有 --profile tools 手动容器；默认 up -d 就要有调度。
+
+    backup-scheduler 复用后端镜像跑 shell 循环（不引入新镜像），间隔
+    AI_BACKUP_INTERVAL_SECONDS 默认 86400（每日），保留份数沿用 AI_BACKUP_KEEP。
+    """
+    compose = (BACKEND_DIR / "compose.prod.yml").read_text(encoding="utf-8")
+    scheduler = compose.split("backup-scheduler:")[1]
+    assert "scripts/backup_sqlite.py" in scheduler, "调度器必须跑同一备份脚本"
+    assert "dockerfile: Dockerfile" in scheduler, "必须复用后端镜像构建"
+    assert "AI_BACKUP_INTERVAL_SECONDS" in scheduler and "86400" in scheduler
+    assert "${AI_BACKUP_KEEP:-14}" in scheduler
+    # 不挂在 tools profile：默认启动即生效，手动容器保持原样
+    assert "profiles:" not in scheduler
+    assert compose.count("scripts/backup_sqlite.py") == 2, (
+        "手动 backup 容器必须原样保留"
+    )

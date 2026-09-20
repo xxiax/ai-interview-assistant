@@ -30,13 +30,6 @@ export interface GlobalPrompt {
   prompt: string
 }
 
-export interface AudioChunkMeta {
-  chunkId: string
-  chunkSeq: number
-  capturedAt: string
-  durationMs: number
-}
-
 export const api = {
   settings: {
     get: () => invoke<AppSettings>('settings_get'),
@@ -81,15 +74,7 @@ export const api = {
   },
   audio: {
     startSystem: () => invoke<boolean>('system_audio_start'),
-    stopSystem: () => invoke<void>('system_audio_stop'),
-    chunk: (meta: AudioChunkMeta, data: ArrayBuffer) =>
-      invoke<boolean>('audio_chunk', {
-        chunkId: meta.chunkId,
-        chunkSeq: meta.chunkSeq,
-        capturedAt: meta.capturedAt,
-        durationMs: meta.durationMs,
-        data: Array.from(new Uint8Array(data))
-      })
+    stopSystem: () => invoke<void>('system_audio_stop')
   },
   outbox: {
     snapshot: () => invoke<OutboxStats>('outbox_snapshot'),

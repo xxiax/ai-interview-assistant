@@ -23,7 +23,7 @@ use base64::Engine as _;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 
-use engine::{Engine, EngineCommand, EngineEvent, NewChunk};
+use engine::{Engine, EngineEvent};
 use overlay::{OverlayLayout, OverlayState};
 use settings::AppSettings;
 use system_audio::SystemAudioState;
@@ -676,34 +676,6 @@ async fn live_end_session(app: AppHandle, state: State<'_, EngineState>) -> Resu
         .map_err(rest_err)
 }
 
-/// 渲染进程采集的分片:落盘 → outbox → 泵(严格按序发送)。
-#[tauri::command]
-async fn audio_chunk(
-    state: State<'_, EngineState>,
-    chunk_id: String,
-    chunk_seq: i64,
-    captured_at: String,
-    duration_ms: i64,
-    data: Vec<u8>, // 前端传 number[](WAV 字节)
-) -> Result<bool, String> {
-    let guard = state.engine.lock().await;
-    let Some(engine) = guard.as_ref() else {
-        return Ok(false);
-    };
-    Ok(engine
-        .cmd_tx
-        .send(EngineCommand::AddChunk(Box::new(NewChunk {
-            chunk_id,
-            chunk_seq,
-            captured_at,
-            duration_ms,
-            codec: "wav_pcm_s16le".into(),
-            source: "pc".into(),
-            data,
-        })))
-        .is_ok())
-}
-
 /// 启动默认 Windows 播放设备的 WASAPI loopback 采集。
 #[tauri::command]
 async fn system_audio_start(
@@ -1337,7 +1309,6 @@ pub fn run() {
             live_regenerate,
             live_solve_screenshot,
             live_end_session,
-            audio_chunk,
             system_audio_start,
             system_audio_stop,
             outbox_set_capture_active,

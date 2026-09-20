@@ -134,6 +134,39 @@ services:
       - no-new-privileges:true
     network_mode: none
 
+  # 每日备份调度：同一后端镜像内跑 shell 循环，不引入新镜像/新工具。
+  # 启动即先备份一次，之后每 AI_BACKUP_INTERVAL_SECONDS（默认 86400，即每日）
+  # 执行一次；单次失败不退出循环，等下一个周期重试。
+  backup-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          python scripts/backup_sqlite.py --source /data/interview.db --destination-dir /backups --keep ${AI_BACKUP_KEEP:-14} || true
+          sleep ${AI_BACKUP_INTERVAL_SECONDS:-86400}
+        done
+    environment:
+      AI_DB_PATH: /data/interview.db
+    volumes:
+      - app_data:/data:ro
+      - backups:/backups
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=10001,gid=10001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+
 volumes:
   app_data:
   backups:

@@ -16,7 +16,7 @@
 | 文件 | 当前用途 |
 |---|---|
 | `Dockerfile` | Python 3.12.11、非 root UID 10001、ffmpeg/ffprobe、从生产锁文件安装依赖、单 worker |
-| `compose.prod.yml` | API、Caddy、持久卷、私有网络、健康检查和一次性备份工具 |
+| `compose.prod.yml` | API、Caddy、持久卷、私有网络、健康检查、每日备份调度和手动备份工具 |
 | `Caddyfile` | 域名入口、自动 TLS 和反向代理 |
 | `.env.production.example` | 生产变量模板，不包含真实秘密 |
 | `requirements.lock` | 当前生产依赖及哈希，已包含 `python-socks`；仍需在真实镜像构建中复核安装结果 |
@@ -123,7 +123,22 @@ curl --fail https://api.example.com/health/ready
 docker compose --env-file /secure/path/ai-interview.env -f compose.prod.yml --profile tools run --rm backup
 ~~~
 
-Compose 默认保留 14 份，可通过 `AI_BACKUP_KEEP` 调整。当前 backup 服务把备份写到 Docker `backups` 卷；正式上线前还需把备份同步到故障域之外，并定期验证可恢复性。
+Compose 默认保留 14 份，可通过 `AI_BACKUP_KEEP` 调整。
+
+### 每日调度（backup-scheduler）
+
+`compose.prod.yml` 包含 `backup-scheduler` 服务：与 API 同一镜像，容器内跑 `sh` 循环（不引入新镜像或 cron 依赖）。启动后先立即备份一次，之后每 `AI_BACKUP_INTERVAL_SECONDS`（默认 `86400`，即每日）执行一次 `scripts/backup_sqlite.py`；单次失败（如数据库尚未创建）不会中断循环，等下一个周期重试。默认 `docker compose ... up -d` 就会启动它，不需要 `--profile tools`；上面的手动容器仍保留，用于临时补一次备份。
+
+### 异机/off-site
+
+调度器与手动容器都把备份写到 Docker `backups` 命名卷，默认与数据卷在同一台宿主机上，不满足"备份在故障域之外"。要满足该要求，应把一个不在本机磁盘上的路径（例如 NFS/网络存储挂载点）bind mount 到两个备份服务的 `/backups`，替换命名卷：
+
+~~~yaml
+volumes:
+  - /mnt/nas/interview-backups:/backups
+~~~
+
+诚实边界：Compose 只负责把备份文件写到挂载点。该路径是否真的异机/异地、复制是否成功、备份是否可恢复，属于运维责任——编排不做异地复制校验，也没有备份失败告警。仍需按下方"恢复"一节定期演练，并自行安排备份监控。
 
 本地直接调用脚本的形式：
 
