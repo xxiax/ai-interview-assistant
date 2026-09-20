@@ -96,6 +96,28 @@ export function parseBlocks(source: string): MarkdownBlock[] {
   return blocks
 }
 
+/**
+ * 块级解析缓存(有界)。H2:实时页每个 token 帧都会让派生层重建答案卡,
+ * 未变化的 source 反复重进 parseBlocks 是 O(n²) 的主要来源;这里按 source
+ * 字符串缓存解析结果(同 source 返回同一数组),淘汰按插入序最旧条目,
+ * 长会话内存有上界。
+ */
+const BLOCKS_CACHE_MAX = 128
+const blocksCache = new Map<string, MarkdownBlock[]>()
+
+/** parseBlocks 的缓存版本:Markdown 渲染组件专用。 */
+export function parseBlocksCached(source: string): MarkdownBlock[] {
+  const cached = blocksCache.get(source)
+  if (cached) return cached
+  const blocks = parseBlocks(source)
+  if (blocksCache.size >= BLOCKS_CACHE_MAX) {
+    const oldest = blocksCache.keys().next()
+    if (!oldest.done) blocksCache.delete(oldest.value)
+  }
+  blocksCache.set(source, blocks)
+  return blocks
+}
+
 /** 行内解析:单行文本 → token 序列(不含换行)。 */
 export function parseInline(line: string): InlineToken[] {
   const tokens: InlineToken[] = []

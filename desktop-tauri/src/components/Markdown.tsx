@@ -10,7 +10,7 @@
  */
 import { Fragment, useState, type ReactNode } from 'react'
 import { Check, Copy } from 'lucide-react'
-import { parseBlocks, parseInline, type MarkdownBlock } from '../shared/markdown'
+import { parseBlocksCached, parseInline, type MarkdownBlock } from '../shared/markdown'
 import { highlight, resolveLang, type HighlightKind } from '../shared/highlight'
 
 // 行内 code / 围栏 code 统一样式 token,与暗色主题一致。
@@ -183,7 +183,8 @@ export default function Markdown({
   source: string
   variant?: 'compact' | 'relaxed' | 'answer'
 }) {
-  const blocks = parseBlocks(source)
+  // H2:同 source 命中模块级缓存,流式重渲染不再重复整篇解析。
+  const blocks = parseBlocksCached(source)
   if (blocks.length === 0) return null
   return (
     <div

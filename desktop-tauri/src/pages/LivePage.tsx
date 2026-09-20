@@ -188,22 +188,62 @@ function TopBar(props: {
   )
 }
 
+// ---------- 答案栏 ----------
+//
+// H2:answer_stream 的 token 帧只改 streamingAnswers/pendingQuestions,
+// 这两片订阅下沉到本组件——token 帧只重渲染答案栏,LivePage 顶栏/转写栏/
+// 底栏全部跳过。卡内再靠 React.memo(AnswerFeed)与 Markdown 解析缓存
+// 把重渲染继续压缩到正在流式的那一张卡。
+function AnswerPanel() {
+  const streamingAnswers = useLiveStore((s) => s.streamingAnswers)
+  const answers = useLiveStore((s) => s.answers)
+  const pending = useLiveStore((s) => s.pendingQuestions)
+  // 一个问题一张卡：后端对累计 partial 的有效 revision 并发请求 LLM；
+  // 展示层保留各版状态，但同一时刻只渲染 catch-up swap 选中的一版。
+  // 已落库答案挂到对应卡片上，不再单独渲染重复卡。
+  const { historyAnswers, threads } = useMemo(
+    () => buildAnswerFeed(Object.values(streamingAnswers), answers),
+    [streamingAnswers, answers]
+  )
+  return (
+    <section className="flex min-w-0 flex-1 flex-col border-l border-stroke" aria-label="AI 答案">
+      <div className="flex items-center gap-2 border-b border-brand/20 bg-brand/[0.045] px-6 py-2.5">
+        <span className="h-1.5 w-1.5 rounded-full bg-good shadow-[0_0_8px_rgba(34,197,94,0.55)]" />
+        <span className="text-[13px] font-semibold text-ink-primary">AI 回答建议</span>
+        <span className="tnum ml-auto text-[11px] text-ink-faint">
+          {historyAnswers.length + threads.length + pending.length} 条
+        </span>
+      </div>
+      <div className="min-h-0 flex-1 bg-[radial-gradient(circle_at_top_right,rgba(79,124,255,0.055),transparent_38%)]">
+        <AnswerFeed answers={historyAnswers} threads={threads} pending={pending} />
+      </div>
+    </section>
+  )
+}
+
 // ---------- 主页面 ----------
 
 export default function LivePage() {
   const { sessionId } = useParams<{ sessionId: string }>()
   const navigate = useNavigate()
-  const live = useLiveStore()
+  // H2:按片订阅(全部返回原始值或 store 内稳定引用),token 帧改不到的
+  // 片不再触发本组件重渲染;streamingAnswers/pendingQuestions 的订阅在
+  // AnswerPanel 里,LivePage 本体对 token 帧零重渲染。
+  const phase = useLiveStore((s) => s.phase)
+  const sessionStatus = useLiveStore((s) => s.sessionStatus)
+  const radioMode = useLiveStore((s) => s.radioMode)
+  const synced = useLiveStore((s) => s.synced)
+  const queued = useLiveStore((s) => s.outbox?.queued ?? 0)
+  const note = useLiveStore((s) => s.note)
+  const captureStateOn = useLiveStore((s) => s.captureOn)
+  const seqWatermarkReady = useLiveStore((s) => s.seqWatermarkReady)
+  const audioFault = useLiveStore((s) => s.audioFault)
+  const systemAudioFault = useLiveStore((s) => s.systemAudioFault)
+  const transcripts = useLiveStore((s) => s.transcripts)
+  const partialTranscript = useLiveStore((s) => s.partialTranscript)
   const transcriptDisplayCount = useMemo(
-    () => groupFinalTranscripts(live.transcripts).length,
-    [live.transcripts]
-  )
-  // 一个问题一张卡：后端对累计 partial 的有效 revision 并发请求 LLM；
-  // 展示层保留各版状态，但同一时刻只渲染 catch-up swap 选中的一版。
-  // 已落库答案挂到对应卡片上，不再单独渲染重复卡。
-  const { historyAnswers, threads } = useMemo(
-    () => buildAnswerFeed(Object.values(live.streamingAnswers), live.answers),
-    [live.streamingAnswers, live.answers]
+    () => groupFinalTranscripts(transcripts).length,
+    [transcripts]
   )
   const [sessionTitle, setSessionTitle] = useState('')
   // 会话快照：标题之外还带 job_description / resume，供答题背景弹窗回填。
@@ -345,7 +385,7 @@ export default function LivePage() {
 
   const handleModeChange = async (mode: RadioMode) => {
     if (modeChangingRef.current || mode === useLiveStore.getState().radioMode) return
-    if (live.phase !== 'ready') {
+    if (phase !== 'ready') {
       showToast('warning', '连接未就绪，稍等片刻再切换收音模式')
       return
     }
@@ -387,7 +427,7 @@ export default function LivePage() {
   const handleManualQuestion = async () => {
     const question = manualQuestion.trim()
     if (!question || manualSending) return
-    if (live.phase !== 'ready' || live.sessionStatus !== 'recording') {
+    if (phase !== 'ready' || sessionStatus !== 'recording') {
       showToast('warning', '面试连接未就绪，暂时无法向 AI 提问')
       return
     }
@@ -414,7 +454,7 @@ export default function LivePage() {
    */
   const handleSolveScreenshot = async () => {
     if (solving) return
-    if (live.phase !== 'ready' || live.sessionStatus !== 'recording') {
+    if (phase !== 'ready' || sessionStatus !== 'recording') {
       showToast('warning', '面试连接未就绪，暂时无法解题')
       return
     }
@@ -493,60 +533,60 @@ export default function LivePage() {
 
   // 模式也可能由重放事件或另一端修改；任何 mobile 权威状态都立即停本机采集。
   useEffect(() => {
-    if (live.radioMode === 'mobile' && systemAudioOnRef.current) {
+    if (radioMode === 'mobile' && systemAudioOnRef.current) {
       void stopCapture('source_disabled')
     }
-  }, [live.radioMode, stopCapture])
+  }, [radioMode, stopCapture])
 
   // 会话状态与连接失步时停止采集,避免分片被逐个标错(session_not_recording 级联)
   useEffect(() => {
     if (
       systemAudioOnRef.current &&
-      (live.phase === 'closed' || live.phase === 'reconnecting')
+      (phase === 'closed' || phase === 'reconnecting')
     ) {
       void stopCapture()
       showToast('warning', '连接中断，已暂停采集；恢复连接后请重新开始')
     }
-  }, [live.phase, stopCapture])
+  }, [phase, stopCapture])
 
   // 音频处理上游不可用时立即熔断本次采集。仅停止录音器不够；stopCapture 还会
   // 取消 Rust outbox 与服务端已排队分片，避免旧任务继续报错。
   useEffect(() => {
-    if (live.audioFault && systemAudioOnRef.current) {
+    if (audioFault && systemAudioOnRef.current) {
       void stopCapture()
     }
-  }, [live.audioFault, stopCapture])
+  }, [audioFault, stopCapture])
 
   useEffect(() => {
-    if (!live.systemAudioFault || !systemAudioOnRef.current) return
+    if (!systemAudioFault || !systemAudioOnRef.current) return
     systemAudioOnRef.current = false
     setSystemAudioOn(false)
     void stopCapture()
-  }, [live.systemAudioFault, stopCapture])
+  }, [systemAudioFault, stopCapture])
 
   // 会话 ended 后自动跳详情
   useEffect(() => {
-    if (live.sessionStatus === 'ended' && sessionId && startedRef.current) {
+    if (sessionStatus === 'ended' && sessionId && startedRef.current) {
       const t = setTimeout(() => navigate(`/session/${sessionId}`, { replace: true }), 800)
       return () => clearTimeout(t)
     }
-  }, [live.sessionStatus, sessionId, navigate])
+  }, [sessionStatus, sessionId, navigate])
 
-  const connecting = live.phase === 'idle' || live.phase === 'connecting'
+  const connecting = phase === 'idle' || phase === 'connecting'
   // 按钮状态跟着事件走(captureState),不能只看本地 systemAudioOn:悬浮窗
   // Ctrl+Alt+Z 开的采集也要让这个按钮如实变成"停止系统采集"。
-  const captureOn = systemAudioOn || live.captureOn
+  const captureOn = systemAudioOn || captureStateOn
   const contextReady = !!(session?.job_description?.trim() || session?.resume?.trim())
 
   return (
     <div className="flex h-full flex-col">
       <TopBar
         title={sessionTitle || '面试进行中'}
-        phase={live.phase}
-        synced={live.synced}
-        recording={live.sessionStatus === 'recording'}
-        radioMode={live.radioMode}
-        queued={live.outbox?.queued ?? 0}
+        phase={phase}
+        synced={synced}
+        recording={sessionStatus === 'recording'}
+        radioMode={radioMode}
+        queued={queued}
         contextReady={contextReady}
         overlayVisible={overlayState.visible}
         onModeChange={handleModeChange}
@@ -558,9 +598,9 @@ export default function LivePage() {
       />
 
       {/* 断线提示条 */}
-      {live.phase === 'closed' && live.note && (
+      {phase === 'closed' && note && (
         <div className="border-b border-bad/25 bg-bad/10 px-5 py-2 text-xs text-bad">
-          {live.note}
+          {note}
         </div>
       )}
 
@@ -588,8 +628,8 @@ export default function LivePage() {
               <CenterSpin hint="连接服务…" />
             ) : (
               <TranscriptFeed
-                transcripts={live.transcripts}
-                partialTranscript={live.partialTranscript}
+                transcripts={transcripts}
+                partialTranscript={partialTranscript}
               />
             )}
           </div>
@@ -618,7 +658,7 @@ export default function LivePage() {
               <button
                 type="button"
                 onClick={() => void handleSolveScreenshot()}
-                disabled={solving || live.phase !== 'ready' || live.sessionStatus !== 'recording'}
+                disabled={solving || phase !== 'ready' || sessionStatus !== 'recording'}
                 aria-label="截图解题"
                 title="截图解题（Ctrl+Alt+Q）；输入框内容会作为备注一起发送"
                 className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-stroke-subtle bg-surface text-ink-secondary shadow-sm transition-colors hover:bg-surface-hover hover:text-ink-primary disabled:cursor-not-allowed disabled:text-ink-faint disabled:opacity-100"
@@ -634,8 +674,8 @@ export default function LivePage() {
                 disabled={
                   !manualQuestion.trim() ||
                   manualSending ||
-                  live.phase !== 'ready' ||
-                  live.sessionStatus !== 'recording'
+                  phase !== 'ready' ||
+                  sessionStatus !== 'recording'
                 }
                 aria-label="发送问题"
                 title="Enter 发送，Shift+Enter 换行"
@@ -651,18 +691,8 @@ export default function LivePage() {
           </form>
         </section>
 
-        <section className="flex min-w-0 flex-1 flex-col border-l border-stroke" aria-label="AI 答案">
-          <div className="flex items-center gap-2 border-b border-brand/20 bg-brand/[0.045] px-6 py-2.5">
-            <span className="h-1.5 w-1.5 rounded-full bg-good shadow-[0_0_8px_rgba(34,197,94,0.55)]" />
-            <span className="text-[13px] font-semibold text-ink-primary">AI 回答建议</span>
-            <span className="tnum ml-auto text-[11px] text-ink-faint">
-              {historyAnswers.length + threads.length + live.pendingQuestions.length} 条
-            </span>
-          </div>
-          <div className="min-h-0 flex-1 bg-[radial-gradient(circle_at_top_right,rgba(79,124,255,0.055),transparent_38%)]">
-            <AnswerFeed answers={historyAnswers} threads={threads} pending={live.pendingQuestions} />
-          </div>
-        </section>
+        {/* 答案栏自订阅 streamingAnswers/answers/pendingQuestions(H2 见 AnswerPanel) */}
+        <AnswerPanel />
       </div>
 
       {/* 底部:电脑端系统声音采集控制 */}
@@ -671,10 +701,10 @@ export default function LivePage() {
           <button
             onClick={() => void toggleCapture()}
             disabled={
-              live.sessionStatus !== 'recording' ||
-              live.phase !== 'ready' ||
-              !live.seqWatermarkReady ||
-              live.radioMode === 'mobile' ||
+              sessionStatus !== 'recording' ||
+              phase !== 'ready' ||
+              !seqWatermarkReady ||
+              radioMode === 'mobile' ||
               captureStarting
             }
             aria-pressed={captureOn}
@@ -693,11 +723,11 @@ export default function LivePage() {
             )}
             {captureStarting ? '启动中…' : captureOn ? '停止系统采集' : '开始系统采集'}
           </button>
-          {!captureOn && live.sessionStatus === 'recording' && (
+          {!captureOn && sessionStatus === 'recording' && (
             <span className="text-xs text-ink-faint">
-              {live.radioMode === 'mobile'
+              {radioMode === 'mobile'
                 ? '手机收音模式下，本机采集保持关闭'
-                : live.seqWatermarkReady
+                : seqWatermarkReady
                    ? '开始后仅采集电脑播放声音（含腾讯会议对方声音）'
                   : '正在初始化分片序号…'}
             </span>
@@ -724,7 +754,7 @@ export default function LivePage() {
             </Button>
             <Button
               variant="primary"
-              disabled={live.phase !== 'ready'}
+              disabled={phase !== 'ready'}
               onClick={() => void handleStart()}
             >
               开始
@@ -751,7 +781,7 @@ export default function LivePage() {
             </button>
           ))}
         </div>
-        {live.phase !== 'ready' && (
+        {phase !== 'ready' && (
           <div className="mt-3 flex items-center gap-2 text-xs text-ink-faint">
             <Loader2 size={12} className="animate-spin" />
             等待连接就绪…

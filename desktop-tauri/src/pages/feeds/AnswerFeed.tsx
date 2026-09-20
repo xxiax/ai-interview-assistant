@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import dayjs from 'dayjs'
 import { Globe, Loader2, RefreshCw, Sparkles, TriangleAlert } from 'lucide-react'
 import type { Answer } from '../../shared/types'
@@ -24,6 +24,147 @@ function SourceBadge({ searchEnhanced }: { searchEnhanced: boolean }) {
     </span>
   )
 }
+
+// ---------- H2:答案卡 memo 化 ----------
+//
+// token 帧到达时派生层(buildAnswerFeed)会整体重建 threads,但未变化卡片的
+// 数据值不变。React.memo 让这些卡片跳过重渲染——正在流式的那张卡之外的卡,
+// 连 Markdown 解析缓存都不会被击穿。
+
+/** 历史答案卡:answer 来自 store,条目引用稳定,默认浅比较即生效。 */
+const HistoryAnswerCard = memo(function HistoryAnswerCard({
+  answer,
+  cooling,
+  onRegenerate
+}: {
+  answer: Answer
+  cooling: boolean
+  onRegenerate: (answer: Answer) => void
+}) {
+  return (
+    <article className="animate-slide-up rounded-xl border border-stroke bg-surface-card p-5 shadow-card">
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <div className="select-text text-sm font-semibold leading-6 text-ink-primary">{answer.question}</div>
+        <SourceBadge searchEnhanced={answer.source === 'search+llm'} />
+      </div>
+      <Markdown source={answer.answer} variant="answer" />
+      <div className="mt-3 flex items-center justify-between">
+        <span className="tnum text-[11px] text-ink-faint">
+          {dayjs(answer.created_at).format('HH:mm:ss')}
+        </span>
+        <Button
+          variant="ghost"
+          icon={<RefreshCw size={12} />}
+          loading={cooling}
+          disabled={cooling}
+          onClick={() => onRegenerate(answer)}
+          className="!px-2 !py-1 !text-xs"
+        >
+          重新生成
+        </Button>
+      </div>
+    </article>
+  )
+})
+
+/**
+ * 线程卡 props 的值比较:thread 对象每次派生都是新引用,默认浅比较对它无效。
+ * 卡片实际只渲染标题/来源/展示版(pickDisplayVersion)内容,按这些字段比较;
+ * 全部一致则跳过重渲染。
+ */
+function threadCardPropsEqual(
+  prev: ThreadCardProps,
+  next: ThreadCardProps
+): boolean {
+  if (prev.cooling !== next.cooling || prev.onRegenerate !== next.onRegenerate) return false
+  const a = prev.thread
+  const b = next.thread
+  if (a === b) return true
+  if (a.key !== b.key || a.question !== b.question || a.source !== b.source) return false
+  if (a.persisted?.id !== b.persisted?.id) return false
+  const va = pickDisplayVersion(a.versions)
+  const vb = pickDisplayVersion(b.versions)
+  if (!va || !vb) return va === vb
+  return (
+    va.request_id === vb.request_id &&
+    va.revision === vb.revision &&
+    va.answer === vb.answer &&
+    va.done === vb.done &&
+    va.failed === vb.failed
+  )
+}
+
+interface ThreadCardProps {
+  thread: AnswerThread
+  cooling: boolean
+  onRegenerate: (thread: AnswerThread) => void
+}
+
+const ThreadCard = memo(function ThreadCard({ thread, cooling, onRegenerate }: ThreadCardProps) {
+  const display = pickDisplayVersion(thread.versions)
+  return (
+    <article
+      className="rounded-xl border border-brand/40 bg-brand/[0.055] p-5 shadow-[0_18px_50px_rgba(0,0,0,0.18)]"
+      aria-live="polite"
+    >
+      {/* 标题就是不断增长的累计问题;每来一版更长的 partial 就整体刷新。 */}
+      <div className="mb-3 flex items-start justify-between gap-2">
+        <div className="select-text text-sm font-semibold leading-6 text-ink-primary">
+          {thread.question}
+        </div>
+        <SourceBadge searchEnhanced={thread.source === 'search+llm'} />
+      </div>
+      {/*
+       * catch-up swap：一张卡同一时刻只展示一段——未被取代的段里答案
+       * 最长的那个（新版流式追平旧版长度即自然接管，永不闪断）。
+       * 标题已经是累计问题，段内不再重复"问题："一行。
+       */}
+      {display ? (
+        <div>
+          {display.answer ? (
+            <Markdown source={display.answer} variant="answer" />
+          ) : (
+            <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
+              {display.failed ? (
+                <TriangleAlert size={12} className="text-bad" />
+              ) : (
+                <Loader2 size={12} className="animate-spin" />
+              )}
+              {display.failed ? '这一段生成失败' : '正在生成…'}
+            </div>
+          )}
+          {display.answer && display.failed && (
+            <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-bad">
+              <TriangleAlert size={12} />
+              这一段中断，仅显示已生成内容
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
+          <Loader2 size={12} className="animate-spin" />
+          正在生成…
+        </div>
+      )}
+      {/*
+       * 常驻重新生成：不管答案出来没有、是否还在生成，都能点——
+       * 生成卡住时这是唯一的自救手段。后端会取消该线程在途任务。
+       */}
+      <div className="mt-3 flex items-center justify-end">
+        <Button
+          variant="ghost"
+          icon={<RefreshCw size={12} />}
+          loading={cooling}
+          disabled={cooling}
+          onClick={() => onRegenerate(thread)}
+          className="!px-2 !py-1 !text-xs"
+        >
+          重新生成
+        </Button>
+      </div>
+    </article>
+  )
+}, threadCardPropsEqual)
 
 export default function AnswerFeed({
   answers,
@@ -62,7 +203,7 @@ export default function AnswerFeed({
     }
   }, [])
 
-  const startCooldown = (key: string) => {
+  const startCooldown = useCallback((key: string) => {
     // 后端限流 10/min:按钮冷却 6.5s,连点不触发限流报错。
     const t = setTimeout(() => {
       cooldownTimersRef.current.delete(t)
@@ -74,34 +215,41 @@ export default function AnswerFeed({
     }, 6500)
     cooldownTimersRef.current.add(t)
     setCoolingKeys((prev) => new Set(prev).add(key))
-  }
+  }, [])
 
   // 历史/已入库答案的重新生成：不带 thread_id，独立成卡立即入库。
-  const handleRegenerateAnswer = async (answer: Answer) => {
-    const key = `answer:${answer.id}`
-    if (coolingKeys.has(key)) return
-    startCooldown(key)
-    try {
-      const ok = await api.live.regenerate(answer.question, false)
-      if (!ok) toast('warning', '当前无法发送请求(连接未就绪或队列已满)')
-    } catch (err) {
-      toast('error', errorMessage(err))
-    }
-  }
+  // useCallback + 值稳定 props:token 帧重渲染时这些引用不变,memo 卡才跳得过。
+  const handleRegenerateAnswer = useCallback(
+    async (answer: Answer) => {
+      const key = `answer:${answer.id}`
+      if (coolingKeys.has(key)) return
+      startCooldown(key)
+      try {
+        const ok = await api.live.regenerate(answer.question, false)
+        if (!ok) toast('warning', '当前无法发送请求(连接未就绪或队列已满)')
+      } catch (err) {
+        toast('error', errorMessage(err))
+      }
+    },
+    [coolingKeys, startCooldown]
+  )
 
   // 问题卡重新生成：带 thread_id，后端 revision+1 并流回同一张卡。
   // 生成中也可点，新旧版本由会话并发上限统一调度。
-  const handleRegenerateThread = async (thread: AnswerThread) => {
-    const key = `thread:${thread.key}`
-    if (coolingKeys.has(key)) return
-    startCooldown(key)
-    try {
-      const ok = await api.live.regenerate(thread.question, false, thread.key)
-      if (!ok) toast('warning', '当前无法发送请求(连接未就绪或队列已满)')
-    } catch (err) {
-      toast('error', errorMessage(err))
-    }
-  }
+  const handleRegenerateThread = useCallback(
+    async (thread: AnswerThread) => {
+      const key = `thread:${thread.key}`
+      if (coolingKeys.has(key)) return
+      startCooldown(key)
+      try {
+        const ok = await api.live.regenerate(thread.question, false, thread.key)
+        if (!ok) toast('warning', '当前无法发送请求(连接未就绪或队列已满)')
+      } catch (err) {
+        toast('error', errorMessage(err))
+      }
+    },
+    [coolingKeys, startCooldown]
+  )
 
   if (answers.length === 0 && threads.length === 0 && pending.length === 0) {
     return (
@@ -116,98 +264,21 @@ export default function AnswerFeed({
     <div ref={feedRef} onScroll={handleScroll} className="h-full overflow-y-auto px-6 py-5">
       <div className="mx-auto max-w-4xl space-y-4">
         {answers.map((a) => (
-          <article
+          <HistoryAnswerCard
             key={a.id}
-            className="animate-slide-up rounded-xl border border-stroke bg-surface-card p-5 shadow-card"
-          >
-            <div className="mb-2 flex items-start justify-between gap-2">
-              <div className="select-text text-sm font-semibold leading-6 text-ink-primary">{a.question}</div>
-              <SourceBadge searchEnhanced={a.source === 'search+llm'} />
-            </div>
-            <Markdown source={a.answer} variant="answer" />
-            <div className="mt-3 flex items-center justify-between">
-              <span className="tnum text-[11px] text-ink-faint">
-                {dayjs(a.created_at).format('HH:mm:ss')}
-              </span>
-              <Button
-                variant="ghost"
-                icon={<RefreshCw size={12} />}
-                loading={coolingKeys.has(`answer:${a.id}`)}
-                disabled={coolingKeys.has(`answer:${a.id}`)}
-                onClick={() => void handleRegenerateAnswer(a)}
-                className="!px-2 !py-1 !text-xs"
-              >
-                重新生成
-              </Button>
-            </div>
-          </article>
+            answer={a}
+            cooling={coolingKeys.has(`answer:${a.id}`)}
+            onRegenerate={handleRegenerateAnswer}
+          />
         ))}
-        {threads.map((thread) => {
-          const display = pickDisplayVersion(thread.versions)
-          return (
-            <article
-              key={thread.key}
-              className="rounded-xl border border-brand/40 bg-brand/[0.055] p-5 shadow-[0_18px_50px_rgba(0,0,0,0.18)]"
-              aria-live="polite"
-            >
-              {/* 标题就是不断增长的累计问题;每来一版更长的 partial 就整体刷新。 */}
-              <div className="mb-3 flex items-start justify-between gap-2">
-                <div className="select-text text-sm font-semibold leading-6 text-ink-primary">
-                  {thread.question}
-                </div>
-                <SourceBadge searchEnhanced={thread.source === 'search+llm'} />
-              </div>
-              {/*
-               * catch-up swap：一张卡同一时刻只展示一段——未被取代的段里答案
-               * 最长的那个（新版流式追平旧版长度即自然接管，永不闪断）。
-               * 标题已经是累计问题，段内不再重复"问题："一行。
-               */}
-              {display ? (
-                <div>
-                  {display.answer ? (
-                    <Markdown source={display.answer} variant="answer" />
-                  ) : (
-                    <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
-                      {display.failed ? (
-                        <TriangleAlert size={12} className="text-bad" />
-                      ) : (
-                        <Loader2 size={12} className="animate-spin" />
-                      )}
-                      {display.failed ? '这一段生成失败' : '正在生成…'}
-                    </div>
-                  )}
-                  {display.answer && display.failed && (
-                    <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-bad">
-                      <TriangleAlert size={12} />
-                      这一段中断，仅显示已生成内容
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
-                  <Loader2 size={12} className="animate-spin" />
-                  正在生成…
-                </div>
-              )}
-              {/*
-               * 常驻重新生成：不管答案出来没有、是否还在生成，都能点——
-               * 生成卡住时这是唯一的自救手段。后端会取消该线程在途任务。
-               */}
-              <div className="mt-3 flex items-center justify-end">
-                <Button
-                  variant="ghost"
-                  icon={<RefreshCw size={12} />}
-                  loading={coolingKeys.has(`thread:${thread.key}`)}
-                  disabled={coolingKeys.has(`thread:${thread.key}`)}
-                  onClick={() => void handleRegenerateThread(thread)}
-                  className="!px-2 !py-1 !text-xs"
-                >
-                  重新生成
-                </Button>
-              </div>
-            </article>
-          )
-        })}
+        {threads.map((thread) => (
+          <ThreadCard
+            key={thread.key}
+            thread={thread}
+            cooling={coolingKeys.has(`thread:${thread.key}`)}
+            onRegenerate={handleRegenerateThread}
+          />
+        ))}
         {/*
          * 刚发出的手动提问（pending）：发送成功即出现在这里，answer_stream
          * 首帧到达自动消失、由真卡接棒（真卡对空答案也显示"正在生成…"，

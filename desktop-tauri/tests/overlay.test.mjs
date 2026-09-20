@@ -114,18 +114,21 @@ test('reconnecting keeps the last session status', () => {
 })
 
 test('stopping the engine emits a closed event after the connection loop', () => {
-  // engine.stop() 走的是循环里 `if stopped { break; }` 这条静默路径,
+  // engine.stop() 走的是循环里 stopped 静默 break 这条路径,
   // 正常结束(close 码 1000)才会发 closed。Rust 侧若不补发,前端归约
   // 永远收不到断开事件,上面的"清状态"测试形同虚设。
+  // (stopped 标志已重构为 stopped_flag.load(Ordering::SeqCst),语义不变)
   const wsClientRust = readFileSync(
     new URL('../src-tauri/src/ws_client.rs', import.meta.url),
     'utf8'
   )
-  assert.match(wsClientRust, /if stopped \{\s*break;\s*\}/)
-  const afterLoop = wsClientRust.slice(wsClientRust.lastIndexOf("if stopped {\n            break;"))
+  assert.match(wsClientRust, /if stopped_flag\.load\(Ordering::SeqCst\) \{\s*break;\s*\}/)
+  const afterLoop = wsClientRust.slice(
+    wsClientRust.lastIndexOf('if stopped_flag.load(Ordering::SeqCst) {\n        drain_pending_on_stop')
+  )
   assert.match(
     afterLoop,
-    /if stopped \{\s*emit\(EngineEvent::Connection \{\s*phase: engine::phase::CLOSED/,
+    /if stopped_flag\.load\(Ordering::SeqCst\) \{[\s\S]*?emit\(EngineEvent::Connection \{\s*phase: engine::phase::CLOSED/,
     '循环结束后必须为 stopped 补发 closed,否则悬浮窗状态卡死在上一场'
   )
 })

@@ -17,7 +17,7 @@ import { useSettingsStore } from '../stores/settings'
 import { errorMessage } from '../shared/errors'
 import type { ConfigItem, ConfigType } from '../shared/types'
 import { Button, Input, Modal, CenterSpin } from '../components/ui'
-import { checkFetchModelsPrecondition, llmSubmitData, type ReasoningEffort } from './llm-form'
+import { checkFetchModelsPrecondition, configSavePayload, llmSubmitData, type ReasoningEffort } from './llm-form'
 
 function toast(kind: string, message: string) {
   window.dispatchEvent(new CustomEvent('app-toast', { detail: { kind, message } }))
@@ -269,7 +269,7 @@ function ConfigCard({ type }: { type: ConfigType }) {
               },
               is_active: isActive
             }
-      await api.configs.save(type, editTarget ? { ...body, config_id: editTarget.id } : body)
+      await api.configs.save(type, configSavePayload(body, editTarget))
       toast(
         'success',
         isLlm ? 'LLM 配置已保存' : isAsr ? 'ASR 配置已保存' : isNetwork ? '代理配置已保存' : '搜索配置已保存'

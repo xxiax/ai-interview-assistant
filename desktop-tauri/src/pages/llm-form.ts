@@ -21,6 +21,19 @@ export function checkFetchModelsPrecondition(input: {
 
 export type ReasoningEffort = 'low' | 'medium' | 'high'
 
+/**
+ * 配置保存载荷的编辑语义:
+ * - 新增(editTarget 为空)→ 原载荷提交,不带 config_id;
+ * - 编辑 → 注入 editTarget.id 作为 config_id,后端按 id 更新,
+ *   否则会新建一条重复配置。
+ */
+export function configSavePayload<B extends object>(
+  body: B,
+  editTarget: { id: number } | null | undefined
+): B | (B & { config_id: number }) {
+  return editTarget ? { ...body, config_id: editTarget.id } : body
+}
+
 /** 提交载荷。 */
 export function llmSubmitData(input: {
   baseUrl: string

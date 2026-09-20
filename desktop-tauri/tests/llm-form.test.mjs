@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFile } from 'node:fs/promises'
 
-const { checkFetchModelsPrecondition, llmSubmitData } = await import('../src/pages/llm-form.ts')
+const { checkFetchModelsPrecondition, configSavePayload, llmSubmitData } = await import('../src/pages/llm-form.ts')
 const settingsSource = await readFile(new URL('../src/pages/SettingsPage.tsx', import.meta.url), 'utf8')
 const bridgeSource = await readFile(new URL('../src/api/bridge.ts', import.meta.url), 'utf8')
 const homeSource = await readFile(new URL('../src/pages/HomePage.tsx', import.meta.url), 'utf8')
@@ -128,10 +128,44 @@ test('HomePage: 搜索结果变少后仍保留搜索框并允许继续分页', (
   assert.match(homeSource, /query && canLoadMore/)
 })
 
-test('SettingsPage edit submit carries config_id for update semantics', async () => {
+// ---------- S5:编辑提交语义(行为测试,替代源码字符串断言) ----------
+
+test('configSavePayload: 新增模式提交原载荷,不带 config_id', () => {
+  // 用真实的 llmSubmitData 组装 LLM 配置体,覆盖"新增 → 不发送 config_id"
+  const body = {
+    name: '主力模型',
+    data: llmSubmitData({
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKey: 'sk-x',
+      model: 'deepseek-chat',
+      authField: 'Authorization'
+    }),
+    is_active: true
+  }
+  const payload = configSavePayload(body, null)
+  assert.ok(!('config_id' in payload), '新增不得带 config_id,否则后端误当更新')
+  assert.deepEqual(payload, {
+    name: '主力模型',
+    data: {
+      base_url: 'https://api.deepseek.com/v1',
+      api_key: 'sk-x',
+      model: 'deepseek-chat',
+      auth_field: 'Authorization',
+      reasoning_effort: 'low'
+    },
+    is_active: true
+  })
+})
+
+test('configSavePayload: 编辑模式注入 editTarget.id 作为 config_id', () => {
+  const body = { name: '代理', data: { proxy_url: 'http://127.0.0.1:7890', api_key: 'placeholder' }, is_active: false }
+  const payload = configSavePayload(body, { id: 42 })
+  assert.deepEqual(payload, { ...body, config_id: 42 })
+  // 原载荷不被原地修改
+  assert.ok(!('config_id' in body))
+})
+
+test('SettingsPage: 保存统一走 configSavePayload(编辑语义接线)', async () => {
   const src = await readFile(new URL('../src/pages/SettingsPage.tsx', import.meta.url), 'utf8')
-  assert.ok(
-    src.includes("editTarget ? { ...body, config_id: editTarget.id } : body"),
-    '编辑提交必须带 config_id,否则后端会新建重复配置'
-  )
+  assert.match(src, /api\.configs\.save\(type, configSavePayload\(body, editTarget\)\)/)
 })

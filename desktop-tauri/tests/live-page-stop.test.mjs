@@ -62,9 +62,9 @@ test('live transcript rail includes an Agent-style manual AI prompt', () => {
 
 test('capture button state follows captureState events, including overlay-started capture', async () => {
   // 悬浮窗 Ctrl+Alt+Z 开的采集:本页 systemAudioOn 没翻,但 store 的
-  // captureOn 跟着 captureState 事件走——按钮必须如实变"停止系统采集",
-  // toggle 也不能把门开着的场景误判成"再开一次"。
-  assert.match(livePageSource, /const captureOn = systemAudioOn \|\| live\.captureOn/)
+  // captureOn(选择器读成 captureStateOn)跟着 captureState 事件走——按钮必须
+  // 如实变"停止系统采集",toggle 也不能把门开着的场景误判成"再开一次"。
+  assert.match(livePageSource, /const captureOn = systemAudioOn \|\| captureStateOn/)
   assert.match(livePageSource, /if \(systemAudioOn \|\| useLiveStore\.getState\(\)\.captureOn\)/)
 })
 
@@ -76,6 +76,8 @@ test('manual question send mounts a pending card immediately', async () => {
     'utf8'
   )
   assert.match(livePageSource, /addPendingQuestion\(question\)/)
-  assert.match(livePageSource, /pending=\{live\.pendingQuestions\}/)
+  // H2:pending 订阅下沉到 AnswerPanel,LivePage 本体对 token 帧零重渲染
+  assert.match(livePageSource, /const pending = useLiveStore\(\(s\) => s\.pendingQuestions\)/)
+  assert.match(livePageSource, /pending=\{pending\}/)
   assert.match(answerFeedSource, /已发送 · 正在思考…/)
 })

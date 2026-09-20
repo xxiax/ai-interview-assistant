@@ -4,7 +4,7 @@ import { registerTsExtensionResolve } from './helpers.mjs'
 
 await registerTsExtensionResolve()
 
-const { parseBlocks, parseInline } = await import('../src/shared/markdown.ts')
+const { parseBlocks, parseBlocksCached, parseInline } = await import('../src/shared/markdown.ts')
 
 test('parseBlocks: **bold** paragraph with inline strong token', () => {
   const [block] = parseBlocks('优先保证 **时间复杂度** 与可读性')
@@ -115,4 +115,27 @@ test('parseInline: empty and plain lines return single text token', () => {
 test('parseBlocks: empty input yields no blocks', () => {
   assert.deepEqual(parseBlocks(''), [])
   assert.deepEqual(parseBlocks('\n\n  \n'), [])
+})
+
+// ---------- H2:块级解析缓存(Markdown 渲染走 parseBlocksCached) ----------
+
+test('parseBlocksCached: 同一 source 命中缓存返回同一数组,结果与直连解析一致', () => {
+  const first = parseBlocksCached('## 标题\n- 项目一\n- 项目二')
+  const second = parseBlocksCached('## 标题\n- 项目一\n- 项目二')
+  // 引用相等 = 第二次没有重新解析(流式重渲染不再重复整篇 parseBlocks)
+  assert.equal(second, first)
+  assert.deepEqual(first, parseBlocks('## 标题\n- 项目一\n- 项目二'))
+  const other = parseBlocksCached('另一段正文')
+  assert.notEqual(other, first)
+})
+
+test('parseBlocksCached: 缓存有界,超出容量后最旧条目被淘汰', () => {
+  // 容量远小于此循环数:首批 key 必然被淘汰,重新解析得到新数组
+  const evicted = parseBlocksCached('缓存边界探测-first')
+  for (let i = 0; i < 500; i++) parseBlocksCached(`缓存边界探测-${i}`)
+  const reparsed = parseBlocksCached('缓存边界探测-first')
+  assert.notEqual(reparsed, evicted, '被淘汰后的 source 需要重新解析')
+  // 刚插入的仍在缓存里
+  const last = parseBlocksCached('缓存边界探测-499')
+  assert.equal(parseBlocksCached('缓存边界探测-499'), last)
 })
