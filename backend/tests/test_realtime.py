@@ -1850,3 +1850,64 @@ async def test_unfinishable_stream_persists_partial_answer(monkeypatch):
     final = next(m for m in messages if m.get("type") == "answer")
     assert final["answer"] == "已生成的部分"
     assert final["revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_answer_falls_back_when_top_revision_has_no_text(monkeypatch):
+    """最高 revision 在首 delta 前被取消:线程退回次高的非空版,不能整条丢失。"""
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "空高版本部分答案")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    first_delta_seen = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fake_stream(question, context="", *_ctx):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield realtime_module.llm.LLMStreamPart(text="低版本答案")
+            first_delta_seen.set()
+        await release.wait()
+
+    messages = []
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS", "0.1")
+    monkeypatch.setattr(realtime_module.llm, "STREAM_TIMEOUT_SECONDS", 0.3)
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    assert await pipeline._enqueue_question_revision(key, "修订问题？")
+    await asyncio.wait_for(first_delta_seen.wait(), timeout=1)
+    assert await pipeline._enqueue_question_revision(key, "修订问题？续")
+    for _ in range(100):
+        if len(pipeline._answer_stream_captures) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert len(pipeline._answer_stream_captures) == 2
+
+    await pipeline.flush_session(session["id"])
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+    await pipeline.stop_session(session["id"])
+
+    conn = db.get_db()
+    try:
+        answers = db.get_answers(conn, session["id"])
+    finally:
+        conn.close()
+    assert [(answer["question"], answer["answer"]) for answer in answers] == [
+        ("修订问题？", "低版本答案")
+    ]
+    final = next(m for m in messages if m.get("type") == "answer")
+    assert final["answer"] == "低版本答案"
+    assert final["revision"] == 1

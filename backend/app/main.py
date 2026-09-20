@@ -178,11 +178,14 @@ def create_app() -> FastAPI:
             except RuntimeError as exc:
                 raise HTTPException(status_code=503, detail="FunASR 尚未就绪") from exc
         else:
-            # llm/groq 同样校验付费路径配置，未配置的部署必须报不健康（B2）
+            # llm/groq 同样校验付费路径配置，未配置的部署必须报不健康（B2）。
+            # detail 用固定字符串:匿名探针不应据此得知部署用的是哪种引擎。
             try:
                 await asr.check_paid_asr_config()
             except RuntimeError as exc:
-                raise HTTPException(status_code=503, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=503, detail="转写引擎未就绪"
+                ) from exc
         return {"status": "ready"}
 
     return application

@@ -333,6 +333,10 @@ async def check_paid_asr_config() -> None:
     elif engine == "llm":
         if not await asyncio.to_thread(_llm_model):
             raise RuntimeError("LLM 转写未配置：激活的 LLM 配置缺少 model")
+    elif engine not in ASR_ENGINE_VALUES:
+        # 未知引擎(如 AI_ASR_ENGINE 拼写错误)不得静默放行,否则未配置的
+        # 部署被报告为健康。
+        raise RuntimeError("AI_ASR_ENGINE 只能是 llm、funasr 或 groq")
 
 
 def inspect_audio(audio_bytes: bytes, codec: str, declared_duration_ms: int) -> int:

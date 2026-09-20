@@ -1837,8 +1837,9 @@ class RealtimePipeline:
     async def _persist_partial_answers(self, session_id: str) -> None:
         """取消在途生成后,把已累计的部分答案落库,避免已消耗预算的答案丢失。
 
-        同一问题线程只落 revision 最高的那一版(与线程正常落库取最新成功版的
-        语义一致);无线程的即时问答各自落一条。
+        同一问题线程只落 revision 最高且已有内容的那一版(与线程正常落库取
+        最新成功版的语义一致)——最高 revision 在首 delta 前被取消时,退回
+        次高的非空版;无线程的即时问答各自落一条。
         """
         captures = []
         for request_id, capture in list(self._answer_stream_captures.items()):
@@ -1847,13 +1848,13 @@ class RealtimePipeline:
                 captures.append(capture)
         best: dict[str, _AnswerStreamCapture] = {}
         for capture in captures:
+            if not capture.text.strip():
+                continue
             key = capture.item.thread_id or f"request:{capture.item.request_id}"
             current = best.get(key)
             if current is None or capture.item.revision > current.item.revision:
                 best[key] = capture
         for capture in best.values():
-            if not capture.text.strip():
-                continue
             try:
                 answer = await run_db(
                     db.add_answer,

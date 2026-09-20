@@ -59,7 +59,7 @@ def test_readiness_fails_closed_for_llm_engine_without_active_config(client):
     """B2：engine=llm 未配置激活 LLM 时必须 503，不能假报 ready。"""
     response = client.get("/health/ready")
     assert response.status_code == 503
-    assert "LLM" in response.json()["detail"]
+    assert response.json()["detail"] == "转写引擎未就绪"
 
 
 def test_readiness_accepts_llm_engine_with_active_config(client):
@@ -72,7 +72,15 @@ def test_readiness_fails_closed_for_groq_engine_without_key(client, monkeypatch)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     response = client.get("/health/ready")
     assert response.status_code == 503
-    assert "Groq" in response.json()["detail"]
+    assert response.json()["detail"] == "转写引擎未就绪"
+
+
+def test_readiness_fails_closed_for_unknown_engine(client, monkeypatch):
+    """AI_ASR_ENGINE 拼写错误属于配置错误,就绪检查不得静默放行。"""
+    monkeypatch.setenv("AI_ASR_ENGINE", "groqq")
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "转写引擎未就绪"
 
 
 def test_readiness_accepts_groq_engine_with_configured_key(client, monkeypatch):
