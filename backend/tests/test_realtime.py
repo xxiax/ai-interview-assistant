@@ -1616,3 +1616,204 @@ async def test_one_revision_failure_does_not_cancel_a_newer_revision(monkeypatch
     finally:
         conn.close()
     await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_finals_commit_prefix_exactly_once(monkeypatch):
+    """非流式路径连续 3 片 final:前缀只在 _enqueue_question_revision 内拼一次。
+
+    回归:此前 _persist_single_final 先把 committed_prefix 拼进 cumulative,
+    _enqueue_question_revision 内部又拼一次,问题文本随分片数指数膨胀。
+    """
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "非流式前缀单次拼接")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    async def fake_transcribe(audio_bytes, *_args):
+        return audio_bytes.decode()
+
+    async def fake_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text=f"回答:{question}")
+
+    messages = []
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(asr, "transcribe_audio", fake_transcribe)
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    captured_at = datetime(2026, 9, 20, tzinfo=timezone.utc)
+    texts = ("介绍一下分布式锁", "的实现原理", "以及常见误区")
+    expected_prefixes = [
+        "介绍一下分布式锁",
+        "介绍一下分布式锁的实现原理",
+        "介绍一下分布式锁的实现原理以及常见误区",
+    ]
+    for seq, text in enumerate(texts):
+        accepted, _ = await pipeline.enqueue_audio(
+            AudioWork(
+                session_id=session["id"],
+                chunk_id=str(uuid4()),
+                source="pc",
+                codec="webm_opus",
+                chunk_seq=seq,
+                captured_at=captured_at,
+                duration_ms=1000,
+                audio_bytes=text.encode(),
+            )
+        )
+        assert accepted
+        expected = expected_prefixes[seq]
+        for _ in range(200):
+            thread = pipeline._question_threads.get(key)
+            if thread is not None and thread.committed_prefix == expected:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            thread = pipeline._question_threads.get(key)
+            pytest.fail(
+                f"chunk {seq} 固化前缀错误: {thread.committed_prefix if thread else None!r}"
+            )
+
+    await pipeline.mark_speech_end(session["id"], "pc", 2)
+    for _ in range(100):
+        if any(m.get("type") == "answer" for m in messages):
+            break
+        await asyncio.sleep(0.01)
+    final = next(m for m in messages if m.get("type") == "answer")
+    assert final["question"] == "介绍一下分布式锁的实现原理以及常见误区"
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_flush_and_stop_bound_a_wedged_processing_task(monkeypatch):
+    """FunASR TCP 卡死(转写任务永不完成)时 flush 等待有界,stop 会取消它。"""
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "转写卡死")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    async def ignore_broadcast(_session_id, _message):
+        return None
+
+    monkeypatch.setenv("AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS", "0.2")
+    pipeline = RealtimePipeline(ignore_broadcast)
+    key = (session["id"], "pc")
+    wedged = asyncio.create_task(asyncio.sleep(30))
+    pipeline._audio_processing_tasks[key] = wedged
+
+    async def flush_and_stop():
+        await pipeline.flush_session(session["id"])
+        await pipeline.stop_session(session["id"])
+
+    await asyncio.wait_for(flush_and_stop(), timeout=2)
+    assert wedged.cancelled()
+    assert key not in pipeline._audio_processing_tasks
+
+
+@pytest.mark.asyncio
+async def test_end_session_during_slow_stream_still_persists_answer(monkeypatch):
+    """end_session 撞上还在流的答案:只要流在 LLM 超时内正常收尾就要落库。"""
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "慢流答案")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    first_delta_seen = asyncio.Event()
+
+    async def slow_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text="第一段")
+        first_delta_seen.set()
+        # 超过 flush 超时(0.2s),但远低于 LLM 流超时(60s)
+        await asyncio.sleep(1)
+        yield realtime_module.llm.LLMStreamPart(text="第二段")
+
+    async def capture_broadcast(_session_id, _message):
+        return None
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", slow_stream)
+    monkeypatch.setenv("AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS", "0.2")
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    assert await pipeline._enqueue_question_revision(key, "慢问题？", 0)
+    await asyncio.wait_for(first_delta_seen.wait(), timeout=1)
+
+    # 复刻 end_session 路由的顺序:flush → 落库结束状态 → stop。
+    await pipeline.flush_session(session["id"])
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+    await pipeline.stop_session(session["id"])
+
+    conn = db.get_db()
+    try:
+        answers = db.get_answers(conn, session["id"])
+    finally:
+        conn.close()
+    assert [(answer["question"], answer["answer"]) for answer in answers] == [
+        ("慢问题？", "第一段第二段")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unfinishable_stream_persists_partial_answer(monkeypatch):
+    """等满 LLM 流超时仍不收尾的生成:取消后已生成的部分答案要落库,不得无声丢失。"""
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "卡死流部分答案")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    first_delta_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stuck_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text="已生成的部分")
+        first_delta_seen.set()
+        await release.wait()
+
+    messages = []
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", stuck_stream)
+    monkeypatch.setenv("AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS", "0.1")
+    monkeypatch.setattr(realtime_module.llm, "STREAM_TIMEOUT_SECONDS", 0.3)
+    pipeline = RealtimePipeline(capture_broadcast)
+    key = (session["id"], "pc")
+    assert await pipeline._enqueue_question_revision(key, "卡死问题？", 0)
+    await asyncio.wait_for(first_delta_seen.wait(), timeout=1)
+
+    await pipeline.flush_session(session["id"])
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+    finally:
+        conn.close()
+    await pipeline.stop_session(session["id"])
+
+    conn = db.get_db()
+    try:
+        answers = db.get_answers(conn, session["id"])
+    finally:
+        conn.close()
+    assert [(answer["question"], answer["answer"]) for answer in answers] == [
+        ("卡死问题？", "已生成的部分")
+    ]
+    final = next(m for m in messages if m.get("type") == "answer")
+    assert final["answer"] == "已生成的部分"
+    assert final["revision"] == 1

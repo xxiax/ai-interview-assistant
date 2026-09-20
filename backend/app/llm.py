@@ -24,6 +24,9 @@ MAX_CONTEXT_CHARS = 20_000
 MAX_REVIEW_INPUT_CHARS = 200_000
 # 与 db.MAX_SESSION_CONTEXT_CHARS 对齐；这里再截一次，防止绕过 REST 写入的超长背景。
 MAX_SESSION_CONTEXT_CHARS = 8_000
+# 流式答案的 HTTP 超时(读/写/池)。realtime.flush_session 以它为结束会话时
+# 等待在途答案流收尾的上限：等得到就正常落库，等不到再取消并落部分答案。
+STREAM_TIMEOUT_SECONDS = 60.0
 _REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 
 # 实时答案(含搜索增强)的系统提示词尾部注入防护句。全局提示词
@@ -381,7 +384,9 @@ async def _chat_stream(
         estimated_input_tokens = max(1, estimated_input_tokens)
     total = ""
     total_thinking = ""
-    client_kwargs = asr.http_client_kwargs(httpx.Timeout(60.0, connect=10.0))
+    client_kwargs = asr.http_client_kwargs(
+        httpx.Timeout(STREAM_TIMEOUT_SECONDS, connect=10.0)
+    )
     request_base_url, request_extensions = external_request_target(
         endpoint, client_kwargs
     )

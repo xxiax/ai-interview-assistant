@@ -185,6 +185,15 @@ class AnswerCompletion:
 
 
 @dataclass
+class _AnswerStreamCapture:
+    """在途答案流的最新进度，供会话结束时兜底落库部分答案。"""
+
+    item: AnswerWork
+    text: str = ""
+    source: str = "llm"
+
+
+@dataclass
 class QuestionThread:
     session_id: str
     source: str
@@ -250,6 +259,9 @@ class RealtimePipeline:
         self._answer_queues: dict[str, asyncio.Queue[AnswerWork]] = {}
         self._answer_tasks: dict[str, asyncio.Task] = {}
         self._answer_generation_tasks: dict[str, set[asyncio.Task]] = {}
+        # 在途答案流的最新进度(request_id → capture)。flush_session 等待超时被迫
+        # 取消生成时,用它把已生成的部分答案落库,避免已消耗预算的答案无声丢失。
+        self._answer_stream_captures: dict[str, _AnswerStreamCapture] = {}
         self._stopped_sessions: set[str] = set()
         self._stop_reasons: dict[str, str] = {}
         self._session_mutations: dict[str, int] = {}
@@ -287,6 +299,7 @@ class RealtimePipeline:
             self._answer_queues.clear()
             self._answer_tasks.clear()
             self._answer_generation_tasks.clear()
+            self._answer_stream_captures.clear()
             self._stopped_sessions.clear()
             self._stop_reasons.clear()
             self._session_mutations.clear()
@@ -929,15 +942,11 @@ class RealtimePipeline:
             ),
         )
         await self._broadcast_chunk_event(current.session_id, chunk_event)
-        # 非流式引擎(Groq)没有累计 partial:每片自己是一个 final,按已固化前缀
-        # 拼出问题全文再提交 revision,并把结果固化给下一片。
-        thread = self._question_threads.get(key)
-        previous = (
-            thread.committed_prefix if thread is not None and not thread.closed else ""
-        )
-        cumulative = join_transcript_text(previous, text)
+        # 非流式引擎(Groq)没有累计 partial:每片自己是一个 final。与流式路径
+        # 同一契约——只传本片文本,committed_prefix 由 _enqueue_question_revision
+        # 内部拼接且只拼一次;随后把全文固化给下一片,否则前缀会随分片数翻倍。
         accepted = await self._enqueue_question_revision(
-            key, cumulative, current.chunk_seq
+            key, text, current.chunk_seq
         )
         await self._commit_question_prefix(key)
         if not accepted:
@@ -1520,10 +1529,17 @@ class RealtimePipeline:
         item: AnswerWork,
         queue: asyncio.Queue[AnswerWork],
     ) -> None:
+        cancelled = False
         try:
             await self._generate_answer(session_id, item)
+        except asyncio.CancelledError:
+            # 取消时保留 capture:flush_session 兜底落部分答案后自行清理。
+            cancelled = True
+            raise
         finally:
             queue.task_done()
+            if not cancelled:
+                self._answer_stream_captures.pop(item.request_id, None)
 
     async def _generate_answer(self, session_id: str, item: AnswerWork) -> None:
         revision_finished = False
@@ -1572,12 +1588,16 @@ class RealtimePipeline:
                 stream = self._plain_answer_stream(
                     item.question, context, job_description, resume
                 )
+            capture = _AnswerStreamCapture(item=item)
+            self._answer_stream_captures[item.request_id] = capture
             async for part, used_search in stream:
                 source = "search+llm" if used_search else "llm"
                 # 思考过程功能已下线:上游 reasoning 增量只用于跳过空 delta,不再
                 # 广播 channel="thinking",也不随 answer 事件下发。
                 if part.text:
                     answer_text += part.text
+                    capture.text = answer_text
+                    capture.source = source
                     await self.broadcast(
                         session_id,
                         server_message(
@@ -1781,15 +1801,35 @@ class RealtimePipeline:
         ):
             yield part, False
 
+    @staticmethod
+    def _final_flush_timeout_seconds() -> float:
+        try:
+            return float(
+                os.environ.get("AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS", "10")
+            )
+        except ValueError:
+            return 10.0
+
     async def flush_session(self, session_id: str) -> None:
         """结束会话前结束 FunASR 语音段，确保最后的 partial 不丢失。"""
+        timeout = self._final_flush_timeout_seconds()
         processing = [
             task
             for key, task in self._audio_processing_tasks.items()
             if key[0] == session_id and not task.done()
         ]
         if processing:
-            await asyncio.gather(*processing, return_exceptions=True)
+            # FunASR TCP 卡死时转写任务永不返回:等待必须有界,超时留给
+            # stop_session 取消,否则 end_session 会挂死。
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*processing, return_exceptions=True),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "结束会话时等待音频转写超时: session=%s", session_id
+                )
         for key in [key for key in self._funasr_streams if key[0] == session_id]:
             try:
                 await self._finish_funasr_segment(key)
@@ -1800,15 +1840,89 @@ class RealtimePipeline:
         queue = self._answer_queues.get(session_id)
         if queue is not None:
             try:
-                await asyncio.wait_for(
-                    queue.join(),
-                    timeout=float(
-                        os.environ.get("AI_FINAL_ANSWER_FLUSH_TIMEOUT_SECONDS", "10")
-                    ),
-                )
-            except (asyncio.TimeoutError, ValueError):
+                await asyncio.wait_for(queue.join(), timeout=timeout)
+            except asyncio.TimeoutError:
                 logger.warning("结束会话时等待最终答案超时: session=%s", session_id)
+        await self._wait_for_final_answers(session_id)
         await self._close_session_question_threads(session_id)
+
+    async def _wait_for_final_answers(self, session_id: str) -> None:
+        """以 LLM 流超时为上限等在途答案生成收尾,让最终答案赶在会话结束前落库。
+
+        `queue.join()` 只等 flush 超时(默认 10s),而 LLM 流自身可跑到 60s;超时后
+        直接取消会把已消耗预算的答案整段丢掉。这里继续等在途生成(通常毫秒级,
+        绝大多数流早已完成);等待期间 worker 从积压队列新开的生成也收编在同一
+        上限内。到上限仍没完的,取消后把已累计的部分答案落库。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + llm.STREAM_TIMEOUT_SECONDS
+        while True:
+            pending = [
+                task
+                for task in self._answer_generation_tasks.get(session_id, ())
+                if not task.done()
+            ]
+            if not pending:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                await self._persist_partial_answers(session_id)
+                return
+            await asyncio.wait(pending, timeout=remaining)
+
+    async def _persist_partial_answers(self, session_id: str) -> None:
+        """取消在途生成后,把已累计的部分答案落库,避免已消耗预算的答案丢失。
+
+        同一问题线程只落 revision 最高的那一版(与线程正常落库取最新成功版的
+        语义一致);无线程的即时问答各自落一条。
+        """
+        captures = []
+        for request_id, capture in list(self._answer_stream_captures.items()):
+            if capture.item.session_id == session_id:
+                self._answer_stream_captures.pop(request_id, None)
+                captures.append(capture)
+        best: dict[str, _AnswerStreamCapture] = {}
+        for capture in captures:
+            key = capture.item.thread_id or f"request:{capture.item.request_id}"
+            current = best.get(key)
+            if current is None or capture.item.revision > current.item.revision:
+                best[key] = capture
+        for capture in best.values():
+            if not capture.text.strip():
+                continue
+            try:
+                answer = await run_db(
+                    db.add_answer,
+                    session_id,
+                    capture.item.question,
+                    capture.text,
+                    capture.source,
+                    capture.item.request_id,
+                    capture.item.thread_id,
+                    capture.item.revision,
+                )
+            except Exception:
+                logger.exception(
+                    "落库部分答案失败: session=%s request=%s",
+                    session_id,
+                    capture.item.request_id,
+                )
+                continue
+            await self.broadcast(
+                session_id,
+                server_message(
+                    "answer",
+                    event_id=answer["event_id"],
+                    **{
+                        field_name: value
+                        for field_name, value in answer.items()
+                        if field_name != "event_id"
+                    },
+                ),
+            )
 
     async def stop_session(self, session_id: str) -> None:
         """结束会话时取消在途任务并清空队列，保证 ended 后不再写入。"""
@@ -1817,6 +1931,12 @@ class RealtimePipeline:
         tasks = []
         for key, task in list(self._audio_tasks.items()):
             if key[0] == session_id:
+                task.cancel()
+                tasks.append(task)
+        for key, task in list(self._audio_processing_tasks.items()):
+            # worker 被 cancel 后其内部 await 的转写任务不会跟着取消,必须一并
+            # cancel,否则卡死的 FunASR 转写任务会泄漏到进程退出。
+            if key[0] == session_id and not task.done():
                 task.cancel()
                 tasks.append(task)
         answer_task = self._answer_tasks.get(session_id)
@@ -1846,6 +1966,9 @@ class RealtimePipeline:
         self._release_stopped_session_if_idle(session_id)
         self._answer_queues.pop(session_id, None)
         self._answer_tasks.pop(session_id, None)
+        for request_id, capture in list(self._answer_stream_captures.items()):
+            if capture.item.session_id == session_id:
+                self._answer_stream_captures.pop(request_id, None)
         audio_keys = {
             key
             for mapping in (
@@ -1885,7 +2008,15 @@ class RealtimePipeline:
             *self._answer_tasks.keys(),
         }
         current_loop = asyncio.get_running_loop()
-        tasks = [*self._audio_tasks.values(), *self._answer_tasks.values()]
+        tasks = [
+            *self._audio_tasks.values(),
+            *[
+                task
+                for task in self._audio_processing_tasks.values()
+                if not task.done()
+            ],
+            *self._answer_tasks.values(),
+        ]
         current_tasks = [task for task in tasks if task.get_loop() is current_loop]
         for session_id in session_ids:
             self._stop_reasons[session_id] = "service_shutdown"
@@ -1921,6 +2052,7 @@ class RealtimePipeline:
         self._answer_queues.clear()
         self._answer_tasks.clear()
         self._answer_generation_tasks.clear()
+        self._answer_stream_captures.clear()
         self._stopped_sessions.clear()
         self._stop_reasons.clear()
         self._session_mutations.clear()
