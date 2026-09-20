@@ -229,6 +229,21 @@ pub fn strip_geometry(work_x: f64, work_y: f64, work_width: f64) -> (f64, f64, f
     (x, work_y, width, STRIP_THICKNESS)
 }
 
+/// 应用一段目标几何时窗口应配合的最小尺寸（S1 的"最小尺寸之舞"）。
+///
+/// 窗口以 `min_inner_size(280, 200)` 建出来，tao 在 set_size 触发的
+/// WM_GETMINMAXINFO 里会用当前最小值把请求夹回去：目标比正常最小值还小
+/// （收起细条 240×18）时，必须先把最小尺寸降到目标本身，否则 Ctrl+Alt+E
+/// 收到的不是细条而是一个 280×200 的色块。目标回到正常最小值及以上时返回
+/// 正常值——展开路径据此把收起期间降下去的最小尺寸放回去。
+fn min_size_for_target(width: f64, height: f64) -> (f64, f64) {
+    if is_full_window_geometry(width, height) {
+        (MIN_WIDTH, MIN_HEIGHT)
+    } else {
+        (width, height)
+    }
+}
+
 fn overlay_window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(OVERLAY_LABEL)
 }
@@ -508,6 +523,13 @@ pub fn collapse(app: &AppHandle, state: &OverlayState) -> Result<OverlayState, S
     }
     let (work_x, work_y, work_w, _) = work_area_of(&window)?;
     let (x, y, w, h) = strip_geometry(work_x, work_y, work_w);
+    // 先降最小尺寸再缩小（顺序不能反）：tao 的 set_min_size 会拿当前尺寸
+    // 重走一遍 WM_GETMINMAXINFO，set_size(240×18) 撞上 280×200 的最小值只能
+    // 收到一个色块。降完再 set_size 才是真正的细条（S1）。
+    let (min_w, min_h) = min_size_for_target(w, h);
+    window
+        .set_min_size(Some(LogicalSize::new(min_w, min_h)))
+        .map_err(|e| format!("放宽悬浮窗最小尺寸失败：{e}"))?;
     // 先缩小再挪位：反过来的话在部分驱动上会先看到窗口跑到顶上再变形。
     window
         .set_size(LogicalSize::new(w, h))
@@ -564,6 +586,13 @@ pub fn expand(
     window
         .set_position(LogicalPosition::new(x, y))
         .map_err(|e| format!("移动悬浮窗失败：{e}"))?;
+    // 尺寸落定后再放回正常最小尺寸（S1）：最小值先升的话，tao 的 set_min_size
+    // 会拿细条当前尺寸重走 WM_GETMINMAXINFO，把 240×18 先夹成 280×200 的色块
+    // 再展开，等于闪一次错误状态。此刻窗口已不小于正常最小值，升回去不会动它。
+    let (min_w, min_h) = min_size_for_target(width, height);
+    window
+        .set_min_size(Some(LogicalSize::new(min_w, min_h)))
+        .map_err(|e| format!("恢复悬浮窗最小尺寸失败：{e}"))?;
     Ok(read_state(
         &window,
         &OverlayState {
@@ -832,6 +861,32 @@ mod tests {
         // 工作区比细条还窄：长度夹到工作区宽，别把细条推出屏幕。
         let (x, _, w, _) = strip_geometry(0.0, 0.0, 100.0);
         assert_eq!((x, w), (0.0, 100.0));
+    }
+
+    #[test]
+    fn strip_geometry_lowers_the_min_size_and_expanding_restores_the_normal_one() {
+        // S1 的"最小尺寸之舞"：细条目标必须先把窗口最小尺寸降到目标本身，
+        // 否则 tao 在 set_size 的 WM_GETMINMAXINFO 里会用 280×200 的最小值把
+        // 240×18 的请求夹回去——Ctrl+Alt+E 只能收到一个色块而不是细条。
+        let (_, _, w, h) = strip_geometry(0.0, 0.0, 1920.0);
+        assert_eq!(
+            min_size_for_target(w, h),
+            (w, h),
+            "细条目标配细条自己的最小尺寸"
+        );
+        // 窄屏上细条长度被工作区夹短，最小尺寸必须跟着目标走，不能还是 240。
+        let (_, _, w, h) = strip_geometry(0.0, 0.0, 100.0);
+        assert_eq!(min_size_for_target(w, h), (100.0, h));
+        // 展开路径：任何完整窗口几何都配回正常最小值，收起期间降下去的值
+        // 不能泄漏成常驻的最小尺寸。
+        assert_eq!(
+            min_size_for_target(DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            (MIN_WIDTH, MIN_HEIGHT)
+        );
+        assert_eq!(
+            min_size_for_target(MIN_WIDTH, MIN_HEIGHT),
+            (MIN_WIDTH, MIN_HEIGHT)
+        );
     }
 
     #[test]

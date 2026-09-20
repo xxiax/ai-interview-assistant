@@ -131,7 +131,9 @@ impl SystemAudioState {
                 .name("system-audio-loopback".into())
                 .spawn(move || {
                     let mut ready = Some(ready_tx);
-                    let result = platform::run(&thread_stop, &thread_command_tx, &mut ready);
+                    // emit 传进采集循环：设备切换事件（S4）必须在包循环里发，
+                    // 外层包装只在整条线程失败时补发既有失败事件。
+                    let result = platform::run(&thread_stop, &thread_command_tx, &emit, &mut ready);
                     if let Err(message) = result {
                         if let Some(ready_tx) = ready.take() {
                             let _ = ready_tx.send(Err(message));
@@ -411,6 +413,89 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+// ---------- 默认播放设备跟踪（S4） ----------
+//
+// 采集启动时把默认 Render endpoint 固定死：会话中途用户拔掉耳机/切换输出，
+// loopback 仍挂在旧端点上，只会安静地采到一片静音。不引入
+// IMMNotificationClient（新依赖），在采集包循环里周期性轮询
+// GetDefaultAudioEndpoint 的端点 ID 做对比。COM 层无法在测试里跑，
+// 切换判定/复查节流/纠正动作全部放在下面的纯逻辑里。
+
+/// 两次默认设备复查的最小间隔。GetDefaultAudioEndpoint + GetId 要走 COM，
+// 每个音频包都查太浪费；间隔越长，切换后静默采集的窗口越久。
+const DEVICE_RECHECK_INTERVAL_MS: u64 = 2_000;
+
+/// 一次默认设备复查的结论。
+#[derive(Debug, PartialEq)]
+enum DefaultDeviceCheck {
+    /// 默认设备没变，继续在当前端点上采集。
+    Unchanged,
+    /// 默认设备变了（带新旧端点 ID），需要在新端点上重启采集。
+    Switched { from: String, to: String },
+    /// 这次查询失败：只推迟到下个周期，绝不误判成切换——重启采集是有
+    /// 感知动作，误报会平白打断一次正在进行的采集。
+    Unknown,
+}
+
+/// 跟踪默认播放设备的端点 ID：决定何时复查、复查后是否切换。
+#[derive(Debug)]
+struct DefaultDeviceWatch {
+    endpoint_id: String,
+    next_check_ms: u64,
+}
+
+impl DefaultDeviceWatch {
+    fn new(endpoint_id: String, now_ms: u64) -> Self {
+        Self {
+            endpoint_id,
+            next_check_ms: now_ms.saturating_add(DEVICE_RECHECK_INTERVAL_MS),
+        }
+    }
+
+    /// 是否到了该复查的时间。采集循环里每个包都会过这道门，必须便宜。
+    fn due(&self, now_ms: u64) -> bool {
+        now_ms >= self.next_check_ms
+    }
+
+    /// 记录一次复查并给出结论；`current` 为 None 表示查询失败（Unknown）。
+    /// 切换发生后跟踪状态前进到新 ID：同一个新设备再查就是 Unchanged，
+    /// 不会每个周期都重启一遍采集。
+    fn observe(&mut self, now_ms: u64, current: Option<String>) -> DefaultDeviceCheck {
+        self.next_check_ms = now_ms.saturating_add(DEVICE_RECHECK_INTERVAL_MS);
+        let Some(current) = current else {
+            return DefaultDeviceCheck::Unknown;
+        };
+        if current == self.endpoint_id {
+            DefaultDeviceCheck::Unchanged
+        } else {
+            let from = std::mem::replace(&mut self.endpoint_id, current.clone());
+            DefaultDeviceCheck::Switched { from, to: current }
+        }
+    }
+}
+
+/// 设备切换的通知事件（S4）。复用 ServerError 通道带上专用 code：
+/// 前端对所有未知 code 都有 toast 兜底，不用为一次可自愈的切换新开事件类型。
+fn device_changed_event(from: &str, to: &str) -> EngineEvent {
+    EngineEvent::ServerError {
+        code: "system_audio_device_changed".into(),
+        message: format!("默认播放设备已切换（{from} → {to}），已转到新设备继续采集系统音频"),
+        retry_after_seconds: None,
+        chunk_id: None,
+    }
+}
+
+/// 切换后重启采集失败的纠正命令（S4 fail-closed）：采集线程即将退出，
+/// 采集门必须翻回关闭，否则悬浮窗徽标对着一个已经静默的采集谎报"录制中"。
+/// ack 置 None：线程不能再阻塞等待 WS 任务的回执。
+fn fail_closed_command() -> EngineCommand {
+    EngineCommand::SetCaptureActive {
+        active: false,
+        reason: crate::protocol::CAPTURE_INTERRUPTED_REASON.to_string(),
+        ack: None,
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
@@ -418,14 +503,15 @@ mod platform {
 
     use windows::core::GUID;
     use windows::Win32::Media::Audio::{
-        eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
+        eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
         MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
         AUDCLNT_STREAMFLAGS_NOPERSIST, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
         WAVE_FORMAT_PCM,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+        COINIT_MULTITHREADED,
     };
 
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -452,6 +538,7 @@ mod platform {
     pub(super) fn run(
         stop: &AtomicBool,
         command_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+        emit: &EngineEventEmitter,
         ready: &mut Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), String> {
         let _com = ComApartment::initialize()?;
@@ -459,11 +546,38 @@ mod platform {
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                 .map_err(|error| win_error("创建设备枚举器", error))?
         };
+        let mut session = open_capture(&enumerator)?;
+
+        let startup_result = ready
+            .take()
+            .ok_or_else(|| "系统音频启动响应通道不存在".to_string())?
+            .send(Ok(()));
+        if startup_result.is_err() {
+            let _ = unsafe { session.audio_client.Stop() };
+            return Err("系统音频启动响应通道已关闭".into());
+        }
+
+        let capture_result = capture_packets(stop, command_tx, emit, &enumerator, &mut session);
+        let _ = unsafe { session.audio_client.Stop() };
+        capture_result
+    }
+
+    /// 一条绑在特定默认播放设备上的完整 loopback 采集链。
+    /// 设备切换（S4）时整条换新，不试图复用旧句柄。
+    struct CaptureSession {
+        endpoint_id: String,
+        audio_client: IAudioClient,
+        capture_client: IAudioCaptureClient,
+    }
+
+    /// 在当前默认播放设备上建采集链。首次启动和设备切换后的重启走同一条路。
+    fn open_capture(enumerator: &IMMDeviceEnumerator) -> Result<CaptureSession, String> {
         let device = unsafe {
             enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .map_err(|error| win_error("获取默认播放设备", error))?
         };
+        let endpoint_id = endpoint_id_of(&device)?;
         let audio_client: IAudioClient = unsafe {
             device
                 .Activate(CLSCTX_ALL, None)
@@ -505,31 +619,89 @@ mod platform {
                 .Start()
                 .map_err(|error| win_error("启动 WASAPI loopback", error))?;
         }
+        Ok(CaptureSession {
+            endpoint_id,
+            audio_client,
+            capture_client,
+        })
+    }
 
-        let startup_result = ready
-            .take()
-            .ok_or_else(|| "系统音频启动响应通道不存在".to_string())?
-            .send(Ok(()));
-        if startup_result.is_err() {
-            let _ = unsafe { audio_client.Stop() };
-            return Err("系统音频启动响应通道已关闭".into());
+    /// 查询当前默认播放设备的端点 ID（S4 轮询对比用）。
+    fn default_endpoint_id(enumerator: &IMMDeviceEnumerator) -> Result<String, String> {
+        let device = unsafe {
+            enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map_err(|error| win_error("获取默认播放设备", error))?
+        };
+        endpoint_id_of(&device)
+    }
+
+    /// 读出 IMMDevice 的端点 ID 并拷成 Rust String。
+    ///
+    /// GetId 的缓冲区由 COM 分配，拷完必须 CoTaskMemFree 释放——复查每 2 秒
+    /// 一次，漏掉就是按会话时长线性泄漏。
+    fn endpoint_id_of(device: &IMMDevice) -> Result<String, String> {
+        let id =
+            unsafe { device.GetId() }.map_err(|error| win_error("读取播放设备端点 ID", error))?;
+        let owned =
+            unsafe { id.to_string() }.map_err(|_| "播放设备端点 ID 不是有效 UTF-16".to_string());
+        unsafe { CoTaskMemFree(Some(id.as_ptr().cast())) };
+        owned
+    }
+
+    /// 复查默认播放设备（S4）。到点才真正查询；切换时发通知事件并整链换到
+    /// 新端点。返回 Ok(true) 表示已换新端点，调用方应回循环头用新客户端
+    /// 重新取包；返回 Err 表示重启失败——采集门已翻回关闭（纠正 UI/快照），
+    /// 线程退出，由外层包装以既有的 system_audio_capture_failed code 补发失败。
+    fn refresh_default_device(
+        emit: &EngineEventEmitter,
+        command_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+        enumerator: &IMMDeviceEnumerator,
+        session: &mut CaptureSession,
+        watch: &mut DefaultDeviceWatch,
+    ) -> Result<bool, String> {
+        let now = now_ms();
+        if !watch.due(now) {
+            return Ok(false);
         }
-
-        let capture_result = capture_packets(stop, command_tx, &capture_client);
-        let _ = unsafe { audio_client.Stop() };
-        capture_result
+        match watch.observe(now, default_endpoint_id(enumerator).ok()) {
+            DefaultDeviceCheck::Switched { from, to } => {
+                emit(device_changed_event(&from, &to));
+                // loopback 句柄绑死在旧设备上，不能跨设备复用：先停旧链再开新链。
+                let _ = unsafe { session.audio_client.Stop() };
+                match open_capture(enumerator) {
+                    Ok(new_session) => {
+                        *session = new_session;
+                        Ok(true)
+                    }
+                    Err(message) => {
+                        let _ = command_tx.send(fail_closed_command());
+                        Err(message)
+                    }
+                }
+            }
+            DefaultDeviceCheck::Unchanged | DefaultDeviceCheck::Unknown => Ok(false),
+        }
     }
 
     fn capture_packets(
         stop: &AtomicBool,
         command_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
-        capture_client: &IAudioCaptureClient,
+        emit: &EngineEventEmitter,
+        enumerator: &IMMDeviceEnumerator,
+        session: &mut CaptureSession,
     ) -> Result<(), String> {
         let mut chunker = SpeechChunker::default();
+        let mut watch = DefaultDeviceWatch::new(session.endpoint_id.clone(), now_ms());
 
         'capture: while !stop.load(Ordering::Acquire) {
+            if refresh_default_device(emit, command_tx, enumerator, session, &mut watch)? {
+                // 换了新客户端：旧客户端的包计数作废，回循环头重新取包。
+                continue 'capture;
+            }
             let mut packet_frames = unsafe {
-                capture_client
+                session
+                    .capture_client
                     .GetNextPacketSize()
                     .map_err(|error| win_error("读取 WASAPI packet 大小", error))?
             };
@@ -542,12 +714,19 @@ mod platform {
                 if stop.load(Ordering::Acquire) {
                     break 'capture;
                 }
+                // 持续有声音时内层循环不会回到外层，而设备切换恰恰多发生在
+                // 会议进行中：这里也要复查。due() 门槛保证约 2 秒才真正走一次
+                // COM 查询，逐包过这道门只是一次整数比较。
+                if refresh_default_device(emit, command_tx, enumerator, session, &mut watch)? {
+                    continue 'capture;
+                }
 
                 let mut data = ptr::null_mut();
                 let mut frames = 0u32;
                 let mut flags = 0u32;
                 unsafe {
-                    capture_client
+                    session
+                        .capture_client
                         .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
                         .map_err(|error| win_error("读取 WASAPI packet", error))?;
                 }
@@ -555,7 +734,7 @@ mod platform {
                 let samples = if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
                     vec![0i16; frames as usize]
                 } else if data.is_null() {
-                    let _ = unsafe { capture_client.ReleaseBuffer(frames) };
+                    let _ = unsafe { session.capture_client.ReleaseBuffer(frames) };
                     return Err("WASAPI 返回了空的非静音缓冲区".into());
                 } else {
                     unsafe { std::slice::from_raw_parts(data.cast::<i16>(), frames as usize) }
@@ -563,7 +742,8 @@ mod platform {
                 };
 
                 unsafe {
-                    capture_client
+                    session
+                        .capture_client
                         .ReleaseBuffer(frames)
                         .map_err(|error| win_error("释放 WASAPI packet", error))?;
                 }
@@ -586,7 +766,8 @@ mod platform {
                 }
 
                 packet_frames = unsafe {
-                    capture_client
+                    session
+                        .capture_client
                         .GetNextPacketSize()
                         .map_err(|error| win_error("读取下一个 WASAPI packet", error))?
                 };
@@ -636,6 +817,7 @@ mod platform {
     pub(super) fn run(
         _stop: &AtomicBool,
         _command_tx: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+        _emit: &EngineEventEmitter,
         _ready: &mut Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), String> {
         Err("系统音频 loopback 仅支持 Windows".into())
@@ -803,5 +985,91 @@ mod tests {
             rfc3339_from_unix_ms(1_776_297_845_123),
             "2026-04-16T00:04:05.123Z"
         );
+    }
+
+    #[test]
+    fn default_device_watch_only_reports_a_real_switch() {
+        // S4 的切换判定：端点 ID 逐字符串对比，COM 查询失败绝不误判成切换。
+        let mut watch = DefaultDeviceWatch::new("ep-a".into(), 1_000);
+        assert_eq!(
+            watch.observe(1_500, None),
+            DefaultDeviceCheck::Unknown,
+            "查询失败只推迟，不能当成切换去重启采集"
+        );
+        assert_eq!(
+            watch.observe(2_100, Some("ep-a".into())),
+            DefaultDeviceCheck::Unchanged
+        );
+        // 切换要带上新旧 ID（事件消息用），且跟踪状态前进：同一个新设备
+        // 下个周期再查就是 Unchanged，不会每个周期都重启一遍。
+        assert_eq!(
+            watch.observe(4_100, Some("ep-b".into())),
+            DefaultDeviceCheck::Switched {
+                from: "ep-a".into(),
+                to: "ep-b".into()
+            }
+        );
+        assert_eq!(
+            watch.observe(6_100, Some("ep-b".into())),
+            DefaultDeviceCheck::Unchanged
+        );
+        // 再切回来也是切换：默认设备可以来回切，每次都要跟上。
+        assert_eq!(
+            watch.observe(8_100, Some("ep-a".into())),
+            DefaultDeviceCheck::Switched {
+                from: "ep-b".into(),
+                to: "ep-a".into()
+            }
+        );
+    }
+
+    #[test]
+    fn default_device_watch_rechecks_on_a_two_second_cadence() {
+        // 采集循环每个包都过 due() 这道门：COM 查询必须被节流到约 2 秒一次。
+        let mut watch = DefaultDeviceWatch::new("ep-a".into(), 1_000);
+        assert!(!watch.due(1_000 + DEVICE_RECHECK_INTERVAL_MS - 1));
+        assert!(watch.due(1_000 + DEVICE_RECHECK_INTERVAL_MS));
+        // 每次复查（无论结论）都把下一次推一个周期，不会失败后连环重试。
+        watch.observe(3_000, None);
+        assert!(!watch.due(3_000 + DEVICE_RECHECK_INTERVAL_MS - 1));
+        assert!(watch.due(3_000 + DEVICE_RECHECK_INTERVAL_MS));
+    }
+
+    #[test]
+    fn device_change_reuses_the_server_error_channel_with_a_dedicated_code() {
+        // S4：切换通知复用 ServerError 通道带专用 code，前端对未知 code 有
+        // toast 兜底；绝不能带 retry_after/chunk_id 这类语义不符的字段。
+        match device_changed_event("ep-a", "ep-b") {
+            EngineEvent::ServerError {
+                code,
+                message,
+                retry_after_seconds,
+                chunk_id,
+            } => {
+                assert_eq!(code, "system_audio_device_changed");
+                assert!(message.contains("ep-a") && message.contains("ep-b"));
+                assert_eq!(retry_after_seconds, None);
+                assert_eq!(chunk_id, None);
+            }
+            other => panic!("设备切换事件必须走 ServerError 通道：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_restart_fails_the_capture_gate_closed() {
+        // S4 纠正路径：切换后重启失败时采集线程即将退出，采集门必须翻回
+        // 关闭，否则悬浮窗徽标对着已经静默的采集谎报"录制中"。
+        match fail_closed_command() {
+            EngineCommand::SetCaptureActive {
+                active,
+                reason,
+                ack,
+            } => {
+                assert!(!active);
+                assert_eq!(reason, crate::protocol::CAPTURE_INTERRUPTED_REASON);
+                assert!(ack.is_none(), "采集线程不能阻塞等待 WS 任务的回执");
+            }
+            other => panic!("纠正动作必须是 SetCaptureActive：{other:?}"),
+        }
     }
 }
