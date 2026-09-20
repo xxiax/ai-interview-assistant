@@ -121,7 +121,7 @@ test('stopping the engine emits a closed event after the connection loop', () =>
   const wsClientRust = readFileSync(
     new URL('../src-tauri/src/ws_client.rs', import.meta.url),
     'utf8'
-  )
+  ).replace(/\r\n/g, '\n')
   assert.match(wsClientRust, /if stopped_flag\.load\(Ordering::SeqCst\) \{\s*break;\s*\}/)
   const afterLoop = wsClientRust.slice(
     wsClientRust.lastIndexOf('if stopped_flag.load(Ordering::SeqCst) {\n        drain_pending_on_stop')
