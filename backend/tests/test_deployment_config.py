@@ -12,6 +12,12 @@ def test_container_healthcheck_uses_trusted_https_proxy_headers():
     assert '"127.0.0.1,172.16.0.0/12"' in dockerfile
 
 
+def test_container_healthcheck_probes_readiness_endpoint():
+    """B2：容器探针必须打 /health/ready，未配置付费转写路径的部署才起不来。"""
+    script = (BACKEND_DIR / "scripts" / "healthcheck.py").read_text(encoding="utf-8")
+    assert "/health/ready" in script
+
+
 def test_compose_passes_through_runtime_read_env_vars():
     """代码实际读取但 compose 白名单缺失的变量必须透传（B7）。
 

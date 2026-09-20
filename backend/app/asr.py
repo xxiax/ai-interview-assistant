@@ -314,6 +314,27 @@ async def check_funasr_ready(timeout_seconds: float = 2.0) -> None:
     await writer.wait_closed()
 
 
+async def check_paid_asr_config() -> None:
+    """非 FunASR 引擎的就绪检查：验证实际付费转写路径的配置已存在。
+
+    engine=llm 需要激活的 LLM 配置填写了 model（与 transcribe_audio 的
+    路由要求一致）；engine=groq 需要已配置 Groq Key（设置页或
+    GROQ_API_KEY）。未配置时抛 RuntimeError，由 /health/ready 转为 503。
+    配置读取同步打开 SQLite，移出事件循环（对齐 llm._get_llm_config_async）。
+    """
+    engine = os.environ.get("AI_ASR_ENGINE", "funasr").strip().lower()
+    if engine == "groq":
+        try:
+            await asyncio.to_thread(_get_api_key)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Groq 转写未配置：请设置 GROQ_API_KEY 或在设置页保存 API Key"
+            ) from exc
+    elif engine == "llm":
+        if not await asyncio.to_thread(_llm_model):
+            raise RuntimeError("LLM 转写未配置：激活的 LLM 配置缺少 model")
+
+
 def inspect_audio(audio_bytes: bytes, codec: str, declared_duration_ms: int) -> int:
     """解析媒体容器，返回服务端测得的真实时长（毫秒）。"""
     if codec not in CODEC_DETAILS:
@@ -607,7 +628,6 @@ class FunAsrStream:
         self._reader: asyncio.Task | None = None
         self._events: asyncio.Queue[FunAsrEvent] = asyncio.Queue(maxsize=64)
         self._lock = asyncio.Lock()
-        self._slot = None
         self._closed = False
         self._utterance_active = False
 
@@ -628,9 +648,6 @@ class FunAsrStream:
                     parsed_funasr_url.hostname, proxy_url
                 )
 
-            slot = cost_control.paid_call_slot("asr")
-            await slot.__aenter__()
-            self._slot = slot
             try:
                 connect_kwargs = {
                     "proxy_url": proxy_url,
@@ -777,28 +794,34 @@ class FunAsrStream:
         async with self._lock:
             if self._closed or self._ws is None:
                 raise RuntimeError("FunASR 长连接已关闭")
-            actual_duration_ms = await asyncio.to_thread(
-                inspect_audio, audio_bytes, "wav_pcm_s16le", declared_duration_ms
-            )
-            await cost_control.reserve_asr_millis(
-                _funasr_token(), actual_duration_ms
-            )
-            if not self._utterance_active:
-                await self._ws.send(
-                    json.dumps(
-                        {
-                            "type": "start",
-                            "sample_rate": 16000,
-                            "format": "pcm_s16le",
-                            "channels": 1,
-                        }
-                    )
+            # 并发门只覆盖"探测+预算+推流+等 partial"的活跃窗口(对齐
+            # _transcribe_funasr 的一次调用一个许可):连接跨语音段复用,
+            # 空闲长连接不得占住许可,否则一个 radio_mode=both 会话的
+            # 两条流就吃满默认 AI_ASR_MAX_CONCURRENCY=2,第二会话直接
+            # PaidCallBusyError。
+            async with cost_control.paid_call_slot("asr"):
+                actual_duration_ms = await asyncio.to_thread(
+                    inspect_audio, audio_bytes, "wav_pcm_s16le", declared_duration_ms
                 )
-                self._utterance_active = True
-            await self._ws.send(_wav_payload(audio_bytes))
-            events = await self._drain_until_idle(
-                _funasr_partial_idle_seconds(), _funasr_partial_max_wait_seconds()
-            )
+                await cost_control.reserve_asr_millis(
+                    _funasr_token(), actual_duration_ms
+                )
+                if not self._utterance_active:
+                    await self._ws.send(
+                        json.dumps(
+                            {
+                                "type": "start",
+                                "sample_rate": 16000,
+                                "format": "pcm_s16le",
+                                "channels": 1,
+                            }
+                        )
+                    )
+                    self._utterance_active = True
+                await self._ws.send(_wav_payload(audio_bytes))
+                events = await self._drain_until_idle(
+                    _funasr_partial_idle_seconds(), _funasr_partial_max_wait_seconds()
+                )
             if any(event.type == "final" for event in events):
                 self._utterance_active = False
             return events
@@ -808,10 +831,11 @@ class FunAsrStream:
         async with self._lock:
             if self._closed or self._ws is None or not self._utterance_active:
                 return []
-            await self._ws.send(json.dumps({"type": "stop"}))
-            events = await self._read_for(
-                float(os.environ.get("AI_FUNASR_FINAL_TIMEOUT_SECONDS", "5"))
-            )
+            async with cost_control.paid_call_slot("asr"):
+                await self._ws.send(json.dumps({"type": "stop"}))
+                events = await self._read_for(
+                    float(os.environ.get("AI_FUNASR_FINAL_TIMEOUT_SECONDS", "5"))
+                )
             if any(event.type == "final" for event in events):
                 self._utterance_active = False
             return events
@@ -837,10 +861,6 @@ class FunAsrStream:
                 await ws_cm.__aexit__(None, None, None)
             except Exception:  # noqa: BLE001,S110 - 清理路径不得覆盖原始异常
                 pass
-        slot = self._slot
-        self._slot = None
-        if slot is not None:
-            await slot.__aexit__(None, None, None)
 
     async def close(self) -> None:
         async with self._lock:

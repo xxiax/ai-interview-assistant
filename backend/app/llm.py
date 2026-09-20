@@ -117,6 +117,11 @@ async def _get_llm_config_async() -> dict:
     return await asyncio.to_thread(_get_llm_config)
 
 
+async def _http_client_kwargs(timeout: httpx.Timeout) -> dict:
+    """出网代理读取会同步打开 SQLite 与注册表，移出事件循环（对齐 asr._groq_request_context）。"""
+    return await asyncio.to_thread(asr.http_client_kwargs, timeout)
+
+
 def _get_global_system_prompt() -> str:
     conn = db.get_db()
     try:
@@ -220,7 +225,7 @@ async def _chat(
         headers = {auth_field: api_key}
     headers["Host"] = endpoint.host_header
 
-    client_kwargs = asr.http_client_kwargs(httpx.Timeout(30.0, connect=10.0))
+    client_kwargs = await _http_client_kwargs(httpx.Timeout(30.0, connect=10.0))
     request_base_url, request_extensions = external_request_target(
         endpoint, client_kwargs
     )
@@ -384,7 +389,7 @@ async def _chat_stream(
         estimated_input_tokens = max(1, estimated_input_tokens)
     total = ""
     total_thinking = ""
-    client_kwargs = asr.http_client_kwargs(
+    client_kwargs = await _http_client_kwargs(
         httpx.Timeout(STREAM_TIMEOUT_SECONDS, connect=10.0)
     )
     request_base_url, request_extensions = external_request_target(
@@ -761,9 +766,9 @@ async def transcribe_via_llm(
     # 预算估算：音频 token 按每秒约 30 计，加上输出上限。
     estimated_tokens = math.ceil(actual_duration_ms / 1000) * 30 + max_completion_tokens
 
+    client_kwargs = await _http_client_kwargs(httpx.Timeout(60.0, connect=10.0))
     async with cost_control.paid_call_slot("llm"):
         await cost_control.reserve_llm_tokens(api_key, estimated_tokens)
-        client_kwargs = asr.http_client_kwargs(httpx.Timeout(60.0, connect=10.0))
         request_base_url, request_extensions = external_request_target(
             endpoint, client_kwargs
         )

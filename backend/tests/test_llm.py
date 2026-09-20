@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
-from app import db, llm, search
+from app import asr, db, llm, search
 
 
 @pytest.mark.asyncio
@@ -956,3 +957,87 @@ async def test_solve_screenshot_rejects_empty_image():
     with pytest.raises(ValueError, match="为空"):
         async for _ in llm.stream_solve_screenshot(b""):
             pass
+
+
+# ---------- 出网代理读取移出事件循环（A3） ----------
+
+
+def _tracking_http_client_kwargs(threads: list[int]):
+    """替换 asr.http_client_kwargs，记录每次调用的线程 ID。"""
+
+    def tracking(timeout):
+        threads.append(threading.get_ident())
+        return {"timeout": timeout}
+
+    return tracking
+
+
+@pytest.mark.asyncio
+async def test_chat_reads_proxy_config_off_the_event_loop(monkeypatch):
+    """http_client_kwargs 同步读 SQLite/注册表，不得在事件循环线程执行。"""
+    _save_llm_config()
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    monkeypatch.setattr(
+        asr, "http_client_kwargs", _tracking_http_client_kwargs(threads)
+    )
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "答案"}}]}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", Client)
+    assert await llm._chat([{"role": "user", "content": "问题"}]) == "答案"
+    assert threads and all(tid != loop_thread for tid in threads)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_reads_proxy_config_off_the_event_loop(monkeypatch):
+    _save_llm_config(base_url="https://llm.example")
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    monkeypatch.setattr(
+        asr, "http_client_kwargs", _tracking_http_client_kwargs(threads)
+    )
+    _stub_stream_client(
+        monkeypatch,
+        {},
+        ['data: {"choices":[{"delta":{"content":"答案"}}]}', "data: [DONE]"],
+    )
+    chunks = [chunk async for chunk in llm.stream_answer("问题")]
+    assert [chunk.text for chunk in chunks] == ["答案"]
+    assert threads and all(tid != loop_thread for tid in threads)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_via_llm_reads_proxy_config_off_the_event_loop(monkeypatch):
+    _save_llm_config_for_audio()
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    monkeypatch.setattr(
+        asr, "http_client_kwargs", _tracking_http_client_kwargs(threads)
+    )
+    capture = {}
+    monkeypatch.setattr(
+        llm.httpx, "AsyncClient", lambda **kw: _AudioClient(capture, **kw)
+    )
+    monkeypatch.setattr(llm, "inspect_audio", lambda *a: 1000)
+    text = await llm.transcribe_via_llm(_wav_bytes(), "gpt-4o-audio-preview", 1000)
+    assert text == "你好面试官"
+    assert threads and all(tid != loop_thread for tid in threads)

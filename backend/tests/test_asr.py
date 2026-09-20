@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from app import asr
+from app import asr, cost_control
 
 
 class FakeResponse:
@@ -404,6 +404,98 @@ async def test_funasr_stream_starts_new_utterance_after_finish(monkeypatch):
 
     assert len(connects) == 1
     assert sent == ["start", "binary", "stop", "start", "binary", "stop"]
+
+
+class _IdleWS:
+    """已连接但不返回任何服务端消息的空闲 FunASR 长连接。"""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def send(self, _raw):
+        return None
+
+    async def recv(self):
+        await asyncio.Event().wait()
+
+    async def close(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_idle_funasr_streams_do_not_hold_asr_slots(monkeypatch):
+    """A4：已连接、未推流的 FunASR 长连接不得占住付费并发门。
+
+    连接跨语音段复用；若连接期持有 slot，一个 radio_mode=both 会话的
+    两条空闲流就吃满默认 AI_ASR_MAX_CONCURRENCY=2，第二个会话的任何
+    转写调用都会 PaidCallBusyError。
+    """
+    monkeypatch.setenv("AI_ASR_ENGINE", "funasr")
+    monkeypatch.setenv("AI_FUNASR_URL", "ws://127.0.0.1:10096/ws")
+    monkeypatch.setenv("AI_ASR_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS", "0.2")
+    cost_control.reset_runtime_state()
+    monkeypatch.setattr(asr, "_active_proxy", lambda: None)
+    monkeypatch.setattr(asr, "_resolve_funasr_host", lambda *_args: _async_none())
+    monkeypatch.setattr(asr, "_websockets_connect", lambda _url, **_kw: _IdleWS())
+
+    stream_a = asr.FunAsrStream()
+    stream_b = asr.FunAsrStream()
+    await stream_a.connect()
+    await stream_b.connect()
+    try:
+        # 两条空闲流不占许可：默认 2 个许可必须全部可用（模拟第二会话的转写调用）
+        async with cost_control.paid_call_slot("asr"):
+            async with cost_control.paid_call_slot("asr"):
+                pass
+    finally:
+        await stream_a.close()
+        await stream_b.close()
+
+
+@pytest.mark.asyncio
+async def test_active_push_holds_exactly_one_asr_slot(monkeypatch):
+    """推流窗口保持一调用一许可：活跃 push 占 1 个，推完立即归还。"""
+    monkeypatch.setenv("AI_ASR_ENGINE", "funasr")
+    monkeypatch.setenv("AI_FUNASR_URL", "ws://127.0.0.1:10096/ws")
+    monkeypatch.setenv("AI_ASR_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("AI_PAID_CALL_QUEUE_TIMEOUT_SECONDS", "0.2")
+    cost_control.reset_runtime_state()
+    monkeypatch.setattr(asr, "_active_proxy", lambda: None)
+    monkeypatch.setattr(asr, "inspect_audio", lambda *_args: 1000)
+    monkeypatch.setattr(asr, "_resolve_funasr_host", lambda *_args: _async_none())
+    monkeypatch.setattr(asr.cost_control, "reserve_asr_millis", _async_noop)
+    monkeypatch.setattr(asr, "_websockets_connect", lambda _url, **_kw: _IdleWS())
+
+    stream = asr.FunAsrStream()
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    async def controlled_drain(*_args, **_kwargs):
+        drain_started.set()
+        await release_drain.wait()
+        return []
+
+    monkeypatch.setattr(stream, "_drain_until_idle", controlled_drain)
+    push = asyncio.create_task(stream.push_wav(_wav_bytes(), 1000))
+    await drain_started.wait()
+
+    # 活跃推流恰好占 1 个许可：剩下 1 个可获取，第 3 次必须 Busy
+    async with cost_control.paid_call_slot("asr"):
+        with pytest.raises(cost_control.PaidCallBusyError):
+            async with cost_control.paid_call_slot("asr"):
+                pass
+    release_drain.set()
+    await push
+    await stream.close()
+
+    # 推流结束即归还：2 个许可重新全部可用
+    async with cost_control.paid_call_slot("asr"):
+        async with cost_control.paid_call_slot("asr"):
+            pass
 
 
 def test_funasr_stream_is_enabled_by_default_for_wav(monkeypatch):

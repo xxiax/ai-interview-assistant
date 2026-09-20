@@ -171,11 +171,18 @@ def create_app() -> FastAPI:
             conn.execute("SELECT 1").fetchone()
         finally:
             conn.close()
-        if os.environ.get("AI_ASR_ENGINE", "funasr").strip().lower() == "funasr":
+        engine = os.environ.get("AI_ASR_ENGINE", "funasr").strip().lower()
+        if engine == "funasr":
             try:
                 await asr.check_funasr_ready()
             except RuntimeError as exc:
                 raise HTTPException(status_code=503, detail="FunASR 尚未就绪") from exc
+        else:
+            # llm/groq 同样校验付费路径配置，未配置的部署必须报不健康（B2）
+            try:
+                await asr.check_paid_asr_config()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"status": "ready"}
 
     return application

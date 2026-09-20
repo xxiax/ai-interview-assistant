@@ -10,7 +10,31 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 
 
+def _save_ready_llm_config():
+    from app import db
+
+    conn = db.get_db()
+    try:
+        db.save_config(
+            conn,
+            "llm",
+            "ready-check",
+            {
+                "base_url": "https://llm.example/v1",
+                "api_key": "secret",
+                "model": "text-model",
+                "auth_field": "Authorization",
+            },
+            True,
+        )
+    finally:
+        conn.close()
+
+
 def test_health_is_anonymous_and_has_security_headers(client):
+    # B2 后 engine=llm 的 /health/ready 要求已配置激活 LLM；补一个激活配置
+    # 以继续断言匿名访问 + 安全头的 200 快乐路径。
+    _save_ready_llm_config()
     response = client.get("/health")
     assert response.status_code == 200
     assert response.headers["x-content-type-options"] == "nosniff"
@@ -29,6 +53,32 @@ def test_readiness_reports_funasr_unavailable(client, monkeypatch):
     response = client.get("/health/ready")
     assert response.status_code == 503
     assert response.json()["detail"] == "FunASR 尚未就绪"
+
+
+def test_readiness_fails_closed_for_llm_engine_without_active_config(client):
+    """B2：engine=llm 未配置激活 LLM 时必须 503，不能假报 ready。"""
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert "LLM" in response.json()["detail"]
+
+
+def test_readiness_accepts_llm_engine_with_active_config(client):
+    _save_ready_llm_config()
+    assert client.get("/health/ready").json() == {"status": "ready"}
+
+
+def test_readiness_fails_closed_for_groq_engine_without_key(client, monkeypatch):
+    monkeypatch.setenv("AI_ASR_ENGINE", "groq")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert "Groq" in response.json()["detail"]
+
+
+def test_readiness_accepts_groq_engine_with_configured_key(client, monkeypatch):
+    monkeypatch.setenv("AI_ASR_ENGINE", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    assert client.get("/health/ready").json() == {"status": "ready"}
 
 
 def test_openapi_declares_bearer_security(client, monkeypatch):
