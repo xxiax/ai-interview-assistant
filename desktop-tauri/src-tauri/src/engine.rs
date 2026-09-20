@@ -7,6 +7,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -122,6 +123,9 @@ pub struct NewChunk {
 
 pub type EngineEventEmitter = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 pub type SharedManifest = Arc<Mutex<OutboxManifest>>;
+/// 引擎停止标记:Stop 后置位。persist_manifest 检查它,让引擎停止后旧任务
+/// (收尾/残留对账)的落盘变成 no-op,不盖掉接替引擎写入的文件(E1c)。
+pub type SharedStopped = Arc<AtomicBool>;
 
 // ---------- 时间与持久化工具 ----------
 
@@ -159,6 +163,11 @@ pub fn atomic_write(path: &Path, data: &str) {
     if f.write_all(data.as_bytes()).is_err() {
         return;
     }
+    // rename 前先 fsync:否则断电窗口内目录项可能先于数据落盘,
+    // 目标文件变成空壳/半截,下次启动按损坏 manifest 处理(E4)。
+    if f.sync_all().is_err() {
+        return;
+    }
     drop(f);
     match std::fs::rename(&tmp, path) {
         Ok(()) => {}
@@ -189,12 +198,26 @@ fn load_cursor(state_dir: &Path, session_id: &str) -> i64 {
 
 /// 查询服务端该会话 pc 源最大 chunk_seq + 1;查询失败返回 0(退回本地水位,由对账兜底)。
 /// 必须在异步上下文中调用(无嵌套 block_on)。
-pub async fn server_next_chunk_seq(ctx: &RestContext, session_id: &str) -> i64 {
+/// 整体受 deadline 约束:50 页 × 15s 的 REST 最坏情况不能让启动扫描分钟级
+/// 停摆(E1a);到限即返回已见页面的最大值。
+pub async fn server_next_chunk_seq(
+    ctx: &RestContext,
+    session_id: &str,
+    deadline: std::time::Instant,
+) -> i64 {
+    let deadline = tokio::time::Instant::from_std(deadline);
     let mut cursor: i64 = -1;
     let mut max_seq: i64 = -1;
     for _ in 0..50 {
-        match crate::rest::audio_chunks(ctx, session_id, "pc", cursor).await {
-            Ok(page) => {
+        match tokio::time::timeout_at(
+            deadline,
+            crate::rest::audio_chunks(ctx, session_id, "pc", cursor),
+        )
+        .await
+        {
+            Err(_elapsed) => break,
+            Ok(Err(_)) => return 0,
+            Ok(Ok(page)) => {
                 if page.is_empty() {
                     break;
                 }
@@ -204,25 +227,85 @@ pub async fn server_next_chunk_seq(ctx: &RestContext, session_id: &str) -> i64 {
                     break;
                 }
             }
-            Err(_) => return 0,
         }
     }
     max_seq + 1
 }
 
-fn load_manifest(state_dir: &Path, session_id: &str) -> OutboxManifest {
+/// 读取 manifest。返回 (manifest, quarantined):文件存在但读取/解析失败时,
+/// 原文件改名 `<name>.corrupt` 保留并返回 quarantined=true,调用方本次启动
+/// 不得清孤儿 WAV,否则等于把积压音频全部删光(E4)。
+fn load_manifest(state_dir: &Path, session_id: &str) -> (OutboxManifest, bool) {
     let path = state_dir.join(format!("outbox-{session_id}.json"));
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return OutboxManifest::empty(session_id);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (OutboxManifest::empty(session_id), false);
+        }
+        Err(e) => {
+            eprintln!("engine: outbox manifest 读取失败({e}),保留音频并跳过孤儿清理");
+            return (OutboxManifest::empty(session_id), true);
+        }
     };
-    serde_json::from_str(&raw).unwrap_or_else(|_| OutboxManifest::empty(session_id))
+    match serde_json::from_str(&raw) {
+        Ok(manifest) => (manifest, false),
+        Err(e) => {
+            let quarantine = path.with_extension("corrupt");
+            // 之前启动已留下隔离文件时 rename 会失败:先删旧的再改。
+            if std::fs::rename(&path, &quarantine).is_err() {
+                let _ = std::fs::remove_file(&quarantine);
+                let _ = std::fs::rename(&path, &quarantine);
+            }
+            eprintln!(
+                "engine: outbox manifest 解析失败({e}),已隔离为 {}",
+                quarantine.display()
+            );
+            (OutboxManifest::empty(session_id), true)
+        }
+    }
 }
 
-pub fn persist_manifest(state_dir: &Path, manifest: &OutboxManifest) {
+pub fn persist_manifest(state_dir: &Path, manifest: &OutboxManifest, stopped: &AtomicBool) {
+    // 引擎停止后的落盘一律跳过:旧引擎收尾/残留对账任务的写入会盖掉接替
+    // 引擎已写入的新文件(E1c)。
+    if stopped.load(Ordering::SeqCst) {
+        return;
+    }
     let path = state_dir.join(format!("outbox-{}.json", manifest.session_id));
     if let Ok(body) = serde_json::to_string(manifest) {
         atomic_write(&path, &body);
     }
+}
+
+/// Engine::spawn 的同步装载:读 manifest(损坏则隔离)→ 冻结遗留未终态分片 →
+/// 清孤儿 WAV(仅当 manifest 可信;不可信时跳过,音频保留待恢复,E4)。
+fn startup_manifest(
+    state_dir: &Path,
+    audio_dir: &Path,
+    session_id: &str,
+    stopped: &AtomicBool,
+) -> OutboxManifest {
+    let (mut manifest, quarantined) = load_manifest(state_dir, session_id);
+
+    // 引擎启动时采集默认关闭。上次遗留的非终态分片视为采集已中断：
+    // 本地未发送项直接终态，服务端可能已接收的项保留 CancelPending，
+    // 等 sync_complete 后先补发取消，绝不自动恢复旧音频上传。
+    let cancellation =
+        outbox::cancel_for_capture_stop(&mut manifest, crate::protocol::CAPTURE_INTERRUPTED_REASON);
+    for file in &cancellation.files_to_delete {
+        let _ = std::fs::remove_file(audio_dir.join(file));
+    }
+    if cancellation.changed {
+        persist_manifest(state_dir, &manifest, stopped);
+    }
+    // 序号水位对齐挪到 run_ws 内(异步上下文):此处同步 block_on 会与 tauri 的
+    // tokio runtime 嵌套冲突。本地水位先保留,连上服务端后立即对齐。
+    if quarantined {
+        eprintln!("engine: manifest 不可信,本次启动跳过孤儿 WAV 清理(音频保留待恢复)");
+    } else {
+        sweep_orphans(&audio_dir, &manifest);
+    }
+    manifest
 }
 
 /// 关闭采集门禁并同步冻结当前 outbox。该函数只在命令队列处理完成或引擎任务
@@ -233,6 +316,7 @@ pub async fn apply_capture_inactive(
     state_dir: &Path,
     audio_dir: &Path,
     emit: &EngineEventEmitter,
+    stopped: &AtomicBool,
 ) {
     let mut m = manifest.lock().await;
     let result = outbox::cancel_for_capture_stop(&mut m, reason);
@@ -243,7 +327,7 @@ pub async fn apply_capture_inactive(
         let _ = std::fs::remove_file(audio_dir.join(file));
     }
     let stats = outbox::stats_of(&m);
-    persist_manifest(state_dir, &m);
+    persist_manifest(state_dir, &m, stopped);
     drop(m);
     emit(EngineEvent::Outbox { stats });
 }
@@ -276,6 +360,8 @@ pub struct Engine {
     pub audio_dir: PathBuf,
     pub emit: EngineEventEmitter,
     pub session_id: String,
+    /// 本引擎的停止标记:run_ws 收到 Stop 置位,所有 manifest 落盘路径共享。
+    stopped: SharedStopped,
 }
 
 impl Engine {
@@ -293,24 +379,8 @@ impl Engine {
         let _ = std::fs::create_dir_all(&audio_dir);
 
         let cursor = load_cursor(&state_dir, &session_id);
-        let mut manifest = load_manifest(&state_dir, &session_id);
-
-        // 引擎启动时采集默认关闭。上次遗留的非终态分片视为采集已中断：
-        // 本地未发送项直接终态，服务端可能已接收的项保留 CancelPending，
-        // 等 sync_complete 后先补发取消，绝不自动恢复旧音频上传。
-        let cancellation = outbox::cancel_for_capture_stop(
-            &mut manifest,
-            crate::protocol::CAPTURE_INTERRUPTED_REASON,
-        );
-        for file in &cancellation.files_to_delete {
-            let _ = std::fs::remove_file(audio_dir.join(file));
-        }
-        if cancellation.changed {
-            persist_manifest(&state_dir, &manifest);
-        }
-        // 序号水位对齐挪到 run_ws 内(异步上下文):此处同步 block_on 会与 tauri 的
-        // tokio runtime 嵌套冲突。本地水位先保留,连上服务端后立即对齐。
-        sweep_orphans(&audio_dir, &manifest);
+        let stopped: SharedStopped = Arc::new(AtomicBool::new(false));
+        let manifest = startup_manifest(&state_dir, &audio_dir, &session_id, &stopped);
         let manifest: SharedManifest = Arc::new(Mutex::new(manifest));
 
         tokio::spawn(super::ws_client::run_ws(
@@ -326,6 +396,7 @@ impl Engine {
             state_dir.clone(),
             audio_dir.clone(),
             emit.clone(),
+            stopped.clone(),
         ));
 
         Self {
@@ -335,6 +406,7 @@ impl Engine {
             audio_dir,
             emit,
             session_id,
+            stopped,
         }
     }
 
@@ -381,6 +453,7 @@ impl Engine {
             &self.state_dir,
             &self.audio_dir,
             &self.emit,
+            &self.stopped,
         )
         .await;
     }
@@ -417,6 +490,7 @@ pub async fn reconcile(
     state_dir: &Path,
     audio_dir: &Path,
     emit: &EngineEventEmitter,
+    stopped: &AtomicBool,
 ) {
     let mut all = Vec::new();
     let mut cursor: i64 = -1;
@@ -530,7 +604,7 @@ pub async fn reconcile(
             }
         }
         let stats = outbox::stats_of(&m);
-        persist_manifest(state_dir, &m);
+        persist_manifest(state_dir, &m, stopped);
         drop(m);
         emit(EngineEvent::Outbox { stats });
     }
@@ -619,6 +693,7 @@ mod tests {
             &state_dir,
             &audio_dir,
             &emit,
+            &AtomicBool::new(false),
         )
         .await;
 
@@ -688,6 +763,7 @@ mod tests {
             audio_dir: audio_dir.clone(),
             emit: Arc::new(|_| {}),
             session_id: "session-1".into(),
+            stopped: Arc::new(AtomicBool::new(false)),
         };
 
         tokio::time::timeout(
@@ -717,6 +793,7 @@ mod tests {
             audio_dir: PathBuf::new(),
             emit: Arc::new(|_| {}),
             session_id: "session-1".into(),
+            stopped: Arc::new(AtomicBool::new(false)),
         };
 
         let error = tokio::time::timeout(Duration::from_secs(1), engine.activate_capture("start"))
@@ -724,5 +801,119 @@ mod tests {
             .expect("activation should not hang")
             .expect_err("activation without an ack must fail");
         assert!(error.contains("尚未开启"));
+    }
+
+    #[test]
+    fn corrupt_manifest_is_quarantined_and_wavs_survive_startup_sweep() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-interview-engine-corrupt-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let state_dir = root.join("state");
+        let audio_dir = root.join("audio");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::create_dir_all(&audio_dir).expect("create audio dir");
+        // 半截 JSON:解析必败;同时留一个 manifest 未引用的 WAV,
+        // 修复前会被 startup sweep 当孤儿删光(E4)。
+        std::fs::write(state_dir.join("outbox-session-1.json"), "{\"records\": [")
+            .expect("write corrupt manifest");
+        std::fs::write(audio_dir.join("pending-chunk.wav"), b"wav").expect("write pending wav");
+
+        let manifest =
+            startup_manifest(&state_dir, &audio_dir, "session-1", &AtomicBool::new(false));
+
+        assert!(manifest.records.is_empty());
+        assert!(
+            audio_dir.join("pending-chunk.wav").exists(),
+            "manifest 不可信时孤儿 WAV 必须保留"
+        );
+        let quarantine = state_dir.join("outbox-session-1.corrupt");
+        assert!(quarantine.exists(), "损坏文件必须隔离保留");
+        assert!(!state_dir.join("outbox-session-1.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(&quarantine).expect("read quarantined file"),
+            "{\"records\": [",
+            "隔离文件应保留原始字节供恢复"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove test dir");
+    }
+
+    #[test]
+    fn valid_manifest_still_sweeps_orphan_wavs() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-interview-engine-sweep-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let state_dir = root.join("state");
+        let audio_dir = root.join("audio");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::create_dir_all(&audio_dir).expect("create audio dir");
+        let valid = serde_json::to_string(&OutboxManifest::empty("session-1")).expect("serialize");
+        std::fs::write(state_dir.join("outbox-session-1.json"), valid).expect("write manifest");
+        std::fs::write(audio_dir.join("orphan-chunk.wav"), b"wav").expect("write orphan wav");
+
+        let manifest =
+            startup_manifest(&state_dir, &audio_dir, "session-1", &AtomicBool::new(false));
+
+        assert!(manifest.records.is_empty());
+        // manifest 可信时清理照常:跳过只发生在损坏/不可读的场景
+        assert!(!audio_dir.join("orphan-chunk.wav").exists());
+        assert!(state_dir.join("outbox-session-1.json").exists());
+
+        std::fs::remove_dir_all(root).expect("remove test dir");
+    }
+
+    #[test]
+    fn persist_manifest_after_stop_is_skipped() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-interview-engine-stop-persist-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let manifest = OutboxManifest::empty("session-1");
+        let path = state_dir.join("outbox-session-1.json");
+
+        let running = AtomicBool::new(false);
+        persist_manifest(&state_dir, &manifest, &running);
+        assert!(path.exists(), "运行中持久化照常");
+
+        std::fs::remove_file(&path).expect("remove manifest");
+        running.store(true, Ordering::SeqCst);
+        persist_manifest(&state_dir, &manifest, &running);
+        assert!(!path.exists(), "Stop 后的落盘必须是 no-op(E1c)");
+
+        std::fs::remove_dir_all(root).expect("remove test dir");
+    }
+
+    #[test]
+    fn atomic_write_roundtrips_and_overwrites() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-interview-engine-atomic-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("create dir");
+        let path = root.join("outbox-session-1.json");
+
+        atomic_write(&path, "{\"nextChunkSeq\":1}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read after write"),
+            "{\"nextChunkSeq\":1}"
+        );
+
+        // 覆盖写:rename 替换既有文件后读到的必须是新内容,tmp 不残留
+        atomic_write(&path, "{\"nextChunkSeq\":2}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read after overwrite"),
+            "{\"nextChunkSeq\":2}"
+        );
+        assert!(!root.join("outbox-session-1.tmp").exists());
+
+        std::fs::remove_dir_all(root).expect("remove test dir");
     }
 }

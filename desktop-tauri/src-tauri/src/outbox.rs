@@ -53,6 +53,10 @@ pub struct CancelIntent {
     pub reason: String,
 }
 
+/// paid_usage_limited 连续受限达到该次数后终止:配额阻塞不会自愈,无上限
+/// 重试等于每 ~30s 一次的永动循环(与 processing_failed 的上限对齐)。
+pub const MAX_PAID_USAGE_LIMITED_ATTEMPTS: u32 = 3;
+
 /// 退避:min(30s, 1s·2^attempts) ±20% 抖动。
 pub fn retry_delay_ms(attempts: u32, random: f64) -> u64 {
     let base = (30_000u64).min(1000u64 << attempts.min(5)) as f64;
@@ -256,10 +260,15 @@ pub fn transition(record: &OutboxRecord, input: &Transition) -> Option<OutboxRec
                 next.server_error = Some(code.clone());
             }
             "paid_usage_limited" if record.state == OutboxState::Sending => {
-                next.state = OutboxState::RetryableFailed;
-                next.attempts = record.attempts + 1;
-                next.next_attempt_at = now + retry_delay_ms(record.attempts + 1, rand_f64());
+                let attempts = record.attempts + 1;
+                next.attempts = attempts;
                 next.server_error = Some(code.clone());
+                if attempts >= MAX_PAID_USAGE_LIMITED_ATTEMPTS {
+                    next.state = OutboxState::TerminalError;
+                } else {
+                    next.state = OutboxState::RetryableFailed;
+                    next.next_attempt_at = now + retry_delay_ms(attempts, rand_f64());
+                }
             }
             "audio_sequence_gap" if record.state == OutboxState::Sending => {
                 // 等待重发(missing_predecessor 事件或对账驱动)
@@ -553,6 +562,49 @@ mod tests {
             current.attempts,
             crate::protocol::MAX_PROCESSING_FAILED_ATTEMPTS
         );
+    }
+
+    #[test]
+    fn paid_usage_limited_retries_are_capped_and_stop_after_three_hits() {
+        let mut current = record(OutboxState::Sending, 0);
+
+        for expected_attempts in 1..MAX_PAID_USAGE_LIMITED_ATTEMPTS {
+            current = transition(
+                &current,
+                &Transition::ErrorCode {
+                    code: "paid_usage_limited".into(),
+                    now: 1_000,
+                },
+            )
+            .expect("usage-limited hit should move to retryable");
+            assert_eq!(current.state, OutboxState::RetryableFailed);
+            assert_eq!(current.attempts, expected_attempts);
+            assert!(current.next_attempt_at > 1_000);
+
+            current = transition(&current, &Transition::SendStarted { now: 2_000 })
+                .expect("retryable record should send again");
+        }
+
+        current = transition(
+            &current,
+            &Transition::ErrorCode {
+                code: "paid_usage_limited".into(),
+                now: 3_000,
+            },
+        )
+        .expect("third usage-limited hit should become terminal");
+        assert_eq!(current.state, OutboxState::TerminalError);
+        assert_eq!(current.attempts, MAX_PAID_USAGE_LIMITED_ATTEMPTS);
+        assert_eq!(current.server_error.as_deref(), Some("paid_usage_limited"));
+        // 终态后再收到同一错误码不再迁移,退避循环真正终止
+        assert!(transition(
+            &current,
+            &Transition::ErrorCode {
+                code: "paid_usage_limited".into(),
+                now: 4_000,
+            },
+        )
+        .is_none());
     }
 
     #[test]

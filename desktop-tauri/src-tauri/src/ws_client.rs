@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -25,7 +26,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::backoff;
 use crate::engine::{
     self, now_ms, rand_f64, EngineCommand, EngineEvent, EngineEventEmitter, SharedManifest,
-    MAX_INFLIGHT_QUEUED,
+    SharedStopped, MAX_INFLIGHT_QUEUED,
 };
 use crate::outbox::{self, CancelIntent, OutboxState, Transition};
 use crate::protocol::{is_fatal_close_code, PROTOCOL_VERSION};
@@ -39,6 +40,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// sync_complete 后同步对账的上限:对账要「先于泵送」完成(防止旧分片抢发),
 /// 但 50 页 × 15s 的 REST 最坏情况不能让 WS 读循环停摆,超时则放弃本次对账。
 const RECONCILE_BUDGET: Duration = Duration::from_secs(30);
+/// 启动序号水位扫描的整体上限:扫描期间命令队列照常轮询,Stop 可秒级中止;
+/// 否则旧引擎最坏 50 页 × 15s 不处理 Stop,收尾把过期 manifest 盖到新引擎
+/// 已写的文件上(E1a)。
+const STARTUP_SCAN_BUDGET: Duration = Duration::from_secs(30);
+/// 连接被视为「稳定」的最短存活时间(自 sync_complete 起):只有稳定连接断开
+/// 才重置重连计数,握手完成即断的服务端不再制造 0.5-1.5s 永久重连风暴(E6)。
+const STABLE_CONNECTION_WINDOW: Duration = Duration::from_secs(30);
+/// Stop 兜底补发 end_session 的 REST 超时:best-effort,不能拖慢引擎退出(E3)。
+const REST_END_ON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 游标合并写窗口:同一批事件推进多次游标时只落盘一次。
 const CURSOR_FLUSH_INTERVAL_MS: u64 = 500;
 
@@ -65,7 +75,9 @@ fn ws_url(server_url: &str, session_id: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
-/// 异步对账(spawn 后台任务,不阻塞 WS 循环)。
+/// 异步对账(spawn 后台任务,不阻塞 WS 循环)。返回句柄供 Stop 时 abort:
+/// 残留任务会在引擎停止/被替换后把过期 manifest 盖到新引擎写入的文件上,
+/// abort 在 await 点生效,残余竞态由 stopped 落盘闸兜住(E1b/E1c)。
 fn spawn_reconcile(
     ctx: &crate::rest::RestContext,
     session_id: &str,
@@ -73,20 +85,42 @@ fn spawn_reconcile(
     state_dir: &Path,
     audio_dir: &Path,
     emit: &EngineEventEmitter,
-) {
+    stopped: &SharedStopped,
+) -> tokio::task::JoinHandle<()> {
     let ctx = ctx.clone();
     let session_id = session_id.to_string();
     let manifest = manifest.clone();
     let state_dir = state_dir.to_path_buf();
     let audio_dir = audio_dir.to_path_buf();
     let emit = emit.clone();
+    let stopped = stopped.clone();
     tokio::spawn(async move {
-        engine::reconcile(&ctx, &session_id, &manifest, &state_dir, &audio_dir, &emit).await;
-    });
+        engine::reconcile(
+            &ctx,
+            &session_id,
+            &manifest,
+            &state_dir,
+            &audio_dir,
+            &emit,
+            &stopped,
+        )
+        .await;
+    })
 }
 
 fn pc_upload_allowed(capture_active: bool, session_status: &str, radio_mode: &str) -> bool {
     capture_active && session_status == "recording" && radio_mode != "mobile"
+}
+
+/// 断开时用于退避的尝试次数:连接自 sync_complete 起稳定满窗口 → 归零
+/// (正常会话断开后快速重连);否则保留现有计数,握手即断的服务端退避
+/// 随失败次数持续增长(E6)。
+fn attempt_for_backoff(current: u32, sync_completed_at: Option<Instant>) -> u32 {
+    if sync_completed_at.is_some_and(|at| at.elapsed() >= STABLE_CONNECTION_WINDOW) {
+        0
+    } else {
+        current
+    }
 }
 
 fn cancel_audio_source_message(intent: &CancelIntent) -> Value {
@@ -114,6 +148,7 @@ async fn send_pending_cancel(
     manifest: &SharedManifest,
     state_dir: &Path,
     emit: &EngineEventEmitter,
+    stopped: &std::sync::atomic::AtomicBool,
 ) -> bool {
     let intent = {
         let m = manifest.lock().await;
@@ -138,7 +173,7 @@ async fn send_pending_cancel(
     let mut m = manifest.lock().await;
     if outbox::clear_cancel_intent_if_resolved(&mut m) {
         let stats = outbox::stats_of(&m);
-        engine::persist_manifest(state_dir, &m);
+        engine::persist_manifest(state_dir, &m, stopped);
         drop(m);
         emit(EngineEvent::Outbox { stats });
     }
@@ -146,6 +181,7 @@ async fn send_pending_cancel(
 }
 
 /// 引擎主循环:WS 会话 + 泵驱动 + 命令分发,直到致命错误/停止。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ws(
     opts: WsClientOptions,
     ctx: crate::rest::RestContext,
@@ -154,10 +190,10 @@ pub async fn run_ws(
     state_dir: PathBuf,
     audio_dir: PathBuf,
     emit: EngineEventEmitter,
+    stopped_flag: SharedStopped,
 ) {
     let mut last_event_id = opts.last_event_id;
     let mut attempt: u32 = 0;
-    let mut stopped = false;
     let mut current_session_status = String::new();
     let mut current_radio_mode = String::from("pc");
     // 安全默认：重进页面或应用重启后，不自动恢复旧音频上传。
@@ -166,35 +202,71 @@ pub async fn run_ws(
     // 重连退避期无法执行的命令必须跨连接保留。尤其 end_session 若被吞，
     // 调用方已收到 channel send 成功，REST 兜底不会再触发。
     let mut pending_commands = VecDeque::new();
+    // 残留对账任务句柄:Stop/退出时统一 abort(E1b)。
+    let mut reconcile_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // 引擎启动即推送序号水位(含本地 outbox 积压),前端 sequencer 以此为权威对齐。
     // 水位 = max(本地 manifest, 服务端已见最大 seq + 1),避免重进会话时新分片撞旧 seq。
+    // 扫描受 STARTUP_SCAN_BUDGET 整体约束,期间命令队列照常轮询:Stop 中止扫描
+    // 并直接走退出路径,不再出现分钟级无响应(E1a)。
     {
-        let server_next = engine::server_next_chunk_seq(&ctx, &opts.session_id).await;
-        let next = {
-            let mut m = manifest.lock().await;
-            let previous_next = m.next_chunk_seq;
-            let previous_intent = m.cancel_intent.clone();
-            m.next_chunk_seq = m.next_chunk_seq.max(server_next);
-            let cancel_through = m.next_chunk_seq.saturating_sub(1);
-            if let Some(intent) = m.cancel_intent.as_mut() {
-                intent.through_chunk_seq = intent.through_chunk_seq.max(cancel_through);
+        let scan_deadline = Instant::now() + STARTUP_SCAN_BUDGET;
+        let scan = engine::server_next_chunk_seq(&ctx, &opts.session_id, scan_deadline);
+        tokio::pin!(scan);
+        let mut server_next: i64 = 0;
+        let mut scan_finished = false;
+        while !scan_finished {
+            tokio::select! {
+                result = &mut scan => {
+                    server_next = result;
+                    scan_finished = true;
+                }
+                cmd = cmd_rx.recv() => {
+                    if !handle_wait_command(
+                        cmd,
+                        &stopped_flag,
+                        &mut capture_active,
+                        &mut capture_inactive_reason,
+                        &mut pending_commands,
+                        &opts.session_id,
+                        &manifest,
+                        &state_dir,
+                        &audio_dir,
+                        &emit,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
             }
-            if m.next_chunk_seq != previous_next || m.cancel_intent != previous_intent {
-                engine::persist_manifest(&state_dir, &m);
-            }
-            emit(EngineEvent::Outbox {
-                stats: outbox::stats_of(&m),
+        }
+        if !stopped_flag.load(Ordering::SeqCst) {
+            let next = {
+                let mut m = manifest.lock().await;
+                let previous_next = m.next_chunk_seq;
+                let previous_intent = m.cancel_intent.clone();
+                m.next_chunk_seq = m.next_chunk_seq.max(server_next);
+                let cancel_through = m.next_chunk_seq.saturating_sub(1);
+                if let Some(intent) = m.cancel_intent.as_mut() {
+                    intent.through_chunk_seq = intent.through_chunk_seq.max(cancel_through);
+                }
+                if m.next_chunk_seq != previous_next || m.cancel_intent != previous_intent {
+                    engine::persist_manifest(&state_dir, &m, &stopped_flag);
+                }
+                emit(EngineEvent::Outbox {
+                    stats: outbox::stats_of(&m),
+                });
+                m.next_chunk_seq
+            };
+            emit(EngineEvent::SeqWatermark {
+                next_chunk_seq: next,
             });
-            m.next_chunk_seq
-        };
-        emit(EngineEvent::SeqWatermark {
-            next_chunk_seq: next,
-        });
+        }
     }
 
     'outer: loop {
-        if stopped {
+        if stopped_flag.load(Ordering::SeqCst) {
             break;
         }
         emit(EngineEvent::Connection {
@@ -230,7 +302,7 @@ pub async fn run_ws(
                     if !sleep_interruptible(
                         &mut cmd_rx,
                         delay,
-                        &mut stopped,
+                        &stopped_flag,
                         &mut capture_active,
                         &mut capture_inactive_reason,
                         &mut pending_commands,
@@ -257,7 +329,7 @@ pub async fn run_ws(
                     if !sleep_interruptible(
                         &mut cmd_rx,
                         delay,
-                        &mut stopped,
+                        &stopped_flag,
                         &mut capture_active,
                         &mut capture_inactive_reason,
                         &mut pending_commands,
@@ -302,7 +374,7 @@ pub async fn run_ws(
             if !sleep_interruptible(
                 &mut cmd_rx,
                 delay,
-                &mut stopped,
+                &stopped_flag,
                 &mut capture_active,
                 &mut capture_inactive_reason,
                 &mut pending_commands,
@@ -324,6 +396,9 @@ pub async fn run_ws(
         let mut last_ping_at: Option<Instant> = None;
         let mut pong_deadline: Option<Instant> = None;
         let mut close_code_seen: Option<u16> = None;
+        // 本连接 sync_complete 的时刻:断开时据此判断连接是否「稳定」,
+        // 只有稳定连接才重置重连计数(E6)。
+        let mut sync_completed_at: Option<Instant> = None;
         let mut cursor_throttle = CursorThrottle::default();
         // 同类错误码 5s 抑制窗口:批量失败只上报一次,避免前端 toast 刷屏
         let mut last_error_emit: std::collections::HashMap<String, Instant> =
@@ -388,7 +463,11 @@ pub async fn run_ws(
                             match msg_type.as_str() {
                                 "sync_complete" => {
                                     authenticated = true;
-                                    attempt = 0;
+                                    // E6:这里不再清零重连计数。若握手完成即断的
+                                    // 服务端每次都归零,配合 .max(500) 下限会形成
+                                    // 0.5-1.5s 永久重连风暴;改为记录 sync 时刻,
+                                    // 断开时连接稳定满窗口才重置。
+                                    sync_completed_at = Some(Instant::now());
                                     last_ping_at = None;
                                     pong_deadline = None;
                                     if let Some(latest) = parsed.get("latest_event_id").and_then(|v| v.as_i64()) {
@@ -421,6 +500,7 @@ pub async fn run_ws(
                                         &manifest,
                                         &state_dir,
                                         &emit,
+                                        &stopped_flag,
                                     )
                                     .await
                                     {
@@ -440,6 +520,7 @@ pub async fn run_ws(
                                             &state_dir,
                                             &audio_dir,
                                             &emit,
+                                            &stopped_flag,
                                         ),
                                     )
                                     .await
@@ -456,6 +537,7 @@ pub async fn run_ws(
                                         &state_dir,
                                         &audio_dir,
                                         &emit,
+                                        &stopped_flag,
                                         pc_upload_allowed(
                                             capture_active,
                                             &current_session_status,
@@ -480,10 +562,20 @@ pub async fn run_ws(
                                         &state_dir,
                                         &audio_dir,
                                         &emit,
+                                        &stopped_flag,
                                     )
                                     .await;
                                     if code == "audio_sequence_gap" {
-                                        spawn_reconcile(&ctx, &opts.session_id, &manifest, &state_dir, &audio_dir, &emit);
+                                        reconcile_tasks.retain(|task| !task.is_finished());
+                                        reconcile_tasks.push(spawn_reconcile(
+                                            &ctx,
+                                            &opts.session_id,
+                                            &manifest,
+                                            &state_dir,
+                                            &audio_dir,
+                                            &emit,
+                                            &stopped_flag,
+                                        ));
                                     }
                                     let resume_after_terminal_error = code == "invalid_audio_chunk"
                                         && pc_upload_allowed(
@@ -507,6 +599,7 @@ pub async fn run_ws(
                                             &state_dir,
                                             &audio_dir,
                                             &emit,
+                                            &stopped_flag,
                                             true,
                                         )
                                         .await;
@@ -528,7 +621,7 @@ pub async fn run_ws(
                                     }
                                     let mut should_resume_pump = false;
                                     if msg_type == "chunk_ack" {
-                                        apply_chunk_ack(&parsed, &manifest, &state_dir, &audio_dir, &emit).await;
+                                        apply_chunk_ack(&parsed, &manifest, &state_dir, &audio_dir, &emit, &stopped_flag).await;
                                         should_resume_pump = true;
                                     } else if msg_type == "session_state" {
                                         current_session_status = parsed
@@ -555,6 +648,7 @@ pub async fn run_ws(
                                             &state_dir,
                                             &audio_dir,
                                             &emit,
+                                            &stopped_flag,
                                             pc_upload_allowed(
                                                 capture_active,
                                                 &current_session_status,
@@ -629,6 +723,7 @@ pub async fn run_ws(
                                 &audio_dir,
                                 &emit,
                                 capture_active,
+                                &stopped_flag,
                             )
                             .await;
                             if accepted && authenticated {
@@ -638,6 +733,7 @@ pub async fn run_ws(
                                     &state_dir,
                                     &audio_dir,
                                     &emit,
+                                    &stopped_flag,
                                     pc_upload_allowed(
                                         capture_active,
                                         &current_session_status,
@@ -696,6 +792,7 @@ pub async fn run_ws(
                                     &state_dir,
                                     &audio_dir,
                                     &emit,
+                                    &stopped_flag,
                                 )
                                 .await;
                             }
@@ -709,6 +806,7 @@ pub async fn run_ws(
                                         &manifest,
                                         &state_dir,
                                         &emit,
+                                        &stopped_flag,
                                     )
                                     .await
                                 {
@@ -721,6 +819,7 @@ pub async fn run_ws(
                                     &state_dir,
                                     &audio_dir,
                                     &emit,
+                                    &stopped_flag,
                                     pc_upload_allowed(
                                         capture_active,
                                         &current_session_status,
@@ -738,6 +837,7 @@ pub async fn run_ws(
                                     &state_dir,
                                     &audio_dir,
                                     &emit,
+                                    &stopped_flag,
                                     pc_upload_allowed(
                                         capture_active,
                                         &current_session_status,
@@ -751,7 +851,16 @@ pub async fn run_ws(
                         }
                         Some(EngineCommand::Reconcile) => {
                             if authenticated {
-                                spawn_reconcile(&ctx, &opts.session_id, &manifest, &state_dir, &audio_dir, &emit);
+                                reconcile_tasks.retain(|task| !task.is_finished());
+                                reconcile_tasks.push(spawn_reconcile(
+                                    &ctx,
+                                    &opts.session_id,
+                                    &manifest,
+                                    &state_dir,
+                                    &audio_dir,
+                                    &emit,
+                                    &stopped_flag,
+                                ));
                             } else {
                                 pending_commands.push_back(EngineCommand::Reconcile);
                             }
@@ -766,6 +875,7 @@ pub async fn run_ws(
                         Some(EngineCommand::Stop) | None => {
                             let _ = write.close().await;
                             cursor_throttle.flush(&state_dir, &opts.session_id, last_event_id);
+                            stopped_flag.store(true, Ordering::SeqCst);
                             break 'outer;
                         }
                     }
@@ -776,7 +886,7 @@ pub async fn run_ws(
         // 连接层结束:根据 close 码决定后续
         let code = close_code_seen.unwrap_or(1006);
         cursor_throttle.flush(&state_dir, &opts.session_id, last_event_id);
-        if stopped {
+        if stopped_flag.load(Ordering::SeqCst) {
             break;
         }
         if code == crate::protocol::WS_CLOSE_NORMAL {
@@ -801,7 +911,7 @@ pub async fn run_ws(
                     }
                 }
                 let stats = outbox::stats_of(&m);
-                engine::persist_manifest(&state_dir, &m);
+                engine::persist_manifest(&state_dir, &m, &stopped_flag);
                 drop(m);
                 emit(EngineEvent::Outbox { stats });
             }
@@ -826,9 +936,11 @@ pub async fn run_ws(
         let delay = if code == crate::protocol::WS_CLOSE_AUTH_RATE_LIMITED {
             backoff::auth_rate_limit_delay_ms(rand_f64())
         } else {
-            let d = backoff::backoff_delay_ms(attempt, rand_f64()).max(500);
-            attempt += 1;
-            d
+            // E6:仅当连接自 sync_complete 起稳定满窗口才归零计数(正常快速
+            // 重连);否则保留计数,让退避随失败次数继续增长。
+            let effective = attempt_for_backoff(attempt, sync_completed_at);
+            attempt = effective + 1;
+            backoff::backoff_delay_ms(effective, rand_f64()).max(500)
         };
         emit(EngineEvent::Connection {
             phase: engine::phase::RECONNECTING,
@@ -842,7 +954,7 @@ pub async fn run_ws(
         if !sleep_interruptible(
             &mut cmd_rx,
             delay,
-            &mut stopped,
+            &stopped_flag,
             &mut capture_active,
             &mut capture_inactive_reason,
             &mut pending_commands,
@@ -858,11 +970,20 @@ pub async fn run_ws(
         }
     }
 
-    // 引擎被停掉（离开实时页 / live_disconnect）时上面的循环直接 break，
-    // 不经过正常关链路，也就没有任何事件通知前端。悬浮窗会因此永远停在
-    // 最后一次会话状态（比如"录制中"）。这里补一条 closed 把状态收干净；
-    // 正常结束（close 码 1000）路径在循环里已经发过 closed，不会走到这。
-    if stopped {
+    // E1b:退出前撤掉仍在跑的对账任务,防止引擎停止/被替换后其收尾写入
+    // 覆盖新引擎的 manifest。abort 在下一个 await 点生效,竞态窗口由
+    // persist_manifest 的 stopped 闸兜住(E1c)。
+    for task in reconcile_tasks.drain(..) {
+        task.abort();
+    }
+    // E3:Stop 时排空退避期缓存的命令。end_session 的 channel send 已向调用
+    // 方返回成功,REST 兜底不会再触发;不补发会话会永远挂在 recording。
+    if stopped_flag.load(Ordering::SeqCst) {
+        drain_pending_on_stop(&mut pending_commands, &ctx, &opts.session_id).await;
+        // 引擎被停掉（离开实时页 / live_disconnect）时上面的循环直接 break，
+        // 不经过正常关链路，也就没有任何事件通知前端。悬浮窗会因此永远停在
+        // 最后一次会话状态（比如"录制中"）。这里补一条 closed 把状态收干净；
+        // 正常结束（close 码 1000）路径在循环里已经发过 closed，不会走到这。
         emit(EngineEvent::Connection {
             phase: engine::phase::CLOSED,
             note: Some("连接已断开".into()),
@@ -917,6 +1038,7 @@ impl CursorThrottle {
 }
 
 /// 新分片:落盘 → manifest → 泵。
+#[allow(clippy::too_many_arguments)]
 async fn add_chunk(
     chunk: &crate::engine::NewChunk,
     session_id: &str,
@@ -925,6 +1047,7 @@ async fn add_chunk(
     audio_dir: &Path,
     emit: &EngineEventEmitter,
     capture_active: bool,
+    stopped: &AtomicBool,
 ) -> bool {
     // SetCaptureActive(false) 处理完成后，renderer invoke 仍可能晚到。
     // 必须在分配序号和持久化 Captured 之前拒绝，否则崩溃窗口会留下一个
@@ -967,13 +1090,12 @@ async fn add_chunk(
     m.records.push(record);
     let next_chunk_seq = m.next_chunk_seq;
     let stats = outbox::stats_of(&m);
-    engine::persist_manifest(state_dir, &m);
+    engine::persist_manifest(state_dir, &m, stopped);
     drop(m);
     if let Some(file) = failed_file {
         // WAV 落盘失败:分片已进 manifest(泵读到文件缺失会转终态),但要告知
         // 前端磁盘异常;每次失败都发会刷屏,进程生命周期内只发一次。
         // 锁外 emit,遵循本文件「先 drop 锁再发事件」的约定。
-        use std::sync::atomic::{AtomicBool, Ordering};
         static ALERTED: AtomicBool = AtomicBool::new(false);
         if !ALERTED.swap(true, Ordering::Relaxed) {
             emit(EngineEvent::ServerError {
@@ -996,6 +1118,7 @@ async fn apply_chunk_ack(
     state_dir: &Path,
     audio_dir: &Path,
     emit: &EngineEventEmitter,
+    stopped: &AtomicBool,
 ) {
     let chunk_id = parsed
         .get("chunk_id")
@@ -1045,7 +1168,7 @@ async fn apply_chunk_ack(
     // 终态收敛点顺带淘汰超额旧记录(与本次 persist 合并,不增加写次数)
     outbox::evict_terminal_records(&mut m);
     let stats = outbox::stats_of(&m);
-    engine::persist_manifest(state_dir, &m);
+    engine::persist_manifest(state_dir, &m, stopped);
     drop(m);
     emit(EngineEvent::Outbox { stats });
 }
@@ -1059,6 +1182,7 @@ async fn handle_server_error(
     state_dir: &Path,
     audio_dir: &Path,
     emit: &EngineEventEmitter,
+    stopped: &AtomicBool,
 ) {
     let mut m = manifest.lock().await;
     let mut changed = false;
@@ -1090,7 +1214,7 @@ async fn handle_server_error(
     }
     if changed {
         let stats = outbox::stats_of(&m);
-        engine::persist_manifest(state_dir, &m);
+        engine::persist_manifest(state_dir, &m, stopped);
         drop(m);
         emit(EngineEvent::Outbox { stats });
     }
@@ -1103,12 +1227,14 @@ type WsWrite = futures_util::stream::SplitSink<
 >;
 
 /// 尝试推进发送(幂等,可频繁调用;严格按 seq,受在途上限约束)。
+#[allow(clippy::too_many_arguments)]
 async fn try_pump(
     write: &mut WsWrite,
     manifest: &SharedManifest,
     state_dir: &Path,
     audio_dir: &Path,
     emit: &EngineEventEmitter,
+    stopped: &AtomicBool,
     pc_upload_allowed: bool,
 ) {
     if !pc_upload_allowed {
@@ -1161,7 +1287,7 @@ async fn try_pump(
             guard.records[idx] = moved;
         }
         let stats = outbox::stats_of(&guard);
-        engine::persist_manifest(state_dir, &guard);
+        engine::persist_manifest(state_dir, &guard, stopped);
         drop(guard);
         emit(EngineEvent::Outbox { stats });
         return;
@@ -1171,7 +1297,7 @@ async fn try_pump(
         guard.records[idx] = moved;
     }
     let stats = outbox::stats_of(&guard);
-    engine::persist_manifest(state_dir, &guard);
+    engine::persist_manifest(state_dir, &guard, stopped);
     drop(guard);
 
     let payload = json!({
@@ -1196,7 +1322,7 @@ async fn try_pump(
             if m.records[idx].state == OutboxState::Sending {
                 m.records[idx].state = OutboxState::Captured;
             }
-            engine::persist_manifest(state_dir, &m);
+            engine::persist_manifest(state_dir, &m, stopped);
         }
     }
     emit(EngineEvent::Outbox { stats });
@@ -1209,6 +1335,7 @@ async fn try_pump(
         state_dir,
         audio_dir,
         emit,
+        stopped,
         pc_upload_allowed,
     ))
     .await;
@@ -1228,12 +1355,81 @@ async fn recv_engine_command(
     cmd_rx.recv().await
 }
 
+/// 等待类间隙(退避 sleep / 启动扫描)中收到的命令:Stop 中止等待并置位
+/// 停止标记,其余即时处理或缓存。返回 false 表示收到 Stop,调用方应立即退出。
+#[allow(clippy::too_many_arguments)]
+async fn handle_wait_command(
+    cmd: Option<EngineCommand>,
+    stopped: &AtomicBool,
+    capture_active: &mut bool,
+    capture_inactive_reason: &mut String,
+    pending_commands: &mut VecDeque<EngineCommand>,
+    session_id: &str,
+    manifest: &SharedManifest,
+    state_dir: &Path,
+    audio_dir: &Path,
+    emit: &EngineEventEmitter,
+) -> bool {
+    match cmd {
+        Some(EngineCommand::Stop) | None => {
+            stopped.store(true, Ordering::SeqCst);
+            false
+        }
+        Some(EngineCommand::SetCaptureActive {
+            active,
+            reason,
+            ack,
+        }) => {
+            *capture_active = active;
+            emit(EngineEvent::CaptureState { active });
+            if !active {
+                *capture_inactive_reason = if reason.is_empty() {
+                    "capture_stopped".into()
+                } else {
+                    reason
+                };
+                engine::apply_capture_inactive(
+                    capture_inactive_reason,
+                    manifest,
+                    state_dir,
+                    audio_dir,
+                    emit,
+                    stopped,
+                )
+                .await;
+            }
+            if let Some(ack) = ack {
+                let _ = ack.send(());
+            }
+            true
+        }
+        Some(EngineCommand::AddChunk(chunk)) => {
+            add_chunk(
+                &chunk,
+                session_id,
+                manifest,
+                state_dir,
+                audio_dir,
+                emit,
+                *capture_active,
+                stopped,
+            )
+            .await;
+            true
+        }
+        Some(command) => {
+            pending_commands.push_back(command);
+            true
+        }
+    }
+}
+
 /// 可中断的 sleep:期间收到 Stop 立即返回 false；音频分片必须先落盘再重连。
 #[allow(clippy::too_many_arguments)]
 async fn sleep_interruptible(
     cmd_rx: &mut mpsc::UnboundedReceiver<EngineCommand>,
     ms: u64,
-    stopped: &mut bool,
+    stopped: &AtomicBool,
     capture_active: &mut bool,
     capture_inactive_reason: &mut String,
     pending_commands: &mut VecDeque<EngineCommand>,
@@ -1246,52 +1442,47 @@ async fn sleep_interruptible(
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(ms)) => true,
         cmd = cmd_rx.recv() => {
-            match cmd {
-                Some(EngineCommand::Stop) | None => {
-                    *stopped = true;
-                    false
-                }
-                Some(EngineCommand::SetCaptureActive { active, reason, ack }) => {
-                    *capture_active = active;
-                    emit(EngineEvent::CaptureState { active });
-                    if !active {
-                        *capture_inactive_reason = if reason.is_empty() {
-                            "capture_stopped".into()
-                        } else {
-                            reason
-                        };
-                        engine::apply_capture_inactive(
-                            capture_inactive_reason,
-                            manifest,
-                            state_dir,
-                            audio_dir,
-                            emit,
-                        )
-                        .await;
-                    }
-                    if let Some(ack) = ack {
-                        let _ = ack.send(());
-                    }
-                    true
-                }
-                Some(EngineCommand::AddChunk(chunk)) => {
-                    add_chunk(
-                        &chunk,
-                        session_id,
-                        manifest,
-                        state_dir,
-                        audio_dir,
-                        emit,
-                        *capture_active,
-                    )
-                    .await;
-                    true
-                }
-                Some(command) => {
-                    pending_commands.push_back(command);
-                    true
-                }
-            }
+            handle_wait_command(
+                cmd,
+                stopped,
+                capture_active,
+                capture_inactive_reason,
+                pending_commands,
+                session_id,
+                manifest,
+                state_dir,
+                audio_dir,
+                emit,
+            )
+            .await
+        }
+    }
+}
+
+/// Stop 兜底:排空退避期缓存的命令,其中夹着的 end_session 曾向调用方返回
+/// channel send 成功,REST 兜底不会再触发,不补发会话将永远挂在 recording。
+/// best-effort:短超时,失败只记日志不阻断退出(E3)。
+async fn drain_pending_on_stop(
+    pending_commands: &mut VecDeque<EngineCommand>,
+    ctx: &crate::rest::RestContext,
+    session_id: &str,
+) {
+    while let Some(command) = pending_commands.pop_front() {
+        let EngineCommand::Send(value) = command else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("end_session") {
+            continue;
+        }
+        match tokio::time::timeout(
+            REST_END_ON_STOP_TIMEOUT,
+            crate::rest::sessions_end(ctx, session_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("ws: Stop 时 REST end_session 失败:{e}"),
+            Err(_) => eprintln!("ws: Stop 时 REST end_session 超时"),
         }
     }
 }
@@ -1382,6 +1573,7 @@ mod tests {
             &audio_dir,
             &emit,
             true,
+            &AtomicBool::new(false),
         )
         .await;
         add_chunk(
@@ -1392,6 +1584,7 @@ mod tests {
             &audio_dir,
             &emit,
             true,
+            &AtomicBool::new(false),
         )
         .await;
 
@@ -1436,6 +1629,7 @@ mod tests {
             &audio_dir,
             &emit,
             false,
+            &AtomicBool::new(false),
         )
         .await;
 
@@ -1475,7 +1669,7 @@ mod tests {
         })))
         .expect("queue chunk during reconnect sleep");
 
-        let mut stopped = false;
+        let stopped_flag = AtomicBool::new(false);
         let mut capture_active = true;
         let mut inactive_reason = "capture_stopped".to_string();
         let mut pending_commands = VecDeque::new();
@@ -1483,7 +1677,7 @@ mod tests {
             sleep_interruptible(
                 &mut rx,
                 60_000,
-                &mut stopped,
+                &stopped_flag,
                 &mut capture_active,
                 &mut inactive_reason,
                 &mut pending_commands,
@@ -1503,7 +1697,7 @@ mod tests {
         drop(guard);
         assert!(audio_dir.join(format!("{chunk_id}.wav")).exists());
         assert!(state_dir.join("outbox-session-1.json").exists());
-        assert!(!stopped);
+        assert!(!stopped_flag.load(Ordering::SeqCst));
         assert!(pending_commands.is_empty());
         std::fs::remove_dir_all(root).expect("remove test dir");
     }
@@ -1542,7 +1736,7 @@ mod tests {
         })
         .expect("queue capture deactivation");
 
-        let mut stopped = false;
+        let stopped_flag = AtomicBool::new(false);
         let mut capture_active = true;
         let mut inactive_reason = "capture_stopped".to_string();
         let mut pending_commands = VecDeque::new();
@@ -1551,7 +1745,7 @@ mod tests {
                 sleep_interruptible(
                     &mut rx,
                     60_000,
-                    &mut stopped,
+                    &stopped_flag,
                     &mut capture_active,
                     &mut inactive_reason,
                     &mut pending_commands,
@@ -1591,7 +1785,7 @@ mod tests {
         assert_eq!(persisted.records[0].state, OutboxState::TerminalError);
         assert!(persisted.cancel_intent.is_some());
         assert!(pending_commands.is_empty());
-        assert!(!stopped);
+        assert!(!stopped_flag.load(Ordering::SeqCst));
         std::fs::remove_dir_all(root).expect("remove test dir");
     }
 
@@ -1621,7 +1815,7 @@ mod tests {
         })))
         .expect("queue chunk during reconnect sleep");
 
-        let mut stopped = false;
+        let stopped_flag = AtomicBool::new(false);
         let mut capture_active = false;
         let mut inactive_reason = "capture_stopped".to_string();
         let mut pending_commands = VecDeque::new();
@@ -1629,7 +1823,7 @@ mod tests {
             sleep_interruptible(
                 &mut rx,
                 60_000,
-                &mut stopped,
+                &stopped_flag,
                 &mut capture_active,
                 &mut inactive_reason,
                 &mut pending_commands,
@@ -1648,7 +1842,7 @@ mod tests {
         drop(guard);
         assert!(!audio_dir.join(format!("{chunk_id}.wav")).exists());
         assert!(!state_dir.join("outbox-session-1.json").exists());
-        assert!(!stopped);
+        assert!(!stopped_flag.load(Ordering::SeqCst));
         assert!(pending_commands.is_empty());
         std::fs::remove_dir_all(root).expect("remove test dir");
     }
@@ -1673,7 +1867,7 @@ mod tests {
         })))
         .expect("queue end_session during reconnect sleep");
 
-        let mut stopped = false;
+        let stopped_flag = AtomicBool::new(false);
         let mut capture_active = false;
         let mut inactive_reason = "capture_stopped".to_string();
         let mut pending_commands = VecDeque::new();
@@ -1681,7 +1875,7 @@ mod tests {
             sleep_interruptible(
                 &mut rx,
                 60_000,
-                &mut stopped,
+                &stopped_flag,
                 &mut capture_active,
                 &mut inactive_reason,
                 &mut pending_commands,
@@ -1703,7 +1897,7 @@ mod tests {
             other => panic!("expected buffered Send, got {other:?}"),
         }
         assert!(pending_commands.is_empty());
-        assert!(!stopped);
+        assert!(!stopped_flag.load(Ordering::SeqCst));
         std::fs::remove_dir_all(root).expect("remove test dir");
     }
 
@@ -1779,5 +1973,98 @@ mod tests {
         // 回归护栏:无上限的 connect/对账会让 WS 循环长时间不可中断
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(RECONCILE_BUDGET, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn startup_scan_budget_is_bounded() {
+        // 回归护栏:无上限的启动水位扫描会让 Stop 分钟级无人处理(E1a)
+        assert_eq!(STARTUP_SCAN_BUDGET, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reconnect_attempt_resets_only_after_stable_window() {
+        let now = Instant::now();
+        // 从未 sync_complete(认证阶段断开/超时):计数保持
+        assert_eq!(attempt_for_backoff(3, None), 3);
+        // 握手完成即断(未满稳定窗口):计数保持,退避随失败继续增长
+        assert_eq!(attempt_for_backoff(3, Some(now)), 3);
+        assert_eq!(
+            attempt_for_backoff(3, Some(now - STABLE_CONNECTION_WINDOW / 2)),
+            3
+        );
+        // 稳定满窗口:归零,恢复正常快速重连
+        assert_eq!(
+            attempt_for_backoff(3, Some(now - STABLE_CONNECTION_WINDOW)),
+            0
+        );
+        assert_eq!(
+            attempt_for_backoff(
+                7,
+                Some(now - STABLE_CONNECTION_WINDOW - Duration::from_secs(1))
+            ),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_drains_buffered_end_session_via_rest() {
+        // 迷你 HTTP 桩:收到 /end 请求即满足断言;响应可解析的 Session JSON,
+        // 让 drain 走 Ok 路径。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.expect("accept connection");
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = "{\"id\":\"session-1\",\"title\":\"t\",\"status\":\"ended\",\"radio_mode\":\"pc\",\"created_at\":\"2026-09-20T00:00:00Z\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            request
+        });
+
+        let ctx = crate::rest::RestContext {
+            server_url: format!("http://{addr}"),
+            token: "test-token".into(),
+        };
+        let mut pending_commands = VecDeque::new();
+        pending_commands.push_back(EngineCommand::Send(json!({
+            "v": PROTOCOL_VERSION,
+            "type": "end_session",
+        })));
+        pending_commands.push_back(EngineCommand::Tick);
+        pending_commands.push_back(EngineCommand::Send(json!({
+            "v": PROTOCOL_VERSION,
+            "type": "regenerate_answer",
+        })));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_pending_on_stop(&mut pending_commands, &ctx, "session-1"),
+        )
+        .await
+        .expect("drain should finish within the short timeout");
+
+        // 全部缓存命令被排空,且只有 end_session 触发了 REST 补发
+        assert!(pending_commands.is_empty());
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock server should finish")
+            .expect("mock server task should not panic");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("POST") && request_line.contains("/api/sessions/session-1/end"),
+            "REST end 应被调用,实际请求行:{request_line}"
+        );
+        assert!(request.contains("Bearer test-token"));
     }
 }
