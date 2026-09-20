@@ -1545,30 +1545,39 @@ class RealtimePipeline:
         revision_finished = False
         answer_text = ""
         source = "llm"
+
+        async def emit_stream_frame(
+            *, delta: str, answer: str, started: bool, done: bool, failed: bool
+        ) -> None:
+            # token 帧只带 delta（answer 恒为空串），终止帧（done/failed）才携带
+            # 全文一次；twin 字段 text 已从协议删除，全文字段统一为 answer。
+            await self.broadcast(
+                session_id,
+                server_message(
+                    "answer_stream",
+                    session_id=session_id,
+                    request_id=item.request_id,
+                    thread_id=item.thread_id,
+                    revision=item.revision,
+                    question=item.question,
+                    channel="answer",
+                    delta=delta,
+                    answer=answer,
+                    source=source,
+                    started=started,
+                    done=done,
+                    failed=failed,
+                ),
+            )
+
         try:
             await run_db(db.ensure_recording, session_id)
             context = await run_db(db.get_recent_transcript_context, session_id)
             # 岗位 JD 与简历让答案贴合这个岗位和这份履历；缺省时退化为通用答案。
             job_description, resume = await run_db(db.get_session_context, session_id)
             if item.thread_id is not None:
-                await self.broadcast(
-                    session_id,
-                    server_message(
-                        "answer_stream",
-                        session_id=session_id,
-                        request_id=item.request_id,
-                        thread_id=item.thread_id,
-                        revision=item.revision,
-                        question=item.question,
-                        channel="answer",
-                        delta="",
-                        text="",
-                        answer="",
-                        source=source,
-                        started=True,
-                        done=False,
-                        failed=False,
-                    ),
+                await emit_stream_frame(
+                    delta="", answer="", started=True, done=False, failed=False
                 )
             if item.use_search:
                 stream = llm.stream_answer_with_search_info(
@@ -1598,45 +1607,21 @@ class RealtimePipeline:
                     answer_text += part.text
                     capture.text = answer_text
                     capture.source = source
-                    await self.broadcast(
-                        session_id,
-                        server_message(
-                            "answer_stream",
-                            session_id=session_id,
-                            request_id=item.request_id,
-                            thread_id=item.thread_id,
-                            revision=item.revision,
-                            question=item.question,
-                            channel="answer",
-                            delta=part.text,
-                            text=answer_text,
-                            answer=answer_text,
-                            source=source,
-                            started=False,
-                            done=False,
-                            failed=False,
-                        ),
+                    await emit_stream_frame(
+                        delta=part.text,
+                        answer="",
+                        started=False,
+                        done=False,
+                        failed=False,
                     )
             if not answer_text.strip():
                 raise RuntimeError("LLM 返回了空答案")
-            await self.broadcast(
-                session_id,
-                server_message(
-                    "answer_stream",
-                    session_id=session_id,
-                    request_id=item.request_id,
-                    thread_id=item.thread_id,
-                    revision=item.revision,
-                    question=item.question,
-                    channel="answer",
-                    delta="",
-                    text=answer_text,
-                    answer=answer_text,
-                    source=source,
-                    started=False,
-                    done=True,
-                    failed=False,
-                ),
+            await emit_stream_frame(
+                delta="",
+                answer=answer_text,
+                started=False,
+                done=True,
+                failed=False,
             )
             if item.persist_immediately:
                 answer = await run_db(
@@ -1683,24 +1668,12 @@ class RealtimePipeline:
                     item.thread_id, item.revision, None
                 )
                 revision_finished = True
-                await self.broadcast(
-                    session_id,
-                    server_message(
-                        "answer_stream",
-                        session_id=session_id,
-                        request_id=item.request_id,
-                        thread_id=item.thread_id,
-                        revision=item.revision,
-                        question=item.question,
-                        channel="answer",
-                        delta="",
-                        text=answer_text,
-                        answer=answer_text,
-                        source=source,
-                        started=False,
-                        done=True,
-                        failed=True,
-                    ),
+                await emit_stream_frame(
+                    delta="",
+                    answer=answer_text,
+                    started=False,
+                    done=True,
+                    failed=True,
                 )
                 await self.broadcast(
                     session_id,
@@ -1725,24 +1698,12 @@ class RealtimePipeline:
                     item.thread_id, item.revision, None
                 )
                 revision_finished = True
-                await self.broadcast(
-                    session_id,
-                    server_message(
-                        "answer_stream",
-                        session_id=session_id,
-                        request_id=item.request_id,
-                        thread_id=item.thread_id,
-                        revision=item.revision,
-                        question=item.question,
-                        channel="answer",
-                        delta="",
-                        text=answer_text,
-                        answer=answer_text,
-                        source=source,
-                        started=False,
-                        done=True,
-                        failed=True,
-                    ),
+                await emit_stream_frame(
+                    delta="",
+                    answer=answer_text,
+                    started=False,
+                    done=True,
+                    failed=True,
                 )
                 logger.exception("答案生成失败: session=%s", session_id)
                 await self.broadcast(

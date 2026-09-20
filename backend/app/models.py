@@ -87,6 +87,10 @@ class AnswerResponse(StrictModel):
     answer: str
     source: Literal["llm", "search+llm"]
     created_at: datetime
+    # 线程身份：REST 历史答案据此挂回实时线程卡；手动提问为 None。
+    request_id: str | None = None
+    thread_id: str | None = None
+    revision: int | None = None
 
 
 class LLMConfigData(StrictModel):

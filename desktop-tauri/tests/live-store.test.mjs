@@ -46,6 +46,7 @@ function answerEvent(id, sessionId, question = `q${id}`, requestId = `r${id}`) {
 }
 
 function streamEvent(sessionId, text, done = false, requestId = 'r1', question = '流式问题') {
+  // H1 delta-only 契约:token 帧只带 delta(answer 恒为空串),done 帧携带全文。
   return {
     kind: 'serverMessage',
     type: 'answer_stream',
@@ -53,10 +54,9 @@ function streamEvent(sessionId, text, done = false, requestId = 'r1', question =
     session_id: sessionId,
     question,
     channel: 'answer',
-    delta: text,
-    text,
+    delta: done ? '' : text,
     thinking: '',
-    answer: text,
+    answer: done ? text : '',
     source: 'llm',
     done
   }
@@ -82,6 +82,7 @@ function threadStreamEvent({
   failed = false,
   superseded = false
 }) {
+  // H1 delta-only 契约:token 帧只带 delta(answer 恒为空串),done 帧携带全文。
   return {
     kind: 'serverMessage',
     type: 'answer_stream',
@@ -91,10 +92,9 @@ function threadStreamEvent({
     session_id: sessionId,
     question,
     channel: 'answer',
-    delta: text,
-    text,
+    delta: done ? '' : text,
     thinking: '',
-    answer: text,
+    answer: done ? text : '',
     source: 'llm',
     done,
     started,
@@ -113,7 +113,14 @@ test('一卡一答（catch-up swap）：新版开火保留旧段，superseded �
     ...state,
     ...applyEngineEvent(
       state,
-      threadStreamEvent({ requestId: 'req1', revision: 1, question: '浏览器输入 URL 后', text: '答案一开头', started: true })
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '浏览器输入 URL 后', text: '', started: true })
+    )
+  }
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '浏览器输入 URL 后', text: '答案一开头' })
     )
   }
   assert.equal(state.streamingAnswers.req1.answer, '答案一开头')
@@ -121,7 +128,14 @@ test('一卡一答（catch-up swap）：新版开火保留旧段，superseded �
     ...state,
     ...applyEngineEvent(
       state,
-      threadStreamEvent({ requestId: 'req2', revision: 2, question: '浏览器输入 URL 后发生了什么', text: '答案二开头', started: true })
+      threadStreamEvent({ requestId: 'req2', revision: 2, question: '浏览器输入 URL 后发生了什么', text: '', started: true })
+    )
+  }
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req2', revision: 2, question: '浏览器输入 URL 后发生了什么', text: '答案二开头' })
     )
   }
   // 两段并存:旧段最长仍是展示版,新版流式追平前不闪断。
@@ -177,15 +191,30 @@ test('superseded 终止帧单独到达也冻结该段（新版 started 帧丢失
     ...state,
     ...applyEngineEvent(
       state,
-      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '半截答案', started: true })
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '', started: true })
     )
   }
-  assert.ok(state.streamingAnswers.req1)
   state = {
     ...state,
     ...applyEngineEvent(
       state,
-      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '半截答案', done: true, superseded: true })
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '半截' })
+    )
+  }
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '答案' })
+    )
+  }
+  assert.ok(state.streamingAnswers.req1)
+  assert.equal(state.streamingAnswers.req1.answer, '半截答案')
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '问', text: '', done: true, superseded: true })
     )
   }
   // 不删段:半截答案冻结保留,它可能仍是这张卡上最长的可读内容。
@@ -297,7 +326,6 @@ test('思考过程通道的增量被直接丢弃，不进 store', () => {
     question: '问题',
     channel: 'thinking',
     delta: '先分析',
-    text: '先分析',
     answer: '',
     source: 'llm',
     done: false,
@@ -423,6 +451,73 @@ test('answer stream replaces cumulative text and survives the persisted answer',
   assert.equal(state.answers.length, 1)
 })
 
+test('token 帧按 delta 累计，全文只在 done 帧可信', () => {
+  // H1 delta-only 契约:token 帧 answer 恒为空串,只有 delta 是增量;
+  // done 帧携带服务端权威全文(catch-up swap 换成全文)。
+  let state = baseState()
+  state = { ...state, ...applyEngineEvent(state, streamEvent('s1', '先', false, 'r1')) }
+  state = { ...state, ...applyEngineEvent(state, streamEvent('s1', '给', false, 'r1')) }
+  state = { ...state, ...applyEngineEvent(state, streamEvent('s1', '出方案', false, 'r1')) }
+  assert.equal(state.streamingAnswers.r1.answer, '先给出方案')
+  assert.equal(state.streamingAnswers.r1.done, false)
+  // done 帧的全文是权威值:即使与累计不同也以它为准。
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      { ...streamEvent('s1', '先给出方案（修订全文）', true), request_id: 'r1' }
+    )
+  }
+  assert.equal(state.streamingAnswers.r1.answer, '先给出方案（修订全文）')
+  assert.equal(state.streamingAnswers.r1.done, true)
+})
+
+test('failed done 帧全文为空时保留已累计内容', () => {
+  let state = baseState()
+  state = { ...state, ...applyEngineEvent(state, streamEvent('s1', '已经流出的半截', false, 'r1')) }
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      { ...streamEvent('s1', '', true, 'r1'), failed: true }
+    )
+  }
+  assert.equal(state.streamingAnswers.r1.failed, true)
+  assert.equal(state.streamingAnswers.r1.done, true)
+  assert.equal(state.streamingAnswers.r1.answer, '已经流出的半截')
+})
+
+test('REST 历史答案先落地、WS 重放副本被 id 去重后线程卡仍带已入库标记', () => {
+  // C1 回归:REST 历史答案必须自带 thread_id;否则它先落进 answers、
+  // WS 重放的同 id 副本又被 id 去重丢掉,线程卡永远等不到 persisted 标记。
+  let state = baseState()
+  state = {
+    ...state,
+    ...applyEngineEvent(
+      state,
+      threadStreamEvent({ requestId: 'req1', revision: 1, question: '线程问题', text: '流式回答', done: true })
+    )
+  }
+  state = {
+    ...state,
+    ...mergeHistory(state, 's1', [], [
+      { ...answerRow(9, 's1', '线程问题'), request_id: 'req1', thread_id: 'th1' }
+    ])
+  }
+  // WS 重放副本后到:同 id 被去重,不重复入列。
+  state = {
+    ...state,
+    ...applyEngineEvent(state, { ...answerEvent(9, 's1', '线程问题', 'req1'), thread_id: 'th1' })
+  }
+  assert.equal(state.answers.length, 1)
+  assert.equal(state.answers[0].thread_id, 'th1')
+
+  const feed = buildAnswerFeed(Object.values(state.streamingAnswers), state.answers)
+  assert.equal(feed.threads.length, 1)
+  assert.equal(feed.threads[0].persisted?.id, 9)
+  assert.deepEqual(feed.historyAnswers, [])
+})
+
 test('concurrent answer streams remain isolated by request_id', () => {
   let state = baseState()
   state = { ...state, ...applyEngineEvent(state, streamEvent('s1', '第一段输出', false, 'r1', '第一段问题')) }
@@ -450,7 +545,6 @@ test('后端仍下发的 thinking 字段被忽略，落库答案只保留正文'
       question: '流式问题',
       channel: 'thinking',
       delta: '先分析',
-      text: '先分析',
       thinking: '先分析',
       answer: '',
       source: 'llm',
@@ -706,7 +800,7 @@ test('a sent question stays pending until the first stream frame takes over', ()
     request_id: 'r1',
     question: '讲讲缓存穿透',
     channel: 'answer',
-    text: '',
+    delta: '',
     answer: '',
     started: true,
     source: 'llm'
@@ -722,7 +816,7 @@ test('a sent question stays pending until the first stream frame takes over', ()
     request_id: 'r2',
     question: 'Q2',
     channel: 'answer',
-    text: '',
+    delta: '',
     answer: '',
     failed: true,
     done: true,

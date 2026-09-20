@@ -222,6 +222,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             answer TEXT NOT NULL,
             source TEXT NOT NULL DEFAULT 'llm',
             created_at TEXT NOT NULL,
+            thread_id TEXT,
+            request_id TEXT,
+            revision INTEGER,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
@@ -303,6 +306,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     # 岗位 JD 与简历：会话级答题背景，供 LLM 生成针对岗位的答案而不是通用答案。
     _ensure_column(conn, "sessions", "job_description", "TEXT")
     _ensure_column(conn, "sessions", "resume", "TEXT")
+    # 答案线程身份：REST 历史答案要能挂回实时线程卡（手动提问为 NULL）。
+    _ensure_column(conn, "answers", "thread_id", "TEXT")
+    _ensure_column(conn, "answers", "request_id", "TEXT")
+    _ensure_column(conn, "answers", "revision", "INTEGER")
 
     conn.execute(
         "UPDATE sessions SET status = 'idle' WHERE status NOT IN ('idle', 'recording', 'ended')"
@@ -1084,8 +1091,18 @@ def add_answer(
     with _transaction(conn):
         ensure_recording(conn, session_id)
         cur = conn.execute(
-            "INSERT INTO answers (session_id, question, answer, source, created_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, question, answer, source, created_at),
+            "INSERT INTO answers (session_id, question, answer, source, created_at, thread_id, request_id, revision)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                question,
+                answer,
+                source,
+                created_at,
+                thread_id,
+                request_id,
+                revision,
+            ),
         )
         result = {
             "id": cur.lastrowid,

@@ -201,12 +201,12 @@ export function applyOverlayEvent(
       if (type === 'answer_stream') {
         const sessionId = event.session_id
         const question = event.question
-        const text = event.text
+        const fullText = event.answer
         const channel = event.channel
         if (
           typeof sessionId !== 'string' ||
           typeof question !== 'string' ||
-          typeof text !== 'string' ||
+          typeof fullText !== 'string' ||
           (channel !== 'thinking' && channel !== 'answer')
         ) {
           return state
@@ -233,10 +233,16 @@ export function applyOverlayEvent(
           return { ...next, streaming }
         }
         const failed = event.failed === true
-        const answer =
-          typeof event.answer === 'string'
-            ? event.answer || (failed ? previous?.answer ?? '' : '')
-            : text
+        const done = event.done === true
+        const started = event.started === true
+        // delta-only 契约:token 帧只带 delta(全文恒为空串),全文只在 done 帧
+        // 可信;done+failed 且全文为空时保留已流出内容;started 空帧开新卡清空文本。
+        const delta = typeof event.delta === 'string' ? event.delta : ''
+        const answer = done
+          ? fullText || (failed ? previous?.answer ?? '' : '')
+          : started
+            ? ''
+            : (previous?.answer ?? '') + delta
         const entry: StreamingAnswer = {
           request_id: requestId,
           thread_id:
@@ -249,8 +255,8 @@ export function applyOverlayEvent(
           question,
           answer,
           source: event.source === 'search+llm' ? 'search+llm' : ('llm' as AnswerSource),
-          done: event.done === true,
-          started: event.started === true,
+          done,
+          started,
           failed
         }
         // catch-up swap：新 revision 的帧不再删除旧 revision 的段——旧段还在

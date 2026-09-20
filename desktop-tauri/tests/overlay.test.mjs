@@ -33,6 +33,7 @@ const cargoToml = readFileSync(
 )
 
 function streamEvent(sessionId, requestId, text, overrides = {}) {
+  // H1 delta-only 契约:token 帧只带 delta(answer 恒为空串),done 帧携带全文。
   return {
     kind: 'serverMessage',
     type: 'answer_stream',
@@ -40,8 +41,8 @@ function streamEvent(sessionId, requestId, text, overrides = {}) {
     session_id: sessionId,
     question: `问题 ${requestId}`,
     channel: 'answer',
-    text,
-    answer: text,
+    delta: text,
+    answer: '',
     source: 'llm',
     done: false,
     ...overrides
@@ -166,12 +167,13 @@ test('a newer revision of the same thread keeps the older segment (catch-up swap
   // 眼前的答案凭空消失。两段都保留,渲染层(pickDisplayVersion)挑「未被
   // 取代里答案最长」的展示:新版追平长度即自然接管。
   const state = reduce([
+    streamEvent('s1', 'r1', '', { thread_id: 't1', revision: 1, started: true }),
     streamEvent('s1', 'r1', '旧版已经流出很长的一段答案文本', {
       thread_id: 't1',
-      revision: 1,
-      started: true
+      revision: 1
     }),
-    streamEvent('s1', 'r2', '新版开头', { thread_id: 't1', revision: 2, started: true })
+    streamEvent('s1', 'r2', '', { thread_id: 't1', revision: 2, started: true }),
+    streamEvent('s1', 'r2', '新版开头', { thread_id: 't1', revision: 2 })
   ])
   assert.deepEqual(Object.keys(state.streaming).sort(), ['r1', 'r2'])
   assert.equal(state.streaming.r1.answer, '旧版已经流出很长的一段答案文本', '旧段必须保留兜底')
@@ -182,8 +184,9 @@ test('a superseded terminal frame freezes the segment instead of removing it', (
   // 旧版被取消时后端补一帧 done+superseded(不带 failed)。段冻结而不是删除:
   // 半截答案仍可读,渲染层挑展示版时跳过它;新版失败时它就是最长的可读答案。
   const state = reduce([
-    streamEvent('s1', 'r1', '旧版半截', { thread_id: 't1', revision: 1, started: true }),
-    streamEvent('s1', 'r1', '旧版半截', {
+    streamEvent('s1', 'r1', '', { thread_id: 't1', revision: 1, started: true }),
+    streamEvent('s1', 'r1', '旧版半截', { thread_id: 't1', revision: 1 }),
+    streamEvent('s1', 'r1', '', {
       thread_id: 't1',
       revision: 1,
       done: true,
@@ -195,6 +198,18 @@ test('a superseded terminal frame freezes the segment instead of removing it', (
   assert.equal(state.streaming.r1.done, true)
   assert.equal(state.streaming.r1.failed, false)
   assert.equal(state.streaming.r1.answer, '旧版半截', '半截答案保留兜底')
+})
+
+test('token 帧按 delta 累计，全文只在 done 帧可信', () => {
+  // H1 delta-only 契约:token 帧 answer 恒为空串,只有 delta 是增量;
+  // done 帧携带服务端权威全文。
+  const state = reduce([
+    streamEvent('s1', 'r1', '缓存穿透是'),
+    streamEvent('s1', 'r1', '查询不存在的键'),
+    streamEvent('s1', 'r1', '', { done: true, answer: '缓存穿透是查询不存在的键（全文）' })
+  ])
+  assert.equal(state.streaming.r1.answer, '缓存穿透是查询不存在的键（全文）')
+  assert.equal(state.streaming.r1.done, true)
 })
 
 test('duplicate persisted answers are not appended twice', () => {

@@ -122,7 +122,7 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
       if (type === 'answer_stream') {
         const sessionId = event.session_id
         const question = event.question
-        const text = event.text
+        const fullText = event.answer
         const channel = event.channel
         const requestId =
           typeof event.request_id === 'string' && event.request_id
@@ -140,7 +140,7 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
           typeof sessionId !== 'string' ||
           sessionId !== state.sessionId ||
           typeof question !== 'string' ||
-          typeof text !== 'string' ||
+          typeof fullText !== 'string' ||
           (channel !== 'thinking' && channel !== 'answer')
         ) {
           return state
@@ -154,6 +154,7 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
         const previous = state.streamingAnswers[streamKey]
         const started = event.started === true
         const failed = event.failed === true
+        const done = event.done === true
         // 兼容旧后端的 superseded 终止帧。当前后端各 revision 互不取消；
         // 若收到旧帧仍冻结该段并保留半截答案。
         if (event.superseded === true) {
@@ -165,20 +166,24 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
             }
           }
         }
-        // 同一 request 内失败时保留已经流出来的可用内容。
-        const preservePrevious = Boolean(previous && failed)
+        // delta-only 契约:token 帧只带 delta(全文恒为空串),全文只在 done 帧
+        // 可信(catch-up swap 换成服务端权威全文)。done+failed 且全文为空
+        // (一个字都没流出)时保留已流出内容;started 空帧开新卡清空文本。
+        const delta = typeof event.delta === 'string' ? event.delta : ''
+        const answerText = done
+          ? fullText || (previous && failed ? previous.answer : '')
+          : started
+            ? ''
+            : (previous?.answer ?? '') + delta
         const answer: StreamingAnswer = {
           request_id: requestId,
           thread_id: threadId,
           revision,
           session_id: sessionId,
           question,
-          answer:
-            typeof event.answer === 'string'
-              ? event.answer || (preservePrevious ? previous?.answer ?? '' : '')
-              : text,
+          answer: answerText,
           source: event.source === 'search+llm' ? 'search+llm' : ('llm' as AnswerSource),
-          done: event.done === true,
+          done,
           started,
           failed
         }

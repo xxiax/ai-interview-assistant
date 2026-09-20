@@ -620,6 +620,20 @@ async def test_answer_stream_is_broadcast_before_final_answer_is_persisted(monke
         "和技术方案。",
     ]
     assert "".join(message["delta"] for message in answer_stream_messages if message["delta"]) == "先给出项目背景和技术方案。"
+    # H1 delta-only 契约:token 帧只带 delta(全文 answer 恒为空串,twin 字段
+    # text 已从协议删除),终止 done 帧单独携带全文一次。
+    assert all("text" not in message for message in answer_stream_messages)
+    token_frames = [
+        message for message in answer_stream_messages if message["delta"]
+    ]
+    assert token_frames
+    assert all(message["answer"] == "" for message in token_frames)
+    done_frames = [
+        message for message in answer_stream_messages if message["done"] is True
+    ]
+    assert len(done_frames) == 1
+    assert done_frames[0]["answer"] == "先给出项目背景和技术方案。"
+    assert done_frames[0]["delta"] == ""
     # 思考过程功能已下线:上游 reasoning 增量不再产生 channel="thinking" 广播,
     # answer 事件也不再携带 thinking 字段。
     assert all(message["channel"] == "answer" for message in stream_messages)
@@ -932,6 +946,21 @@ async def test_question_revisions_run_concurrently_and_only_latest_is_persisted(
     assert final["thread_id"] in stream_thread_ids
     assert final["revision"] == 2
     assert final["request_id"] in stream_request_ids
+    # C1:落库答案带线程身份,REST/回填才能挂回线程卡。
+    assert answers[0]["thread_id"] == final["thread_id"]
+    assert answers[0]["revision"] == 2
+    assert answers[0]["request_id"] == final["request_id"]
+    # H1:线程路径的 started 空帧保持原形状(delta/answer 均为空,无 text)。
+    started_frames = [
+        message
+        for message in messages
+        if message.get("type") == "answer_stream" and message.get("started") is True
+    ]
+    assert started_frames
+    assert all(
+        message["delta"] == "" and message["answer"] == "" and "text" not in message
+        for message in started_frames
+    )
     completed_revisions = {
         message["revision"]
         for message in messages
@@ -1592,11 +1621,15 @@ async def test_one_revision_failure_does_not_cancel_a_newer_revision(monkeypatch
         await asyncio.sleep(0.01)
     assert done_new, "新版要正常收尾"
 
-    assert [
+    failed_frames = [
         m
         for m in messages
         if m.get("type") == "answer_stream" and m.get("revision") == 1 and m.get("failed")
-    ], "旧版真实失败应只标记自己的 revision"
+    ]
+    assert failed_frames, "旧版真实失败应只标记自己的 revision"
+    # H1:failed 终止帧携带已流出的部分全文,token 帧不重复全文。
+    assert failed_frames[0]["answer"] == "半截"
+    assert "text" not in failed_frames[0]
     assert [
         m for m in messages if m.get("code") == "answer_generation_failed"
     ]

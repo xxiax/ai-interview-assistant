@@ -86,6 +86,14 @@ pub struct Answer {
     pub answer: String,
     pub source: String, // "llm" | "search+llm"
     pub created_at: String,
+    /// 线程身份：REST 历史答案据此挂回实时线程卡；手动提问为 None。
+    /// 缺了这三个字段 serde 会静默丢弃，前端线程卡就拿不到"已入库"标记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -106,6 +106,39 @@ def test_input_validation_and_missing_children(client, auth_headers):
     )
 
 
+def test_answers_rest_response_carries_thread_fields(client, auth_headers):
+    # C1:REST 历史答案必须带线程身份,否则回填时挂不回线程卡。
+    session = _create(client, auth_headers)
+    client.post(
+        f"/api/sessions/{session['id']}/start",
+        json={"radio_mode": "pc"},
+        headers=auth_headers,
+    )
+    conn = db.get_db()
+    try:
+        db.add_answer(
+            conn,
+            session["id"],
+            "线程问题",
+            "线程答案",
+            request_id="req-9",
+            thread_id="thread-9",
+            revision=3,
+        )
+    finally:
+        conn.close()
+
+    response = client.get(
+        f"/api/sessions/{session['id']}/answers", headers=auth_headers
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["thread_id"] == "thread-9"
+    assert payload[0]["request_id"] == "req-9"
+    assert payload[0]["revision"] == 3
+
+
 def test_audio_chunk_statuses_can_be_pulled_after_ack(client, auth_headers):
     session = _create(client, auth_headers)
     client.post(

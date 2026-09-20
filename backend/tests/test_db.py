@@ -91,6 +91,44 @@ def test_answer_event_persists_stream_metadata_for_websocket_replay(conn):
     assert event["payload"]["request_id"] == "request-123"
     assert event["payload"]["thread_id"] == "thread-123"
     assert event["payload"]["revision"] == 3
+    # 线程身份必须真正落库:REST get_answers 靠它把历史答案挂回线程卡。
+    rows = db.get_answers(conn, session["id"])
+    assert rows[0]["request_id"] == "request-123"
+    assert rows[0]["thread_id"] == "thread-123"
+    assert rows[0]["revision"] == 3
+
+
+def test_answer_thread_fields_survive_migration_from_old_schema(conn):
+    # 旧库的 answers 表没有线程列;init_db 必须补列且旧数据可继续读。
+    conn.execute("ALTER TABLE answers DROP COLUMN thread_id")
+    conn.execute("ALTER TABLE answers DROP COLUMN request_id")
+    conn.execute("ALTER TABLE answers DROP COLUMN revision")
+    db.init_db(conn)
+
+    session = _recording_session(conn)
+    db.add_answer(
+        conn,
+        session["id"],
+        "旧库问题",
+        "旧库答案",
+        request_id="req-mig",
+        thread_id="thread-mig",
+        revision=2,
+    )
+    rows = db.get_answers(conn, session["id"])
+    assert rows[0]["request_id"] == "req-mig"
+    assert rows[0]["thread_id"] == "thread-mig"
+    assert rows[0]["revision"] == 2
+
+
+def test_manual_answer_persists_null_thread_fields(conn):
+    # 手动提问没有线程身份:三列落 NULL,REST 序列化为 None。
+    session = _recording_session(conn)
+    db.add_answer(conn, session["id"], "手动问题", "手动答案")
+    rows = db.get_answers(conn, session["id"])
+    assert rows[0]["thread_id"] is None
+    assert rows[0]["request_id"] is None
+    assert rows[0]["revision"] is None
 
 
 def test_repeated_init_preserves_existing_transcript_sequence(conn):
