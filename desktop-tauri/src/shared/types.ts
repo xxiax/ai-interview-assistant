@@ -63,6 +63,8 @@ export interface StreamingAnswer {
   done: boolean
   started: boolean
   failed: boolean
+  /** 失败帧携带的原因（后端 reason 字段），直接展示给用户。 */
+  error?: string
   /** 被同线程更新 revision 取代：内容冻结保留（catch-up swap），不算失败。 */
   superseded?: boolean
 }

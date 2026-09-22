@@ -442,6 +442,17 @@ def test_network_config_accepts_four_proxy_schemes(client, auth_headers, proxy_u
     assert response.json()["type"] == "network"
 
 
+def test_network_config_accepts_empty_proxy_url_as_direct(client, auth_headers):
+    """设置页"直连"子项：proxy_url 为空串合法，表示显式不走任何代理。"""
+    response = client.post(
+        "/api/configs/network",
+        json={"name": "直连", "data": {"proxy_url": "", "api_key": "placeholder"}, "is_active": True},
+        headers=auth_headers,
+    )
+    assert response.status_code == 201
+    assert response.json()["data"]["proxy_url"] == ""
+
+
 def test_network_config_rejects_bad_scheme(client, auth_headers):
     for bad in ("ftp://x", "socks4://x", "not-a-url", "127.0.0.1:7897"):
         response = client.post(

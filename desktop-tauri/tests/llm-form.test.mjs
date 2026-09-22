@@ -82,15 +82,18 @@ test('SettingsPage: LLM 配置不再包含音频模型，获取模型传认证 H
   assert.match(settingsSource, /reasoningEffort/)
 })
 
-test('SettingsPage: 获取模型按钮和文本模型位于 API Key 之后', async () => {
+test('SettingsPage: 获取模型按钮和模型选择位于 API Key 之后', async () => {
   const src = await readFile(new URL('../src/pages/SettingsPage.tsx', import.meta.url), 'utf8')
-  // 布局顺序: API Key 输入 -> 获取模型按钮 -> 文本模型
+  // 布局顺序: API Key 输入 -> 获取模型按钮 -> 可搜索模型下拉
   const apiKeyPos = src.indexOf('label="API Key"')
   const fetchBtnPos = src.indexOf('\n                获取模型')
-  const modelInputPos = src.indexOf('label="模型"')
-  assert.ok(apiKeyPos > 0 && fetchBtnPos > apiKeyPos && modelInputPos > fetchBtnPos,
+  const modelSelectPos = src.indexOf('<ModelSelect')
+  assert.ok(apiKeyPos > 0 && fetchBtnPos > apiKeyPos && modelSelectPos > fetchBtnPos,
     '获取模型按钮与模型选择应位于 API Key 下边')
-  assert.match(settingsSource, /datalist id="llm-model-options"/)
+  // 模型字段是可搜索 Select:未获取模型列表时禁用,不再回退 Input+datalist
+  assert.match(src, /disabled=\{modelOptions\.length === 0\}/)
+  assert.match(src, /placeholder="搜索模型…"/)
+  assert.ok(!src.includes('datalist'), '旧的 datalist 方案应被移除')
 })
 
 test('bridge: configs.fetchModels 调用 llm_fetch_models 命令并传 baseUrl/apiKey', () => {

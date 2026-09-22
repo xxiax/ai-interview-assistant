@@ -257,7 +257,11 @@ export function applyOverlayEvent(
           source: event.source === 'search+llm' ? 'search+llm' : ('llm' as AnswerSource),
           done,
           started,
-          failed
+          failed,
+          error:
+            failed && typeof event.reason === 'string' && event.reason
+              ? event.reason
+              : undefined
         }
         // catch-up swap：新 revision 的帧不再删除旧 revision 的段——旧段还在
         // 流式输出时被删会让用户眼前的答案凭空消失。全部保留，渲染层

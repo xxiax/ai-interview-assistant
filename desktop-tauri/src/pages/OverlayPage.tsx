@@ -15,8 +15,8 @@
  * rgba(17,17,17,·)。状态之间用亮度区分（状态点、角标），不用彩色。
  */
 import { useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
+import dayjs from 'dayjs'
 import {
-  ArrowDownToLine,
   Camera,
   ChevronsDown,
   ChevronsDownUp,
@@ -28,10 +28,6 @@ import {
   Pin,
   PinOff,
   RefreshCw,
-  SendHorizontal,
-  Settings,
-  ShieldCheck,
-  ShieldOff,
   TriangleAlert,
   X
 } from 'lucide-react'
@@ -64,14 +60,6 @@ const PHASE_DOT: Record<ConnectionPhase, string> = {
   reconnecting: 'bg-white/60',
   closed: 'bg-white/25'
 }
-
-/**
- * 自动滚动的判定余量（px）。
- *
- * 48 而不是 0：流式输出时 `scrollHeight` 每个 token 都在变，严格判等的话
- * 用户什么都没做也会被判成"手动滚上去了"，自动滚动直接失效。
- */
-const TAIL_SLACK = 48
 
 /** 工具条按钮。悬浮窗空间紧，只留图标 + title，尺寸仍守住 28px 可点区域。 */
 function ToolButton({
@@ -139,26 +127,21 @@ export default function OverlayPage() {
   const [feed, dispatch] = useReducer(applyOverlayEvent, initialOverlayFeed)
   const { state: overlay, actions } = useOverlayControl()
   const bodyRef = useRef<HTMLDivElement>(null)
-  const followTailRef = useRef(true)
   // 快速提问输入框：自动增高用（见下方 effect）。
   const questionInputRef = useRef<HTMLTextAreaElement>(null)
-  const [atTail, setAtTail] = useState(true)
-  const [showSettings, setShowSettings] = useState(false)
   const [solving, setSolving] = useState(false)
-  const [solveHint, setSolveHint] = useState<{ kind: 'info' | 'warn'; text: string } | null>(null)
+  // 就地拦截提示（只放 warn：成功路径的"已发送/录制开关"一类 info 提示
+  // 已按用户要求全部移除，答案区的卡本身就是状态反馈）。
+  const [solveHint, setSolveHint] = useState<{ text: string } | null>(null)
+  // 收起前的滚动位置：收起/展开会卸载重挂滚动容器（scrollTop 归零），
+  // 展开时按这个 ref 恢复"收起前停在哪就回到哪"。
+  const savedScrollTopRef = useRef(0)
+  const prevCollapsedRef = useRef(overlay.collapsed)
   // 底部快速提问输入框的内容与发送中状态。
   const [question, setQuestion] = useState('')
   const [sending, setSending] = useState(false)
   // Ctrl+Alt+Z 开启/暂停录制的执行中状态；同一时刻只允许一次。
   const [togglingRecording, setTogglingRecording] = useState(false)
-  /*
-   * 「最新」按钮的竞态修复：平滑回底（scrollToTail 的 behavior:'smooth'）动画
-   * 期间每个中间帧都"不在底部"，handleScroll 照常判定会把刚隐藏的按钮又闪
-   * 出来（用户实测的"先消失→一闪→再消失"）。动画期间抑制判定，落到底部
-   * 即解除；定时器是安全阀——动画因故没走到尾时也不许把按钮永久藏住。
-   */
-  const jumpingToTailRef = useRef(false)
-  const jumpTimeoutRef = useRef<number | null>(null)
   // 重新生成按钮冷却（按线程 key）。悬浮窗没有 toast，冷却就是唯一反馈。
   const [coolingKeys, setCoolingKeys] = useState<Set<string>>(new Set())
   const cooldownTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
@@ -170,7 +153,6 @@ export default function OverlayPage() {
     return () => {
       for (const t of timers) clearTimeout(t)
       timers.clear()
-      if (jumpTimeoutRef.current !== null) window.clearTimeout(jumpTimeoutRef.current)
     }
   }, [])
 
@@ -185,6 +167,8 @@ export default function OverlayPage() {
    * 快速提问 textarea 自动增高：高度永远跟着内容走（先归 auto 再量
    * scrollHeight），不写死；封顶约 6 行（max-h-28），超出内部滚动。
    * 发送清空后 question 变 ''，同一个 effect 把高度收回一行。
+   * 收起再展开会卸载重挂 textarea（收起态渲染的是另一棵树），内联高度
+   * 随之丢失，所以 overlay.collapsed 必须进依赖，展开时重算一次。
    */
   useEffect(() => {
     const el = questionInputRef.current
@@ -197,7 +181,7 @@ export default function OverlayPage() {
     // 之前直接把溢出藏掉——高度就是内容高度不可能真溢出；到顶后才恢复
     // 滚动，让第 7 行起内部滚动。
     el.style.overflowY = grown >= 112 ? 'auto' : 'hidden'
-  }, [question])
+  }, [question, overlay.collapsed])
 
   // 透明窗口需要 body/#root/html 三层都透明，靠这个 class 触发 global.css 里的规则。
   useEffect(() => {
@@ -302,58 +286,31 @@ export default function OverlayPage() {
   )
 
   useLayoutEffect(() => {
+    const wasCollapsed = prevCollapsedRef.current
+    prevCollapsedRef.current = overlay.collapsed
     const node = bodyRef.current
-    if (node && followTailRef.current) node.scrollTop = node.scrollHeight
-    // 依赖里必须有 overlay.collapsed：收起/展开会卸载重挂滚动容器，重挂后
-    // scrollTop 归零，必须重新贴底，否则展开后聊天记录显示在顶部。
-    // feed.pending 也要贴底：刚发出的"正在思考"卡得出现在视野里。
-  }, [model.threads, feed.partial, feed.pending, overlay.collapsed])
+    if (!node) return
+    // 展开：容器重挂后 scrollTop 归零，恢复收起前停住的位置（顶部就是最新
+    // 内容，0 是常见位置，天然正确）。
+    if (wasCollapsed && !overlay.collapsed) node.scrollTop = savedScrollTopRef.current
+  }, [overlay.collapsed])
 
   const handleScroll = () => {
     const node = bodyRef.current
     if (!node) return
-    const tail = node.scrollHeight - node.scrollTop - node.clientHeight < TAIL_SLACK
-    if (jumpingToTailRef.current) {
-      // 平滑回底动画进行中：中间帧距离底部必然超过 TAIL_SLACK，照常判定会
-      // 把刚隐藏的「最新」按钮又闪出来。落到底部（tail 为真）才解除抑制；
-      // 中间帧一律忽略。安全阀见 scrollToTail。
-      if (tail) {
-        jumpingToTailRef.current = false
-        if (jumpTimeoutRef.current !== null) {
-          window.clearTimeout(jumpTimeoutRef.current)
-          jumpTimeoutRef.current = null
-        }
-        followTailRef.current = true
-        setAtTail(true)
-      }
-      return
-    }
-    followTailRef.current = tail
-    // `atTail` 只驱动"回到底部"按钮的显隐，滚动判断仍走 ref：
-    // setState 会重渲染，流式输出时每帧滚动都重渲染整棵树太贵。
-    setAtTail((prev) => (prev === tail ? prev : tail))
-  }
-
-  const scrollToTail = () => {
-    const node = bodyRef.current
-    if (!node) return
-    jumpingToTailRef.current = true
-    if (jumpTimeoutRef.current !== null) window.clearTimeout(jumpTimeoutRef.current)
-    // 安全阀：动画 600ms 内没走到尾（内容暴涨把目标顶远、用户中途反向滚）
-    // 也要解除抑制，否则「最新」按钮会被永久藏住。
-    jumpTimeoutRef.current = window.setTimeout(() => {
-      jumpingToTailRef.current = false
-      jumpTimeoutRef.current = null
-    }, 600)
-    node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' })
-    followTailRef.current = true
-    setAtTail(true)
+    // 收起过渡的痕迹不落账（2026-09-22 CDP 复现实测）：Rust 收起先
+    // set_size(240×18) 再发 collapsed 状态，窗口已缩、完整树还没换走的间隙
+    // 里窄幅重排触发滚动锚定，scrollTop 会被顶到几千（实测 1290→5746，
+    // 当时 scrollHeight 11810 / clientHeight 20）。这个值存进
+    // savedScrollTopRef 的话，展开恢复会被夹到最底部——正是"反复
+    // Ctrl+Alt+E 滚动位置一路下滑到底"的根因。条状尺寸下容器只有 ~20px
+    // 高，真实展开态不可能低于 64px，用它挡掉过渡期的 scroll 事件。
+    if (node.clientHeight < 64) return
+    savedScrollTopRef.current = node.scrollTop
   }
 
   const clearAnswers = () => {
     dispatch({ kind: 'overlay:clear' })
-    followTailRef.current = true
-    setAtTail(true)
   }
 
   const phase = feed.phase
@@ -390,9 +347,25 @@ export default function OverlayPage() {
    * - idle：会话还没开始录制，Ctrl+Alt+Z 一键开启。
    * - ''（未知）：刚连上还在同步 / 引擎重连中，事件到达即恢复。
    */
-  const sessionBlockHint = (action: string) => {
-    if (feed.sessionStatus === 'ended') return `这场面试已结束，无法${action}`
-    if (feed.sessionStatus === 'idle') return `还没开始录制，按 Ctrl+Alt+Z 开启后再${action}`
+  /*
+   * sessionStatus 为 '' 时的自愈：会话状态事件只在每次连接建立时下发，
+   * 稳态下不会再有——一旦被清掉（adopt() 切会话时清、连接关闭时清），
+   * 不主动补拉就永远停在"同步中"。拉 Rust 快照经 seed 落回 reducer；
+   * seed 只补状态字段，不清答案卡，稳态调用无副作用。
+   */
+  const refreshSessionStatus = async (): Promise<string> => {
+    if (feed.sessionStatus !== '') return feed.sessionStatus
+    try {
+      const snapshot = await api.live.runtimeState()
+      dispatch({ kind: 'overlay:seed', snapshot })
+      return snapshot.sessionStatus ?? ''
+    } catch {
+      return ''
+    }
+  }
+  const sessionBlockHint = (status: string, action: string) => {
+    if (status === 'ended') return `这场面试已结束，无法${action}`
+    if (status === 'idle') return `还没开始录制，按 Ctrl+Alt+Z 开启后再${action}`
     return `会话状态同步中，稍候再${action}`
   }
   const solveScreenshot = async () => {
@@ -400,24 +373,23 @@ export default function OverlayPage() {
     // 与提问同一套门禁：只看连接与会话（暂停期间截图解题照常可用），
     // 提示语与真实拦因一致，每种状态一句话说清为什么。
     if (phase !== 'ready') {
-      setSolveHint({ kind: 'warn', text: '连接未就绪，稍候再试' })
+      setSolveHint({ text: '连接未就绪，稍候再试' })
       return
     }
     if (!recording) {
-      setSolveHint({ kind: 'warn', text: sessionBlockHint('解题') })
-      return
+      const status = await refreshSessionStatus()
+      if (status !== 'recording') {
+        setSolveHint({ text: sessionBlockHint(status, '解题') })
+        return
+      }
     }
     setSolving(true)
     setSolveHint(null)
     try {
       const ok = await api.live.solveScreenshot()
-      setSolveHint(
-        ok
-          ? { kind: 'info', text: '截图已发送，正在解题' }
-          : { kind: 'warn', text: '截图发送失败，检查连接' }
-      )
+      if (!ok) setSolveHint({ text: '截图发送失败，检查连接' })
     } catch (err) {
-      setSolveHint({ kind: 'warn', text: errorMessage(err) })
+      setSolveHint({ text: errorMessage(err) })
     } finally {
       setSolving(false)
     }
@@ -438,12 +410,15 @@ export default function OverlayPage() {
     // 手动提问不走音频，暂停期间照常可问。拦因按 sessionStatus 细分通报
     // （见 sessionBlockHint），别再拿"未在录制中"一句话盖住四种不同情况。
     if (phase !== 'ready') {
-      setSolveHint({ kind: 'warn', text: '连接未就绪，稍候再试' })
+      setSolveHint({ text: '连接未就绪，稍候再试' })
       return
     }
     if (!recording) {
-      setSolveHint({ kind: 'warn', text: sessionBlockHint('提问') })
-      return
+      const status = await refreshSessionStatus()
+      if (status !== 'recording') {
+        setSolveHint({ text: sessionBlockHint(status, '提问') })
+        return
+      }
     }
     setSending(true)
     setSolveHint(null)
@@ -454,9 +429,8 @@ export default function OverlayPage() {
       // 发送成功立刻挂"正在思考"卡：有没有发出去、AI 开始答没有，一眼可见，
       // 不用猜也不用重发。answer_stream 首帧（started 空帧）到达即自动交棒。
       dispatch({ kind: 'overlay:asked', question: text })
-      setSolveHint({ kind: 'info', text: '已发送，正在思考' })
     } catch (err) {
-      setSolveHint({ kind: 'warn', text: errorMessage(err) })
+      setSolveHint({ text: errorMessage(err) })
     } finally {
       setSending(false)
     }
@@ -500,16 +474,16 @@ export default function OverlayPage() {
   const toggleRecording = async () => {
     if (togglingRecording) return
     if (phase !== 'ready') {
-      setSolveHint({ kind: 'warn', text: '未连接实时面试，请先在主窗口打开面试' })
+      setSolveHint({ text: '未连接实时面试，请先在主窗口打开面试' })
       return
     }
     if (feed.sessionStatus === 'ended') {
-      setSolveHint({ kind: 'warn', text: '这场面试已结束' })
+      setSolveHint({ text: '这场面试已结束' })
       return
     }
     if (feed.sessionStatus === 'recording') {
       if (feed.radioMode === 'mobile') {
-        setSolveHint({ kind: 'warn', text: '手机收音模式，请在手机端暂停' })
+        setSolveHint({ text: '手机收音模式，请在手机端暂停' })
         return
       }
       setTogglingRecording(true)
@@ -518,23 +492,21 @@ export default function OverlayPage() {
         if (feed.captureOn) {
           await api.audio.stopSystem()
           await api.outbox.setCaptureActive(false)
-          setSolveHint({ kind: 'info', text: '已暂停录制（面试仍在进行，可继续提问）' })
         } else {
           const started = await api.audio.startSystem()
           if (!started) throw new Error('无法开始系统声音采集')
           await api.outbox.setCaptureActive(true)
-          setSolveHint({ kind: 'info', text: '已继续录制' })
         }
       } catch (err) {
         if (!feed.captureOn) await api.audio.stopSystem().catch(() => {})
-        setSolveHint({ kind: 'warn', text: errorMessage(err) })
+        setSolveHint({ text: errorMessage(err) })
       } finally {
         setTogglingRecording(false)
       }
       return
     }
     if (feed.sessionStatus !== 'idle') {
-      setSolveHint({ kind: 'warn', text: '会话状态同步中，请稍候再按' })
+      setSolveHint({ text: '会话状态同步中，请稍候再按' })
       return
     }
     setTogglingRecording(true)
@@ -545,10 +517,9 @@ export default function OverlayPage() {
       const started = await api.audio.startSystem()
       if (!started) throw new Error('无法开始系统声音采集')
       await api.outbox.setCaptureActive(true)
-      setSolveHint({ kind: 'info', text: '已开始录制' })
     } catch (err) {
       await api.audio.stopSystem().catch(() => {})
-      setSolveHint({ kind: 'warn', text: errorMessage(err) })
+      setSolveHint({ text: errorMessage(err) })
     } finally {
       setTogglingRecording(false)
     }
@@ -684,68 +655,17 @@ export default function OverlayPage() {
           >
             <Eraser size={13} />
           </ToolButton>
-          <ToolButton
-            label="设置"
-            active={showSettings}
-            onClick={() => setShowSettings((prev) => !prev)}
-          >
-            <Settings size={13} />
-          </ToolButton>
           <ToolButton label="隐藏悬浮窗（Ctrl+Alt+O 再唤出）" onClick={() => void actions.hide()}>
             <X size={13} />
           </ToolButton>
         </div>
       </header>
 
-      {/*
-       * 设置面板。折进来而不是常驻工具条：透明度、共享隐身这些是"摆好一次"
-       * 的开关，摆好之后天天占着顶栏只会挤掉答案空间。
-       */}
-      {showSettings && (
-        <div className="overlay-panel shrink-0 space-y-2 border-b border-white/10 bg-white/[0.03] px-3 py-2">
-          <div className="flex items-center justify-between gap-2">
-            <span className="shrink-0 text-[10px] text-white/55">背景不透明度</span>
-            <div className="flex min-w-0 flex-1 items-center gap-2 pl-3">
-              <input
-                type="range"
-                min={25}
-                max={100}
-                step={5}
-                value={Math.round(overlay.opacity * 100)}
-                aria-label="背景不透明度"
-                onChange={(e) => void actions.setOpacity(Number(e.target.value) / 100)}
-                className="h-1 min-w-0 flex-1 cursor-pointer accent-white"
-              />
-              <span className="tnum w-9 shrink-0 text-right text-[11px] text-white/75">
-                {Math.round(overlay.opacity * 100)}%
-              </span>
-            </div>
-          </div>
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[10px] text-white/55">
-              共享隐身
-              <span className="ml-1 text-white/40">只挡录屏，挡不住手机拍屏</span>
-            </span>
-            <ToolButton
-              label={overlay.contentProtected ? '关闭共享隐身' : '开启共享隐身'}
-              active={overlay.contentProtected}
-              onClick={() => void actions.setContentProtected(!overlay.contentProtected)}
-            >
-              {overlay.contentProtected ? <ShieldCheck size={13} /> : <ShieldOff size={13} />}
-            </ToolButton>
-          </div>
-        </div>
-      )}
-
-      {/* 就地反馈（解题/提问）：主窗口的 toast 到不了这个 webview。灰阶里 warn 比 info 亮一档+粗边框。 */}
+      {/* 就地反馈（解题/提问，只放拦截原因）：主窗口的 toast 到不了这个 webview。 */}
       {solveHint && (
         <div
           role="status"
-          className={`shrink-0 border-b px-3 py-1.5 text-[10px] ${
-            solveHint.kind === 'info'
-              ? 'border-white/15 bg-white/[0.06] text-white/75'
-              : 'border-white/30 bg-white/[0.08] text-white'
-          }`}
+          className="shrink-0 border-b border-white/30 bg-white/[0.08] px-3 py-1.5 text-[10px] text-white"
         >
           {solveHint.text}
         </div>
@@ -764,9 +684,12 @@ export default function OverlayPage() {
         </div>
       )}
 
-      {/* 答案区。relative 是为了让"回到底部"浮标定位在这一块的右下角。 */}
-      <div className="relative min-h-0 flex-1">
-      <div ref={bodyRef} onScroll={handleScroll} className="h-full overflow-y-auto px-3 py-2.5">
+      {/*
+       * 答案区：最新在最上（2026-09-22 用户拍板）。新内容从顶部插入、把旧的
+       * 往下挤，流式输出不打扰阅读位置——因此没有任何自动滚动，也不再需要
+       * 回到底部的浮标按钮。
+       */}
+      <div ref={bodyRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto px-3 py-2.5">
         {answerCount === 0 && feed.pending.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
             <Eye size={18} className="text-white/40" aria-hidden />
@@ -777,6 +700,24 @@ export default function OverlayPage() {
           </div>
         ) : (
           <div className="space-y-2.5">
+            {/*
+             * 刚发出的手动提问（pending）：发送成功即出现在这里，answer_stream
+             * 首帧到达自动消失、由真卡接棒。用户由此确认"发出去了、AI 在想"，
+             * 不用反复重发。
+             */}
+            {feed.pending.map((p) => (
+              <article
+                key={p.id}
+                className="overlay-answer-enter rounded-lg border border-white/15 bg-white/[0.05] p-2.5"
+                aria-live="polite"
+              >
+                <div className="select-text text-[12px] font-semibold leading-5 text-white">{p.question}</div>
+                <div className="flex items-center gap-1.5 text-[10px] text-white/45">
+                  <Loader2 size={10} className="animate-spin" />
+                  已发送 · 正在思考
+                </div>
+              </article>
+            ))}
             {model.threads.map((thread) => {
               const display = pickDisplayVersion(thread.versions)
               return (
@@ -827,9 +768,20 @@ export default function OverlayPage() {
                       ) : (
                         <Loader2 size={10} className="animate-spin" />
                       )}
-                      {display?.failed ? '生成失败，可点重新生成' : '正在生成…'}
+                      {display?.failed
+                        ? display.error || '生成失败，可点重新生成'
+                        : '正在生成…'}
                     </div>
                   )}
+                  {/*
+                   * 落库时间（与主窗口答案卡一致的 HH:mm:ss）：答完落库才有，
+                   * 生成中的卡先不出时间，避免拿"到达时间"冒充。
+                   */}
+                  {thread.persisted ? (
+                    <div className="tnum mt-1 text-[10px] leading-4 text-white/70">
+                      {dayjs(thread.persisted.created_at).format('HH:mm:ss')}
+                    </div>
+                  ) : null}
                 </article>
               )
             })}
@@ -842,23 +794,8 @@ export default function OverlayPage() {
                   {answer.question}
                 </div>
                 <Markdown source={answer.answer} variant="answer" />
-              </article>
-            ))}
-            {/*
-             * 刚发出的手动提问（pending）：发送成功即出现在这里，answer_stream
-             * 首帧到达自动消失、由真卡接棒。用户由此确认"发出去了、AI 在想"，
-             * 不用反复重发。
-             */}
-            {feed.pending.map((p) => (
-              <article
-                key={p.id}
-                className="overlay-answer-enter rounded-lg border border-white/15 bg-white/[0.05] p-2.5"
-                aria-live="polite"
-              >
-                <div className="select-text text-[12px] font-semibold leading-5 text-white">{p.question}</div>
-                <div className="flex items-center gap-1.5 text-[10px] text-white/45">
-                  <Loader2 size={10} className="animate-spin" />
-                  已发送 · 正在思考
+                <div className="tnum mt-1 text-[10px] leading-4 text-white/70">
+                  {dayjs(answer.created_at).format('HH:mm:ss')}
                 </div>
               </article>
             ))}
@@ -867,29 +804,10 @@ export default function OverlayPage() {
       </div>
 
       {/*
-       * 一键回到底部。只在用户手动滚上去之后出现：常驻的话会一直挡住答案右下角，
-       * 而自动滚动本来就在跟着底部，那个按钮 90% 的时间没有意义。
-       */}
-      {!atTail && answerCount > 0 && (
-        <button
-          type="button"
-          onClick={scrollToTail}
-          title="回到最新答案"
-          aria-label="回到最新答案"
-          className="overlay-panel absolute bottom-2.5 right-3 flex h-7 items-center gap-1 rounded-full border border-white/30 bg-[#111111] px-2.5 text-[10px] text-white transition-colors hover:bg-white/15"
-        >
-          <ArrowDownToLine size={11} />
-          最新
-        </button>
-      )}
-      </div>
-
-      {/*
        * 底部快速提问（用户拍板：原热键说明区换成输入框）：不想等面试官说、
        * 或想追问时直接敲问题。Enter 发送、Shift+Enter 换行；textarea 高度跟
-       * 内容走（自动增高，封顶约 6 行）；发送按钮是右下角的图标——单行时
-       * 恰好垂直居中在右侧，多行时贴住右下角。走手动提问路径，答案独立成卡
-       * 流回上方。未录制时按钮禁用——截图解题按钮同一条规则。
+       * 内容走（自动增高，封顶约 6 行）。发送按钮已按用户要求移除，只留
+       * Enter 发送。走手动提问路径，答案独立成卡流回上方。
        *
        * 与答案区的分隔靠"面"不靠"线"（用户拍板 2026-09-02 的四层方案，
        * 全黑白灰）：footer 整块抬一档操作面（white/[0.04]），输入容器再亮
@@ -901,51 +819,27 @@ export default function OverlayPage() {
        * 里 overlay-root 的表单控件例外），边框提亮已足够表达焦点。
        */}
       <footer className="shrink-0 border-t border-white/10 bg-white/[0.04] px-3 pb-2 pt-3">
-        <form
-          onSubmit={(event) => {
-            event.preventDefault()
-            void submitQuestion()
+        <textarea
+          ref={questionInputRef}
+          value={question}
+          onChange={(event) => setQuestion(event.target.value.slice(0, 2000))}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault()
+              void submitQuestion()
+            }
           }}
-        >
-          <div className="relative">
-            <textarea
-              ref={questionInputRef}
-              value={question}
-              onChange={(event) => setQuestion(event.target.value.slice(0, 2000))}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault()
-                  // 直调 submitQuestion 而非 requestSubmit：下方发送按钮在
-                  // 未连接/未录制时是 disabled，requestSubmit 对被禁用的默认
-                  // 提交按钮是静默无操作——门禁提示永远亮不出来，用户只会
-                  // 看到"按了 Enter 毫无反应"。直调保证四种拦因都能通报。
-                  void submitQuestion()
-                }
-              }}
-              rows={1}
-              placeholder="向 AI 提问…"
-              aria-label="向 AI 快速提问"
-              className="max-h-28 w-full resize-none overflow-y-auto rounded-lg border border-white/20 bg-white/[0.08] py-1.5 pl-2.5 pr-8 text-[11px] leading-4 text-white outline-none transition-colors placeholder:text-white/35 focus:border-white/35 focus:bg-white/[0.10]"
-            />
-            <button
-              type="submit"
-              disabled={sending || !question.trim() || phase !== 'ready' || !recording}
-              title={phase === 'ready' && recording ? '发送问题（Enter）' : '开始录制后才能提问'}
-              aria-label="发送问题"
-              className="absolute bottom-0.5 right-1 flex h-6 w-6 cursor-pointer items-center justify-center rounded text-white/85 transition-colors hover:bg-white/15 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              {sending ? (
-                <Loader2 size={13} className="animate-spin" />
-              ) : (
-                <SendHorizontal size={13} />
-              )}
-            </button>
-          </div>
-          {/* 快捷键微字提示：从 placeholder 挪到输入框下方，placeholder 只留「向 AI 提问…」 */}
-          <div className="mt-1.5 px-0.5 text-[10px] leading-3 text-white/35">
-            Enter 发送 · Shift+Enter 换行
-          </div>
-        </form>
+          rows={1}
+          placeholder="向 AI 提问…"
+          aria-label="向 AI 快速提问"
+          className="max-h-28 w-full resize-none overflow-y-auto rounded-lg border border-white/20 bg-white/[0.08] py-1.5 pl-2.5 pr-8 text-[11px] leading-4 text-white outline-none transition-colors placeholder:text-white/35 focus:border-white/35 focus:bg-white/[0.10]"
+        />
+        {/* 快捷键微字提示：从 placeholder 挪到输入框下方，placeholder 只留「向 AI 提问…」。
+            white/60：正文级亮度——白底半透明时 35% 的白字会融进底色，
+            只剩 .overlay-card 继承的黑描边显形，看起来就是一排重影。 */}
+        <div className="mt-1.5 px-0.5 text-[10px] leading-3 text-white/60">
+          Enter 发送 · Shift+Enter 换行
+        </div>
       </footer>
     </div>
   )

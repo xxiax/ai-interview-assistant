@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import dayjs from 'dayjs'
 import { Globe, Loader2, RefreshCw, Sparkles, TriangleAlert } from 'lucide-react'
 import type { Answer } from '../../shared/types'
@@ -90,7 +90,8 @@ function threadCardPropsEqual(
     va.revision === vb.revision &&
     va.answer === vb.answer &&
     va.done === vb.done &&
-    va.failed === vb.failed
+    va.failed === vb.failed &&
+    va.error === vb.error
   )
 }
 
@@ -130,7 +131,7 @@ const ThreadCard = memo(function ThreadCard({ thread, cooling, onRegenerate }: T
               ) : (
                 <Loader2 size={12} className="animate-spin" />
               )}
-              {display.failed ? '这一段生成失败' : '正在生成…'}
+              {display.failed ? display.error || '这一段生成失败' : '正在生成…'}
             </div>
           )}
           {display.answer && display.failed && (
@@ -177,22 +178,9 @@ export default function AnswerFeed({
   /** 已发出、还没等到 answer_stream 首帧的手动提问（"正在思考"卡）。 */
   pending?: { id: number; question: string }[]
 }) {
-  const feedRef = useRef<HTMLDivElement>(null)
-  const followTailRef = useRef(true)
   // 冷却按卡记录（历史答案 id / 线程 key）：一张卡重新生成时其余按钮仍可用。
   const [coolingKeys, setCoolingKeys] = useState<Set<string>>(new Set())
   const cooldownTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
-
-  useLayoutEffect(() => {
-    const feed = feedRef.current
-    if (feed && followTailRef.current) feed.scrollTop = feed.scrollHeight
-  }, [answers.length, threads, pending])
-
-  const handleScroll = () => {
-    const feed = feedRef.current
-    if (!feed) return
-    followTailRef.current = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 64
-  }
 
   // 卸载清理冷却定时器,避免卸载后 setState 脏更新
   useEffect(() => {
@@ -261,24 +249,13 @@ export default function AnswerFeed({
   }
 
   return (
-    <div ref={feedRef} onScroll={handleScroll} className="h-full overflow-y-auto px-6 py-5">
+    <div className="h-full overflow-y-auto px-6 py-5">
+      {/*
+       * 最新在最上（2026-09-22 用户拍板）：pending → 实时线程 → 历史答案。
+       * 新内容从顶部插入、把旧的往下挤，流式输出不打扰阅读位置——所以这里
+       * 没有任何自动滚动。
+       */}
       <div className="mx-auto max-w-4xl space-y-4">
-        {answers.map((a) => (
-          <HistoryAnswerCard
-            key={a.id}
-            answer={a}
-            cooling={coolingKeys.has(`answer:${a.id}`)}
-            onRegenerate={handleRegenerateAnswer}
-          />
-        ))}
-        {threads.map((thread) => (
-          <ThreadCard
-            key={thread.key}
-            thread={thread}
-            cooling={coolingKeys.has(`thread:${thread.key}`)}
-            onRegenerate={handleRegenerateThread}
-          />
-        ))}
         {/*
          * 刚发出的手动提问（pending）：发送成功即出现在这里，answer_stream
          * 首帧到达自动消失、由真卡接棒（真卡对空答案也显示"正在生成…"，
@@ -298,6 +275,22 @@ export default function AnswerFeed({
               已发送 · 正在思考…
             </div>
           </article>
+        ))}
+        {threads.map((thread) => (
+          <ThreadCard
+            key={thread.key}
+            thread={thread}
+            cooling={coolingKeys.has(`thread:${thread.key}`)}
+            onRegenerate={handleRegenerateThread}
+          />
+        ))}
+        {answers.map((a) => (
+          <HistoryAnswerCard
+            key={a.id}
+            answer={a}
+            cooling={coolingKeys.has(`answer:${a.id}`)}
+            onRegenerate={handleRegenerateAnswer}
+          />
         ))}
       </div>
     </div>

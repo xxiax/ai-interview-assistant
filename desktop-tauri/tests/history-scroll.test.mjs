@@ -19,11 +19,12 @@ const detailSource = await readFile(
   'utf8'
 )
 
-test('历史转写和答案进入页面时直接定位底部，不播放滚动动画', () => {
+test('历史转写进入页面时直接定位底部，不播放滚动动画', () => {
+  // 答案区已改为最新在最上(2026-09-22),不再贴底——tail 断言只留给转写区。
+  assert.match(transcriptSource, /useLayoutEffect/)
+  assert.match(transcriptSource, /scrollTop = feed\.scrollHeight/)
+  assert.match(transcriptSource, /followTailRef/)
   for (const source of [transcriptSource, answerSource]) {
-    assert.match(source, /useLayoutEffect/)
-    assert.match(source, /scrollTop = feed\.scrollHeight/)
-    assert.match(source, /followTailRef/)
     assert.doesNotMatch(source, /pb-0/)
     assert.doesNotMatch(source, /scrollIntoView/)
     assert.doesNotMatch(source, /behavior: 'smooth'/)
@@ -31,6 +32,21 @@ test('历史转写和答案进入页面时直接定位底部，不播放滚动�
   assert.match(transcriptSource, /px-4 py-3/)
   assert.match(answerSource, /px-6 py-5/)
   assert.match(detailSource, /overflow-y-auto px-6 py-5/)
+})
+
+test('答案区最新在最上且不做任何自动滚动', () => {
+  // 2026-09-22 用户拍板:最新在底部时流式输出会把页面一跳一跳地往上弹,
+  // 改为最新从顶部插入、旧内容往下挤;阅读位置不被打扰,自动滚动整体作废。
+  assert.doesNotMatch(answerSource, /useLayoutEffect/)
+  assert.doesNotMatch(answerSource, /followTailRef/)
+  assert.doesNotMatch(answerSource, /scrollTop = feed\.scrollHeight/)
+  // 渲染顺序:pending → 实时线程 → 历史(源码里依次出现)。
+  const pending = answerSource.indexOf('pending.map')
+  const threads = answerSource.indexOf('threads.map')
+  const answers = answerSource.indexOf('answers.map')
+  assert.ok(pending > -1, 'pending 卡渲染块应存在')
+  assert.ok(threads > pending, '实时线程卡应排在 pending 之后')
+  assert.ok(answers > threads, '历史答案卡应排在实时线程之后')
 })
 
 test('相邻 final 只在显示层合并，跨来源或明显停顿保持分段', () => {

@@ -283,10 +283,11 @@ test('the regenerate button shares the title row instead of occupying its own li
 })
 
 test('the bottom bar is a quick-question composer, not a hotkey legend', () => {
-  // 用户拍板:底部快捷键说明换成 textarea + 右下角图标按钮,想问什么直接敲。
-  // 走不带 thread_id 的手动提问路径,答案独立成卡。Enter 发送、Shift+Enter
-  // 换行(用户习惯),未录制时按钮禁用。placeholder 只留「向 AI 提问…」,
-  // 不再背着键位说明(七轮:键位挪到输入框下方微字,见 footer 分层测试)。
+  // 用户拍板:底部快捷键说明换成 textarea,想问什么直接敲。走不带 thread_id
+  // 的手动提问路径,答案独立成卡。Enter 发送、Shift+Enter 换行(用户习惯)。
+  // 后续拍板:右下角发送按钮整个移除,只留 Enter 发送。
+  // placeholder 只留「向 AI 提问…」,键位说明在输入框下方微字(见 footer
+  // 分层测试)。
   assert.ok(
     !overlayPageSource.includes('placeholder="快速提问'),
     'placeholder 不得再背键位说明'
@@ -298,13 +299,11 @@ test('the bottom bar is a quick-question composer, not a hotkey legend', () => {
     overlayPageSource,
     /event\.key === 'Enter' && !event\.shiftKey/
   )
-  assert.match(overlayPageSource, /type="submit"/)
-  assert.match(overlayPageSource, /aria-label="发送问题"/)
   assert.match(overlayPageSource, /api\.live\.regenerate\(text, false\)/)
-  assert.match(
-    overlayPageSource,
-    /disabled=\{sending \|\| !question\.trim\(\) \|\| phase !== 'ready' \|\| !recording\}/
-  )
+  // 发送按钮已移除:不得再 import 图标、不得再有提交按钮。
+  assert.ok(!overlayPageSource.includes('SendHorizontal'), '发送按钮图标应随按钮一起移除')
+  assert.ok(!overlayPageSource.includes('aria-label="发送问题"'), '发送按钮已移除,只留 Enter')
+  assert.ok(!overlayPageSource.includes('type="submit"'), '不再有表单提交按钮')
   // 三轮拍板"聚焦不改边框颜色"针对的是彩色描边(黑白灰配色下唯一的异色);
   // 七轮拍板改为灰阶提亮:white/35 边框 + white/[0.10] 背景。仍禁彩色 focus 边框。
   assert.ok(
@@ -327,14 +326,33 @@ test('the overlay palette is strictly black/white/gray', () => {
   assert.ok(!overlayPageSource.includes('0B0F1A'), '旧蓝黑底色应已换成中性黑')
 })
 
-test('collapsing scrolls the restored feed back to the tail', () => {
-  // 收起/展开会卸载重挂滚动容器,重挂后 scrollTop 归零——依赖里必须有
-  // overlay.collapsed,否则展开后聊天记录显示在顶部。feed.pending 也要
-  // 贴底:刚发出的"正在思考"卡得出现在视野里。
-  assert.match(
-    overlayPageSource,
-    /\[model\.threads, feed\.partial, feed\.pending, overlay\.collapsed\]/
-  )
+test('collapsing restores the saved scroll position on expand', () => {
+  // 收起/展开会卸载重挂滚动容器,重挂后 scrollTop 归零——展开时按收起前
+  // 保存的 scrollTop 恢复"停在哪就回到哪"。答案区已改为最新在最上,不再有
+  // 贴底语义,恢复原始 scrollTop 即可(顶部就是新内容,0 天然正确)。
+  assert.match(overlayPageSource, /savedScrollTopRef\.current = node\.scrollTop/)
+  assert.match(overlayPageSource, /node\.scrollTop = savedScrollTopRef\.current/)
+})
+
+test('收起过渡期的滚动锚定不污染保存的位置', () => {
+  // 2026-09-22 CDP 复现实测的竞态:Rust 收起先把窗口 set_size(240×18) 再发
+  // collapsed 状态,窗口已缩、完整树还没换走的间隙里窄幅重排触发滚动锚定,
+  // scrollTop 从 1290 被顶到 5746(当时 scrollHeight 11810/clientHeight 20),
+  // 存进 savedScrollTopRef 后展开恢复会被夹到最底部——正是"反复 Ctrl+Alt+E
+  // 滚动位置一路下滑到底"。条状尺寸下容器只有 ~20px 高,真实展开态不可能
+  // 低于 64px,用它把过渡期的 scroll 事件挡在保存之外。
+  assert.match(overlayPageSource, /if \(node\.clientHeight < 64\) return/)
+})
+
+test('会话门禁拦下前先补拉一次运行时快照自愈', () => {
+  // 2026-09-22 线上卡死:sessionStatus 一旦被清(adopt 切会话/连接关闭),
+  // 稳态下不再有 sessionState 事件来补——提问/解题门禁永远拦在
+  // "会话状态同步中"。拦截前先 refreshSessionStatus() 拉 Rust 快照经
+  // overlay:seed 落回(seed 只补状态不清卡),拉完仍非 recording 才拦。
+  assert.match(overlayPageSource, /refreshSessionStatus/)
+  assert.match(overlayPageSource, /overlay:seed/)
+  assert.match(overlayPageSource, /sessionBlockHint\(status, '提问'\)/)
+  assert.match(overlayPageSource, /sessionBlockHint\(status, '解题'\)/)
 })
 
 test('overlay page subscribes to engine events itself', () => {
@@ -636,10 +654,12 @@ test('Ctrl+Alt+Z toggles recording without ever ending the session', () => {
     startAt < sysAt && sysAt < gateAt,
     '开启必须先起会话和系统采集再开上传门禁'
   )
-  // 就地反馈与手机模式提示。
-  assert.ok(slice.includes('已暂停录制'))
-  assert.ok(slice.includes('已继续录制'))
-  assert.ok(slice.includes('已开始录制'))
+  // 就地反馈只保留拦截/失败原因(warn);成功路径的"已暂停/已继续/已开始
+  // 录制"info 提示已按用户要求全部移除——状态本身在徽标上,答案区不刷屏。
+  // 手机模式的提示是拦截原因,保留。
+  for (const gone of ['已暂停录制', '已继续录制', '已开始录制', '已发送，正在思考', '截图已发送，正在解题']) {
+    assert.ok(!overlayPageSource.includes(gone), `info 提示应已移除: ${gone}`)
+  }
   assert.ok(slice.includes('手机收音模式，请在手机端暂停'))
 })
 
@@ -659,7 +679,7 @@ test('manual question and screenshot gates read session status only, with distin
     overlayPageSource.indexOf('setSending(true)')
   )
   assert.ok(askGate.includes('连接未就绪，稍候再试'), '提问门禁要先报连接')
-  assert.ok(askGate.includes("sessionBlockHint('提问')"), '会话侧拦因细分通报')
+  assert.ok(askGate.includes("sessionBlockHint(status, '提问')"), '会话侧拦因细分通报')
   assert.ok(
     !askGate.includes('captureOn'),
     '提问门禁不得看采集开关——暂停期间照常可问'
@@ -669,7 +689,7 @@ test('manual question and screenshot gates read session status only, with distin
     overlayPageSource.indexOf('setSolving(true)')
   )
   assert.ok(solveGate.includes('连接未就绪，稍候再试'))
-  assert.ok(solveGate.includes("sessionBlockHint('解题')"))
+  assert.ok(solveGate.includes("sessionBlockHint(status, '解题')"))
   assert.ok(
     !solveGate.includes('captureOn'),
     '截图门禁同样不得看采集开关'
@@ -800,6 +820,34 @@ test('a sent question shows up as a pending card until the stream answers', () =
   assert.equal(failed.pending.length, 0, '失败帧也要收掉 pending')
 })
 
+test('a failed stream frame carries its reason into the card for display', () => {
+  // 用户痛点:出错时答案区只有一个"生成失败",为什么失败一点信息都没有。
+  // 后端失败帧带 reason,归约层必须把它存进 streaming 条目(渲染层直接展示)。
+  const failed = applyOverlayEvent(
+    initialOverlayFeed,
+    streamEvent('s1', 'r1', '', {
+      question: 'Q',
+      failed: true,
+      done: true,
+      answer: '',
+      reason: '付费服务预算或并发已达上限'
+    })
+  )
+  assert.equal(failed.streaming.r1.error, '付费服务预算或并发已达上限')
+
+  // 非 failed 帧或没有 reason 的失败帧不带 error,不显示误导信息。
+  const noReason = applyOverlayEvent(
+    initialOverlayFeed,
+    streamEvent('s1', 'r2', '', { question: 'Q', failed: true, done: true, answer: '' })
+  )
+  assert.equal(noReason.streaming.r2.error, undefined)
+  // 渲染层:失败卡优先展示真实原因,没有 reason 才落回通用文案。
+  assert.match(
+    overlayPageSource,
+    /display\?\.failed\s*\?\s*display\.error \|\| '生成失败，可点重新生成'\s*:\s*'正在生成…'/
+  )
+})
+
 test('a disconnect clears pending questions instead of leaving spinners forever', () => {
   const asked = applyOverlayEvent(initialOverlayFeed, { kind: 'overlay:asked', question: 'Q' })
   const closed = applyOverlayEvent(asked, { kind: 'connection', phase: 'closed' })
@@ -887,10 +935,8 @@ test('stale engine events are dropped by a generation gate', () => {
   const disconnect = libRust.slice(disconnectAt, disconnectNext)
   assert.ok(!disconnect.includes('fetch_add'), 'live_disconnect 不该翻代际')
 
-  // Enter 直调 submitQuestion 而非 requestSubmit：发送按钮 disabled 时
-  // requestSubmit 对被禁用的默认提交按钮是静默无操作，门禁提示永远亮不
-  // 出来（"按了毫无反应"的观感来源之一）。断言匹配的是调用语法——注释
-  // 里允许解释来龙去脉。
+  // Enter 直调 submitQuestion。发送按钮移除后表单也不在了,这个断言守住
+  // "Enter 永远直接走提交逻辑"不被将来的表单回潮打破。
   assert.ok(
     !/\.requestSubmit\(/.test(overlayPageSource),
     'Enter 必须直调 submitQuestion，不得绕回表单提交'
@@ -912,16 +958,45 @@ test('ctrl+wheel scrolls the overlay instead of being eaten as zoom', () => {
   assert.match(overlayPageSource, /node\.scrollTop \+= amount/)
 })
 
-test('jumping to tail suppresses the latest-button flash during smooth scroll', () => {
-  // 真实竞态:点「最新」→ setAtTail(true) 按钮隐藏 → smooth 动画中间帧
-  // "不在底部" → setAtTail(false) 按钮闪出 → 到尾再隐藏。修法:动画期间
-  // 抑制 handleScroll 的判定,落底解除;600ms 安全阀兜住没走到尾的极端情况。
-  assert.match(overlayPageSource, /jumpingToTailRef\.current = true/)
+test('答案卡显示落库时间,与主窗口一致的 HH:mm:ss', () => {
+  // 2026-09-22 用户要求:悬浮窗答案卡加时间。线程卡在答案落库(persisted)后
+  // 显示——生成中的卡先不出时间,避免拿"到达时间"冒充;历史卡直接显示。
+  // 格式与主窗口 AnswerFeed 相同(HH:mm:ss + tnum 等宽数字)。
   assert.match(
     overlayPageSource,
-    /if \(jumpingToTailRef\.current\) \{[\s\S]{0,400}setAtTail\(true\)/
+    /dayjs\(thread\.persisted\.created_at\)\.format\('HH:mm:ss'\)/
   )
-  assert.match(overlayPageSource, /window\.setTimeout\(\(\) => \{[\s\S]{0,160}jumpingToTailRef\.current = false/)
+  assert.match(overlayPageSource, /dayjs\(answer\.created_at\)\.format\('HH:mm:ss'\)/)
+  assert.match(overlayPageSource, /tnum mt-1 text-\[10px\] leading-4 text-white\/70/)
+  // 2026-09-22 白底重影修复:white/40 的字身在白底半透明下只剩继承的黑描边
+  // 显形(实测填充对比 1.86:1),提到 70 后字身 3.0:1、描边 4.7:1,深底 9.6:1。
+  assert.ok(
+    !overlayPageSource.includes('tnum mt-1 text-[10px] leading-4 text-white/40'),
+    '时间戳不得回退到 white/40(白底重影)'
+  )
+})
+
+test('答案区最新在最上,贴底自动滚动与「最新」浮标整体作废', () => {
+  // 2026-09-22 用户拍板:流式输出时贴底自动滚动一跳一跳,很影响观感。改为
+  // 最新从顶部插入、旧内容往下挤,阅读位置不被打扰——tail-follow 判定、
+  // 平滑回底、回底按钮(含曾经的按钮闪烁竞态修复)全部不再需要。
+  for (const sym of [
+    'atTail',
+    'scrollToTail',
+    'followTailRef',
+    'TAIL_SLACK',
+    'ArrowDownToLine',
+    '回到最新答案'
+  ]) {
+    assert.ok(!overlayPageSource.includes(sym), `应随贴底机制一起移除: ${sym}`)
+  }
+  // 渲染顺序:pending → 实时线程 → 历史(源码里依次出现)。
+  const pending = overlayPageSource.indexOf('feed.pending.map')
+  const threads = overlayPageSource.indexOf('model.threads.map')
+  const answers = overlayPageSource.indexOf('model.historyAnswers.map')
+  assert.ok(pending > -1, 'pending 卡渲染块应存在')
+  assert.ok(threads > pending, '实时线程卡应排在 pending 之后')
+  assert.ok(answers > threads, '历史答案卡应排在实时线程之后')
 })
 
 test('answer text is selectable while chrome stays unselectable', () => {

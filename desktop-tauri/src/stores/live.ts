@@ -185,7 +185,11 @@ export function applyEngineEvent(state: LiveState, event: EngineEvent): Partial<
           source: event.source === 'search+llm' ? 'search+llm' : ('llm' as AnswerSource),
           done,
           started,
-          failed
+          failed,
+          error:
+            failed && typeof event.reason === 'string' && event.reason
+              ? event.reason
+              : undefined
         }
         // catch-up swap：新 revision 的帧不删旧 revision 的段——旧段正流着
         // 被删会让眼前答案凭空消失。全部保留，渲染层挑「未被取代里答案

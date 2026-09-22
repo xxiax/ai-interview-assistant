@@ -114,6 +114,7 @@ html:has(body.overlay-root) {
   }
 }
 
+/* 悬浮窗根卡片的入场动画（根容器同时挂 overlay-card/overlay-panel）。 */
 .overlay-panel {
   animation: overlay-panel-in 200ms ease-out;
 }

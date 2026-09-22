@@ -313,6 +313,275 @@ async def test_stream_answer_yields_reasoning_fields_as_they_arrive(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_stream_answer_strips_inline_think_tags_across_chunks(monkeypatch):
+    """content 里内联的 <think>…</think> 必须剔除(标签可被 SSE 拆在多个 chunk)。"""
+    _save_llm_config()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"<th"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"ink>内心独白</think>正"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"文"}}]}'
+            yield 'data: [DONE]'
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", Client)
+    chunks = [chunk async for chunk in llm.stream_answer("问题")]
+    assert "".join(chunk.text for chunk in chunks) == "正文"
+
+
+@pytest.mark.asyncio
+async def test_stream_answer_raises_when_only_think_tags_are_returned(monkeypatch):
+    """两次都只回思考 → 自动加大预算重试一次，重试仍无正文才报错。"""
+    _save_llm_config()
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"<think>只有思考"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"没有正文</think>"}}]}'
+            yield 'data: [DONE]'
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, _method, _url, json=None, **_kwargs):
+            calls.append(json["max_completion_tokens"])
+            return Response()
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", Client)
+    with pytest.raises(RuntimeError, match="只返回了思考过程"):
+        async for _chunk in llm.stream_answer("问题"):
+            pass
+    assert len(calls) == 2, "先按默认预算，再按加大预算重试一次"
+    assert calls[1] == llm._escalated_budget(calls[0])
+
+
+@pytest.mark.asyncio
+async def test_stream_answer_retries_with_escalated_budget_then_succeeds(monkeypatch):
+    """思考型模型把 <think> 写进 content，小预算被思考耗尽 → 换大预算重试拿到正文。"""
+    _save_llm_config()
+    calls = []
+
+    class ThinkOnlyResponse:
+        def raise_for_status(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"<think>超长思考撑爆预算"}}]}'
+            yield 'data: [DONE]'
+
+    class MixedResponse:
+        def raise_for_status(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"<think>思考</think>"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"正文"}}]}'
+            yield 'data: [DONE]'
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, _method, _url, json=None, **_kwargs):
+            calls.append(json["max_completion_tokens"])
+            return ThinkOnlyResponse() if len(calls) == 1 else MixedResponse()
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", Client)
+    chunks = [chunk async for chunk in llm.stream_answer("问题")]
+    # 第一轮被过滤得只剩空白（对下游不可见），第二轮的正文是唯一内容。
+    assert "".join(chunk.text for chunk in chunks) == "正文"
+    assert len(calls) == 2
+    assert calls[1] == llm._escalated_budget(calls[0])
+
+
+@pytest.mark.asyncio
+async def test_stream_answer_does_not_retry_truly_empty_response(monkeypatch):
+    """content 一个字都没有（上游真返回空）→ 直接报空答案，不重试。"""
+    _save_llm_config()
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: [DONE]'
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, _method, _url, json=None, **_kwargs):
+            calls.append(json["max_completion_tokens"])
+            return Response()
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", Client)
+    with pytest.raises(RuntimeError, match="空答案"):
+        async for _chunk in llm.stream_answer("问题"):
+            pass
+    assert len(calls) == 1, "真空答案不重试"
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_retries_thinking_only_response(monkeypatch):
+    """非流式路径同样自动换大预算重试一次。"""
+    _save_llm_config()
+    calls = []
+
+    class ThinkOnlyResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "<think>思考撑爆预算没有正文</think>"}}
+                ]
+            }
+
+    class MixedResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "<think>思考</think>答案正文"}}
+                ]
+            }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, json=None, **_kwargs):
+            calls.append(json["max_completion_tokens"])
+            return ThinkOnlyResponse() if len(calls) == 1 else MixedResponse()
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", Client)
+    assert await llm.generate_answer("问题") == "答案正文"
+    assert len(calls) == 2
+    assert calls[1] == llm._escalated_budget(calls[0])
+
+
+def test_strip_inline_thinking_handles_closed_and_unclosed_tags():
+    assert llm._strip_inline_thinking("<think>隐藏</think>答案") == "答案"
+    assert llm._strip_inline_thinking("前<think>未闭合") == "前"
+    assert llm._strip_inline_thinking("无标签文本") == "无标签文本"
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_strips_inline_think_tags(monkeypatch):
+    _save_llm_config()
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "<think>长篇思考</think>答案正文"}}]
+            }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", Client)
+    assert await llm.generate_answer("问题") == "答案正文"
+
+
+@pytest.mark.asyncio
 async def test_chat_sends_reasoning_effort_for_reasoning_model(monkeypatch):
     conn = db.get_db()
     try:
@@ -505,7 +774,7 @@ async def test_empty_system_prompt_falls_back_to_builtin(monkeypatch):
     await llm.generate_answer("什么是 FastAPI？")
     system = captured["messages"][0]["content"]
     assert "资深面试辅导专家" in system
-    assert "200 字以内" in system
+    assert "800 字左右" in system
     assert "不可信数据" in system
 
 

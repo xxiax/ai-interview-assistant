@@ -161,7 +161,7 @@ async def _resolve_funasr_host(hostname: str, proxy_url: str | None) -> str | No
 
 
 def _active_proxy() -> str | None:
-    """代理优先级：部署环境覆盖 → 设置页配置 → Windows 当前用户代理。"""
+    """代理优先级：部署环境覆盖 → 设置页配置(空=显式直连) → Windows 当前用户代理。"""
     override = _normalize_proxy_url(os.environ.get("AI_OUTBOUND_PROXY", ""))
     if override:
         return override
@@ -173,7 +173,11 @@ def _active_proxy() -> str | None:
             conn.close()
         if config:
             url = config["data"].get("proxy_url")
-            if isinstance(url, str) and url.strip():
+            if isinstance(url, str):
+                if not url.strip():
+                    # 激活的网络配置显式选择"直连"：出网一律不走代理，
+                    # 也不再回退 Windows 系统代理。
+                    return None
                 normalized = _normalize_proxy_url(url)
                 if normalized:
                     return normalized

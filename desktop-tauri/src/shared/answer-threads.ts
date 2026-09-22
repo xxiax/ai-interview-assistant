@@ -9,6 +9,8 @@ export interface AnswerVersion {
   answer: string
   done: boolean
   failed: boolean
+  /** 失败原因（来自后端失败帧的 reason），直接展示给用户。 */
+  error?: string
   /** 被同线程更新 revision 取代：内容冻结保留，不参与展示版挑选。 */
   superseded?: boolean
 }
@@ -91,6 +93,7 @@ export function buildAnswerFeed(
             answer: item.answer,
             done: item.done,
             failed: item.failed,
+            error: item.error,
             superseded: item.superseded
           }
         ]
@@ -106,6 +109,7 @@ export function buildAnswerFeed(
       answer: item.answer,
       done: item.done,
       failed: item.failed,
+      error: item.error,
       superseded: item.superseded
     })
   }
@@ -131,8 +135,16 @@ export function buildAnswerFeed(
     }
   }
 
+  /*
+   * 展示顺序：最新在最上（2026-09-22 用户拍板）。最新答案从顶部插入、把旧
+   * 内容往下挤，流式输出时正在阅读的位置不被打扰——也因此两个窗口都不再
+   * 需要任何自动滚动。线程按"首帧到达"先后算新旧（Map 插入序最旧在前），
+   * 历史答案按落库 id 倒序。
+   */
   return {
-    historyAnswers: answers.filter((answer) => !covered.has(answer.id)),
-    threads
+    historyAnswers: answers
+      .filter((answer) => !covered.has(answer.id))
+      .sort((a, b) => b.id - a.id),
+    threads: threads.reverse()
   }
 }

@@ -638,6 +638,12 @@ async def test_answer_stream_is_broadcast_before_final_answer_is_persisted(monke
     # answer 事件也不再携带 thinking 字段。
     assert all(message["channel"] == "answer" for message in stream_messages)
     assert all("thinking" not in message for message in stream_messages)
+    # 手动提问（thread_id=None）也必须在生成一开始就发 started 空帧：
+    # 主窗口/悬浮窗两个前端都靠这帧即刻挂出"正在生成"卡（发送方以外的
+    # 窗口也要立刻知道有问题在答），不能等第一个 delta。
+    assert answer_stream_messages[0].get("started") is True
+    assert answer_stream_messages[0]["delta"] == ""
+    assert answer_stream_messages[0]["done"] is False
     assert stream_messages[-1]["done"] is True
     final_answer_event = next(message for message in messages if message.get("type") == "answer")
     assert "thinking" not in final_answer_event
@@ -647,6 +653,68 @@ async def test_answer_stream_is_broadcast_before_final_answer_is_persisted(monke
     finally:
         conn.close()
     assert answers[0]["answer"] == "先给出项目背景和技术方案。"
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_manual_question_failure_broadcasts_reason(monkeypatch):
+    """手动提问失败不能静默：失败帧带 reason，error 广播带原因文本。
+
+    用户痛点：textarea 提问失败时答案区一点反馈都没有，只能干等。失败帧的
+    reason 字段驱动前端失败卡显示真实原因（而不是通用文案）。
+    """
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "手动提问失败")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    messages = []
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    async def failing_stream(question, context="", *_ctx):
+        raise RuntimeError("LLM 只返回了思考过程，未生成答案正文，请重试或换模型")
+        yield  # pragma: no cover - 让本函数成为 async 生成器
+
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", failing_stream)
+    monkeypatch.setattr(
+        realtime_module.llm,
+        "stream_answer_with_search_info",
+        failing_stream,
+    )
+    pipeline = RealtimePipeline(capture_broadcast)
+    assert await pipeline.enqueue_answer(
+        AnswerWork(session["id"], "为什么会失败", False)
+    )
+
+    for _ in range(100):
+        if any(
+            message.get("type") == "error"
+            and message.get("code") == "answer_generation_failed"
+            for message in messages
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    failed_frames = [
+        message
+        for message in messages
+        if message.get("type") == "answer_stream" and message.get("failed") is True
+    ]
+    assert len(failed_frames) == 1
+    assert failed_frames[0]["reason"] == (
+        "LLM 只返回了思考过程，未生成答案正文，请重试或换模型"
+    )
+    error = next(
+        message
+        for message in messages
+        if message.get("type") == "error"
+        and message.get("code") == "answer_generation_failed"
+    )
+    assert "LLM 只返回了思考过程" in error["message"]
     await pipeline.stop_session(session["id"])
 
 
@@ -868,6 +936,113 @@ async def test_funasr_cumulative_partial_drives_revisions_and_one_transcript_per
         conn.close()
     # 一个语音段只落一条转写，而不是每片一条。
     assert [item["text"] for item in transcripts] == ["第1片第2片"]
+    await pipeline.stop_session(session["id"])
+
+
+@pytest.mark.asyncio
+async def test_mid_utterance_final_does_not_poison_next_utterance(monkeypatch):
+    """网关 VAD 中途 final 后：新 utterance 的累计 partial 立即开版不被上一句
+    遗留的 dispatched_text 节流；stop 无事件时兜底合成 final 用的是新
+    utterance 的文本，不会把已落库的上一句原文再重复落一条转写。"""
+    conn = db.get_db()
+    try:
+        session = db.create_session(conn, "网关VAD中途final")
+        db.start_session(conn, session["id"], "pc")
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("AI_ASR_ENGINE", "funasr")
+    monkeypatch.setenv("AI_FUNASR_STREAM", "true")
+    monkeypatch.setenv("AI_QUESTION_THREAD_GRACE_SECONDS", "0.05")
+    messages = []
+
+    # 33 个互不重复的字符：长度超过落库去重的 32 字符尾巴窗口（重复落库
+    # 不会被去重吃掉，bug 才可观测），且任何后缀都不等于自身前缀（不会
+    # 触发 ≥4 字符重叠去重误伤第二条转写）。
+    first_final = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg"
+    second_partial = first_final + "吗"
+    script = [
+        ("partial", first_final),
+        ("final", first_final),
+        ("partial", second_partial),
+    ]
+
+    class FakeStream:
+        def __init__(self):
+            self.pushed = 0
+
+        async def connect(self):
+            return None
+
+        async def push_wav(self, _audio_bytes, _duration_ms):
+            event_type, text = script[self.pushed]
+            self.pushed += 1
+            return [asr.FunAsrEvent(event_type, text=text)]
+
+        async def finish(self):
+            # stop 后网关一个事件都不回 → 触发 dispatched_text 兜底合成 final
+            return []
+
+        async def close(self):
+            return None
+
+    async def fake_stream(question, context="", *_ctx):
+        yield realtime_module.llm.LLMStreamPart(text=f"回答:{question}")
+
+    monkeypatch.setattr(realtime_module.asr, "FunAsrStream", FakeStream)
+    monkeypatch.setattr(realtime_module.llm, "stream_answer", fake_stream)
+
+    async def capture_broadcast(_session_id, message):
+        messages.append(message)
+
+    pipeline = RealtimePipeline(capture_broadcast)
+    start = datetime.now(timezone.utc)
+    for seq in range(3):
+        item = AudioWork(
+            session_id=session["id"],
+            chunk_id=str(uuid4()),
+            source="pc",
+            codec="wav_pcm_s16le",
+            chunk_seq=seq,
+            captured_at=start + timedelta(milliseconds=seq * 500),
+            duration_ms=1000,
+            audio_bytes=b"wav",
+        )
+        accepted, _ = await pipeline.enqueue_audio(item)
+        assert accepted
+
+    # 第三片是新 utterance 的累计 partial，必须立刻开一版 LLM；
+    # 旧的 bug 会拿上一句的 dispatched_text 判"开头相同、增长不足"把它丢掉。
+    saw_second_revision = False
+    for _ in range(100):
+        saw_second_revision = any(
+            "吗" in message["question"]
+            for message in messages
+            if message["type"] == "answer_stream"
+        )
+        if saw_second_revision:
+            break
+        await asyncio.sleep(0.01)
+    assert saw_second_revision
+
+    await pipeline.mark_speech_end(session["id"], "pc", 2)
+    for _ in range(100):
+        conn = db.get_db()
+        try:
+            transcripts = db.get_transcripts(conn, session["id"])
+        finally:
+            conn.close()
+        if len(transcripts) == 2:
+            break
+        await asyncio.sleep(0.01)
+    conn = db.get_db()
+    try:
+        db.end_session(conn, session["id"])
+        transcripts = db.get_transcripts(conn, session["id"])
+    finally:
+        conn.close()
+    # 第一句一条、第二句一条；旧的 bug 是 finish 兜底把第一句原文再落一条。
+    assert [item["text"] for item in transcripts] == [first_final, second_partial]
     await pipeline.stop_session(session["id"])
 
 

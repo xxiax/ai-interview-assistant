@@ -117,6 +117,12 @@ def _is_config_error(exc: BaseException) -> bool:
     return ("401" in reason or "403" in reason) and "groq.com" in reason
 
 
+def _failure_reason(exc: BaseException) -> str:
+    """给前端展示的失败原因：真实异常文本，截断防刷屏。"""
+    text = str(exc).strip() or exc.__class__.__name__
+    return text[:200]
+
+
 def _audio_config_error_message() -> str:
     engine = os.environ.get("AI_ASR_ENGINE", "funasr").strip().lower()
     if engine == "funasr":
@@ -1050,6 +1056,12 @@ class RealtimePipeline:
             await self._dispatch_segment_revision(key, segment, final_text, force=True)
             await self._commit_question_prefix(key)
             await self._persist_segment_final(key, segment, final_text)
+            # 网关 VAD 可能在说话中途就吐 final，连接随后继续服务下一个
+            # utterance。这里必须清空 dispatched_text：否则下一个 utterance
+            # 的累计 partial 会被上一句的旧文本错误节流（开头相同的新句甚至
+            # 被当成"无增长"整版丢弃），stop 兜底合成 final 时还会把已落库
+            # 的旧文本再重复落一条转写。
+            segment.dispatched_text = ""
 
     async def _commit_question_prefix(self, key: tuple[str, str]) -> None:
         """语音段结束时固化问题前缀。
@@ -1547,7 +1559,13 @@ class RealtimePipeline:
         source = "llm"
 
         async def emit_stream_frame(
-            *, delta: str, answer: str, started: bool, done: bool, failed: bool
+            *,
+            delta: str,
+            answer: str,
+            started: bool,
+            done: bool,
+            failed: bool,
+            reason: str = "",
         ) -> None:
             # token 帧只带 delta（answer 恒为空串），终止帧（done/failed）才携带
             # 全文一次；twin 字段 text 已从协议删除，全文字段统一为 answer。
@@ -1567,6 +1585,7 @@ class RealtimePipeline:
                     started=started,
                     done=done,
                     failed=failed,
+                    reason=reason,
                 ),
             )
 
@@ -1575,10 +1594,12 @@ class RealtimePipeline:
             context = await run_db(db.get_recent_transcript_context, session_id)
             # 岗位 JD 与简历让答案贴合这个岗位和这份履历；缺省时退化为通用答案。
             job_description, resume = await run_db(db.get_session_context, session_id)
-            if item.thread_id is not None:
-                await emit_stream_frame(
-                    delta="", answer="", started=True, done=False, failed=False
-                )
+            # 手动提问（thread_id=None）也发 started 空帧：主窗口/悬浮窗都靠
+            # 这帧即刻挂出"正在生成"卡，否则发送方以外的窗口要等第一个
+            # delta 才知道有问题在答——两边看起来各说各话。
+            await emit_stream_frame(
+                delta="", answer="", started=True, done=False, failed=False
+            )
             if item.use_search:
                 stream = llm.stream_answer_with_search_info(
                     item.question, context, job_description, resume
@@ -1663,10 +1684,14 @@ class RealtimePipeline:
                     item.thread_id, item.revision, None
                 )
         except (db.UsageLimitExceeded, cost_control.PaidCallBusyError) as exc:
-            if not item.persist_immediately and not revision_finished:
-                await self._finish_question_revision(
-                    item.thread_id, item.revision, None
-                )
+            # 失败帧与错误广播对手动提问（persist_immediately=True）也要发：
+            # 只有线程 revision 才需要 _finish_question_revision 收尾，失败
+            # 通报是两回事——手动提问失败时静默会让前端卡在"正在生成"。
+            if not revision_finished:
+                if not item.persist_immediately:
+                    await self._finish_question_revision(
+                        item.thread_id, item.revision, None
+                    )
                 revision_finished = True
                 await emit_stream_frame(
                     delta="",
@@ -1674,6 +1699,7 @@ class RealtimePipeline:
                     started=False,
                     done=True,
                     failed=True,
+                    reason="付费服务预算或并发已达上限",
                 )
                 await self.broadcast(
                     session_id,
@@ -1692,11 +1718,14 @@ class RealtimePipeline:
                     self._cleanup_cancelled_revision(item, session_id)
                 )
             raise
-        except Exception:
-            if not item.persist_immediately and not revision_finished:
-                await self._finish_question_revision(
-                    item.thread_id, item.revision, None
-                )
+        except Exception as exc:
+            # 同上：失败帧与错误广播不再只属于线程路径，手动提问也要能看到
+            # 失败原因（reason 进失败帧，文本进 error 广播）。
+            if not revision_finished:
+                if not item.persist_immediately:
+                    await self._finish_question_revision(
+                        item.thread_id, item.revision, None
+                    )
                 revision_finished = True
                 await emit_stream_frame(
                     delta="",
@@ -1704,6 +1733,7 @@ class RealtimePipeline:
                     started=False,
                     done=True,
                     failed=True,
+                    reason=_failure_reason(exc),
                 )
                 logger.exception("答案生成失败: session=%s", session_id)
                 await self.broadcast(
@@ -1711,7 +1741,7 @@ class RealtimePipeline:
                     server_message(
                         "error",
                         code="answer_generation_failed",
-                        message="答案生成失败，请稍后重试",
+                        message=f"答案生成失败：{_failure_reason(exc)}",
                     ),
                 )
 

@@ -163,8 +163,8 @@ class ASRConfigData(StrictModel):
 
 
 class NetworkConfigData(StrictModel):
-    """网络代理配置:proxy_url 支持 http/https/socks5/socks5h。"""
-    proxy_url: Annotated[str, Field(min_length=1, max_length=500)]
+    """网络代理配置:proxy_url 支持 http/https/socks5/socks5h;空串表示直连。"""
+    proxy_url: Annotated[str, Field(max_length=500)]
     api_key: Annotated[SecretStr, Field(min_length=1, max_length=4096)]
 
     @field_validator("proxy_url")
@@ -172,6 +172,8 @@ class NetworkConfigData(StrictModel):
     def validate_proxy_scheme(cls, value: str) -> str:
         from urllib.parse import urlparse
 
+        if not value.strip():
+            return ""
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname:
             raise ValueError("proxy_url 必须是 http/https/socks5/socks5h 之一且包含主机")

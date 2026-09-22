@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AudioLines,
   CheckCircle2,
+  ChevronDown,
   Globe,
   KeyRound,
   Pencil,
@@ -185,6 +186,120 @@ function PromptCard() {
   )
 }
 
+// ---------- 可搜索下拉(单用途:LLM 模型选择) ----------
+
+function ModelSelect({
+  value,
+  options,
+  disabled,
+  onChange
+}: {
+  value: string
+  options: string[]
+  disabled?: boolean
+  onChange: (value: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const rootRef = useRef<HTMLDivElement>(null)
+  // 编辑模式已保存的模型可能不在拉取列表里:并入选项,保证回显可选。
+  const allOptions = useMemo(
+    () => (value && !options.includes(value) ? [value, ...options] : options),
+    [value, options]
+  )
+  const filtered = useMemo(() => {
+    const keyword = query.trim().toLowerCase()
+    if (!keyword) return allOptions
+    return allOptions.filter((m) => m.toLowerCase().includes(keyword))
+  }, [allOptions, query])
+
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onPointerDown)
+    return () => document.removeEventListener('mousedown', onPointerDown)
+  }, [open])
+
+  if (disabled) {
+    return (
+      <div>
+        <span className="mb-1.5 block text-[13px] font-medium text-ink-secondary">模型</span>
+        <button
+          type="button"
+          disabled
+          className="flex w-full cursor-not-allowed items-center justify-between rounded-lg border border-stroke bg-surface-card px-3 py-2 text-left text-sm text-ink-faint opacity-50"
+        >
+          <span className="truncate">{value || '先点击「获取模型」'}</span>
+          <ChevronDown size={14} className="shrink-0" />
+        </button>
+        <span className="mt-1.5 block text-xs text-ink-faint">先点击「获取模型」拉取列表后再选择</span>
+      </div>
+    )
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <span className="mb-1.5 block text-[13px] font-medium text-ink-secondary">模型</span>
+      <button
+        type="button"
+        onClick={() => {
+          setQuery('')
+          setOpen(!open)
+        }}
+        className="flex w-full cursor-pointer items-center justify-between rounded-lg border border-stroke bg-surface-card px-3 py-2 text-left text-sm text-ink-primary transition-colors duration-150 hover:border-[#35415f] focus:border-brand focus:outline-none"
+      >
+        <span className={`truncate ${value ? '' : 'text-ink-faint'}`}>{value || '请选择模型'}</span>
+        <ChevronDown
+          size={14}
+          className={`shrink-0 transition-transform duration-150 ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+      {open && (
+        <div className="absolute z-10 mt-1 w-full rounded-lg border border-stroke bg-surface-card p-2 shadow-pop">
+          <input
+            autoFocus
+            value={query}
+            placeholder="搜索模型…"
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setOpen(false)
+              if (e.key === 'Enter' && filtered.length > 0) {
+                e.preventDefault()
+                onChange(filtered[0])
+                setOpen(false)
+              }
+            }}
+            className="w-full rounded-lg border border-stroke bg-surface px-3 py-1.5 text-sm text-ink-primary placeholder:text-ink-faint focus:border-brand focus:outline-none"
+          />
+          <div className="mt-1.5 max-h-48 overflow-y-auto">
+            {filtered.length === 0 ? (
+              <p className="py-3 text-center text-xs text-ink-faint">无匹配模型</p>
+            ) : (
+              filtered.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => {
+                    onChange(m)
+                    setOpen(false)
+                  }}
+                  className={`block w-full cursor-pointer truncate rounded-md px-2.5 py-1.5 text-left text-sm ${
+                    m === value ? 'bg-brand/10 text-brand' : 'text-ink-secondary hover:bg-surface-hover'
+                  }`}
+                >
+                  {m}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ---------- 配置卡片 ----------
 
 function ConfigCard({ type }: { type: ConfigType }) {
@@ -317,7 +432,7 @@ function ConfigCard({ type }: { type: ConfigType }) {
     setOpen(true)
   }
 
-  // 获取模型列表:成功后 model 变为 datalist 下拉可选
+  // 获取模型列表:成功后模型字段从禁用态变为可搜索下拉可选
   const handleFetchModels = async () => {
     const normalizeBaseUrl = (value: string) => value.trim().replace(/\/+$/, '')
     const canReuseSavedKey =
@@ -352,6 +467,31 @@ function ConfigCard({ type }: { type: ConfigType }) {
     try {
       await api.configs.activate(type, id)
       toast('success', '已激活')
+      void load()
+    } catch (err) {
+      toast('error', errorMessage(err))
+    }
+  }
+
+  // 网络代理的内置"直连"子项:proxy_url 为空 = 显式不走任何代理(激活后
+  // 后端也不再回退 Windows 系统代理)。首次激活时自动落库,之后直接切换。
+  const directItem = isNetwork
+    ? items.find((item) => !String(item.data.proxy_url ?? '').trim())
+    : undefined
+  const proxyItems = isNetwork ? items.filter((item) => item !== directItem) : items
+
+  const handleActivateDirect = async () => {
+    try {
+      if (directItem) {
+        await api.configs.activate(type, directItem.id)
+      } else {
+        await api.configs.save(type, {
+          name: '直连',
+          data: { proxy_url: '', api_key: 'placeholder' },
+          is_active: true
+        })
+      }
+      toast('success', '已激活直连:所有出网请求不走代理')
       void load()
     } catch (err) {
       toast('error', errorMessage(err))
@@ -408,13 +548,35 @@ function ConfigCard({ type }: { type: ConfigType }) {
         </Button>
       </div>
 
-      {items.length === 0 ? (
+      {items.length === 0 && !isNetwork ? (
         <p className="py-6 text-center text-xs text-ink-faint">
           暂无{isLlm ? ' LLM ' : isAsr ? ' ASR ' : isNetwork ? '代理' : '搜索'}配置
         </p>
       ) : (
         <div className="space-y-2">
-          {items.map((item) => (
+          {isNetwork && (
+            <div className="flex items-center gap-3 rounded-lg border border-stroke-subtle bg-surface/50 px-4 py-3">
+              <Globe size={14} className="text-ink-faint" />
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px] font-medium text-ink-primary">直连</div>
+                <div className="truncate text-xs text-ink-faint">默认子项:不使用任何代理</div>
+              </div>
+              {directItem?.is_active ? (
+                <span className="rounded-full bg-brand/15 px-2.5 py-0.5 text-[11px] font-medium text-brand">
+                  使用中
+                </span>
+              ) : (
+                <Button
+                  variant="ghost"
+                  className="!px-2.5 !py-1 !text-xs"
+                  onClick={() => void handleActivateDirect()}
+                >
+                  激活
+                </Button>
+              )}
+            </div>
+          )}
+          {(isNetwork ? proxyItems : items).map((item) => (
             <div
               key={item.id}
               className="flex items-center gap-3 rounded-lg border border-stroke-subtle bg-surface/50 px-4 py-3"
@@ -551,7 +713,7 @@ function ConfigCard({ type }: { type: ConfigType }) {
               placeholder="http://127.0.0.1:7897"
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
-              hint="支持 http / https / socks5 / socks5h;留空不保存则默认直连"
+              hint="支持 http / https / socks5 / socks5h;不需要代理时直接激活列表里的「直连」"
             />
           ) : isLlm ? (
             <>
@@ -647,20 +809,12 @@ function ConfigCard({ type }: { type: ConfigType }) {
                   编辑模式:API Key 留空表示沿用已保存的密钥;获取模型将直接使用 Base URL 调用。
                 </p>
               )}
-              <Input
-                label="模型"
-                placeholder="如:deepseek-chat"
+              <ModelSelect
                 value={model}
-                list={modelOptions.length > 0 ? 'llm-model-options' : undefined}
-                onChange={(e) => setModel(e.target.value)}
-                />
-                {modelOptions.length > 0 && (
-                  <datalist id="llm-model-options">
-                    {modelOptions.map((m) => (
-                      <option key={m} value={m} />
-                    ))}
-                  </datalist>
-              )}
+                options={modelOptions}
+                disabled={modelOptions.length === 0}
+                onChange={setModel}
+              />
               <div>
                 <span className="mb-1.5 block text-[13px] font-medium text-ink-secondary">
                   思考强度
@@ -705,10 +859,8 @@ export default function SettingsPage() {
         </div>
         <TokenCard />
         <PromptCard />
-        <ConfigCard type="asr" />
         <ConfigCard type="network" />
         <ConfigCard type="llm" />
-        <ConfigCard type="search" />
       </div>
     </div>
   )

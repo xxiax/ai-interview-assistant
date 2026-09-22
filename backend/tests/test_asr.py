@@ -871,6 +871,23 @@ def test_explicit_outbound_proxy_wins(monkeypatch):
     assert asr._active_proxy() == "socks5://127.0.0.1:1080"
 
 
+def test_active_direct_network_config_skips_system_proxy(monkeypatch):
+    """激活的网络配置 proxy_url 为空(设置页"直连"子项)时必须不走任何代理,
+    即便 Windows 系统代理开着也不回退——用户显式选择直连。"""
+    from app import db as app_db
+
+    monkeypatch.delenv("AI_OUTBOUND_PROXY", raising=False)
+    monkeypatch.setattr(asr, "_windows_system_proxy", lambda: "http://127.0.0.1:7897")
+    conn = app_db.get_db()
+    try:
+        app_db.save_config(
+            conn, "network", "直连", {"proxy_url": "", "api_key": "placeholder"}, True
+        )
+    finally:
+        conn.close()
+    assert asr._active_proxy() is None
+
+
 @pytest.mark.asyncio
 async def test_funasr_fake_dns_address_uses_doh_fallback(monkeypatch):
     monkeypatch.setattr(

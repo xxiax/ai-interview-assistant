@@ -364,6 +364,47 @@ test('buildAnswerFeed 保留未被卡片覆盖的历史答案', () => {
   assert.equal(feed.threads[0].persisted?.id, 2)
 })
 
+test('buildAnswerFeed 最新线程在最前、历史答案按 id 倒序', () => {
+  // 2026-09-22 用户拍板:答案区最新在最上,新内容从顶部把旧的往下挤,
+  // 阅读位置不被流式输出打扰(也因此没有任何自动滚动)。
+  const streaming = [
+    {
+      request_id: 'r1',
+      thread_id: 'th1',
+      revision: 1,
+      session_id: 's1',
+      question: '第一问',
+      answer: 'A1',
+      source: 'llm',
+      done: true,
+      started: true,
+      failed: false
+    },
+    {
+      request_id: 'r2',
+      thread_id: 'th2',
+      revision: 1,
+      session_id: 's1',
+      question: '第二问',
+      answer: 'A2',
+      source: 'llm',
+      done: true,
+      started: true,
+      failed: false
+    }
+  ]
+  const answers = [answerRow(1, 's1'), answerRow(2, 's1'), answerRow(3, 's1')]
+  const feed = buildAnswerFeed(streaming, answers)
+  assert.deepEqual(
+    feed.threads.map((t) => t.key),
+    ['th2', 'th1']
+  )
+  assert.deepEqual(
+    feed.historyAnswers.map((a) => a.id),
+    [3, 2, 1]
+  )
+})
+
 test('buildAnswerFeed 按 revision 排序且标题不会被更短的旧问题改回去', () => {
   const mk = (requestId, revision, question, answer) => ({
     request_id: requestId,
